@@ -1,0 +1,156 @@
+[workspace]
+members = ["k2k-common"]
+resolver = "2"
+
+[package]
+name = "knowledge-nexus-agent"
+version = "0.8.0"
+edition = "2021"
+description = "Knowledge Nexus Local Agent - K2K federation, local file indexing, and semantic search"
+license = "Apache-2.0"
+repository = "https://github.com/jaredcluff/knowledge-nexus-local"
+authors = ["Jared Cluff"]
+keywords = ["knowledge-nexus", "ai", "file-search", "semantic-search"]
+categories = ["command-line-utilities", "filesystem"]
+
+[[bin]]
+name = "knowledge-nexus-agent"
+path = "src/main.rs"
+
+[features]
+default = ["tray"]
+tray = ["dep:tray-icon", "dep:png", "dep:open", "dep:libc"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket client
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+
+# HTTP server for local UI
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Configuration
+directories = "5"  # XDG directories
+dirs = "5"  # Home directory access
+hostname = "0.4"  # Get system hostname
+shellexpand = "3"
+urlencoding = "2"
+
+# File operations
+walkdir = "2"
+glob = "0.3"
+notify = "6"  # File watcher
+mime_guess = "2"
+mime = "0.3"
+rand = "0.8"
+
+# Vector database (embedded)
+lancedb = "0.13"
+arrow-array = "52"
+arrow-schema = "52"
+futures = "0.3"
+
+# ONNX Runtime for embeddings
+ort = { version = "=2.0.0-rc.10", features = ["download-binaries"] }
+ndarray = "0.16"
+tokenizers = "0.20"
+
+# Security
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
+jsonwebtoken = "9"
+rsa = "0.9"
+pem = "3.0"
+base64 = "0.22"
+
+# System tray (optional - requires GTK on Linux)
+tray-icon = { version = "0.17", optional = true }
+png = { version = "0.17", optional = true }
+open = { version = "5", optional = true }
+libc = { version = "0.2", optional = true }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# SQLite (embedded)
+rusqlite = { version = "0.35", features = ["bundled"] }
+
+# Regex
+regex = "1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# HTTP client (for Hub communication fallback)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+# Shared K2K library
+k2k-common = { path = "k2k-common" }
+
+# Async utilities
+async-trait = "0.1"
+async-stream = "0.3"
+
+# mDNS discovery
+mdns-sd = "0.11"
+
+# Embed static files for web UI
+rust-embed = "8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux-specific dependencies if needed
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
+
+# The objc crate's msg_send!/class! macros check cfg(feature = "cargo-clippy")
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+strip = true
+incremental = true
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+
+[patch.crates-io]
+# Fix chrono 0.4.35+ quarter() conflict with arrow-arith 52.2.0
+arrow-arith = { path = "patches/arrow-arith-52.2.0" }
+# Fix queries overflow depth limit in lance async blocks (Rust 1.94+)
+lance = { path = "patches/lance-0.19.2" }
