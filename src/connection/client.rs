@@ -551,7 +551,7 @@ fn apply_query_filters(
                 let result_path = std::path::Path::new(&r.path);
                 if !paths
                     .iter()
-                    .any(|p| result_path.starts_with(std::path::Path::new(p)))
+                    .any(|p| crate::path_utils::path_starts_with(result_path, std::path::Path::new(p)))
                 {
                     return false;
                 }

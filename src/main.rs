@@ -19,6 +19,7 @@ mod embeddings;
 mod federation;
 mod k2k;
 mod knowledge;
+pub(crate) mod path_utils;
 mod retrieval;
 mod router;
 mod search;

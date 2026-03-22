@@ -67,7 +67,7 @@ fn is_ignored(entry: &DirEntry, config: &IndexingConfig) -> bool {
         let canonical_excluded = std::fs::canonicalize(excluded)
             .unwrap_or_else(|_| std::path::PathBuf::from(excluded));
         let excluded_str = canonical_excluded.to_string_lossy();
-        if path_str.starts_with(excluded_str.as_ref()) {
+        if crate::path_utils::str_path_starts_with(path_str.as_ref(), excluded_str.as_ref()) {
             return true;
         }
     }

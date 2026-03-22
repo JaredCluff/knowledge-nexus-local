@@ -375,7 +375,7 @@ pub async fn handle_query(
                     let result_path = std::path::Path::new(&r.path);
                     paths
                         .iter()
-                        .any(|p| result_path.starts_with(std::path::Path::new(p)))
+                        .any(|p| crate::path_utils::path_starts_with(result_path, std::path::Path::new(p)))
                 })
                 .collect()
         } else {
@@ -1236,7 +1236,7 @@ fn is_path_allowed(allowed_paths: &[String], requested_path: &str) -> bool {
         let allowed_path = shellexpand::tilde(allowed).to_string();
         let allowed_path = std::path::Path::new(&allowed_path);
 
-        if requested.starts_with(allowed_path) {
+        if crate::path_utils::path_starts_with(requested, allowed_path) {
             return true;
         }
     }
