@@ -2,6 +2,8 @@
 """Test WebSocket authentication with the generated JWT token."""
 
 import asyncio
+import os
+import platform
 import websockets
 import json
 import yaml
@@ -9,7 +11,13 @@ from pathlib import Path
 
 async def test_auth():
     # Load config to get auth token
-    config_paths = [
+    config_paths = []
+    if platform.system() == "Windows":
+        appdata = os.environ.get('APPDATA', '')
+        if appdata:
+            config_paths.append(Path(appdata) / "knowledge-nexus-agent/config.yaml")
+        config_paths.append(Path.home() / "AppData/Roaming/knowledge-nexus-agent/config.yaml")
+    config_paths += [
         Path.home() / "Library/Application Support/knowledge-nexus-agent/config.yaml",
         Path.home() / ".config/knowledge-nexus-agent/config.yaml",
     ]
@@ -65,7 +73,7 @@ async def test_auth():
                         "agent_version": "0.8.0"
                     },
                     "capabilities": ["query", "read_file", "list_dir"],
-                    "allowed_paths": ["/home/user/Documents", "/home/user/Projects"],
+                    "allowed_paths": [str(Path.home() / "Documents"), str(Path.home() / "Projects")],
                     "blocked_patterns": []
                 }
             }

@@ -758,14 +758,8 @@ async fn cmd_paths(action: PathsAction) -> Result<()> {
                     "Path permissions are currently informational only; using default read/list behavior"
                 );
             }
-            // Expand path
-            let expanded = if path.starts_with('~') {
-                dirs::home_dir()
-                    .map(|home| path.replacen('~', &home.to_string_lossy(), 1))
-                    .unwrap_or(path.clone())
-            } else {
-                path.clone()
-            };
+            // Expand path (handles ~ on all platforms)
+            let expanded = shellexpand::tilde(&path).to_string();
 
             // Validate path exists
             let path_buf = std::path::PathBuf::from(&expanded);
