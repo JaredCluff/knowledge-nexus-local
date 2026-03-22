@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [features]
 default = ["tray"]
-tray = ["dep:tray-icon", "dep:png", "dep:open", "dep:libc"]
+tray = ["dep:tray-icon", "dep:png", "dep:open"]
 
 [dependencies]
 # Async runtime
@@ -82,7 +82,6 @@ base64 = "0.22"
 tray-icon = { version = "0.17", optional = true }
 png = { version = "0.17", optional = true }
 open = { version = "5", optional = true }
-libc = { version = "0.2", optional = true }
 
 # Logging
 tracing = "0.1"
@@ -132,6 +131,7 @@ windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_System_Co
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"
 objc = "0.2"
+libc = "0.2"
 
 # The objc crate's msg_send!/class! macros check cfg(feature = "cargo-clippy")
 [lints.rust]
