@@ -111,6 +111,13 @@ impl PathWhitelist {
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
 
+        // On Windows, normalize to lowercase for case-insensitive matching
+        #[cfg(windows)]
+        let (path_str, file_name) = (
+            std::borrow::Cow::Owned(path_str.to_lowercase()),
+            std::borrow::Cow::Owned(file_name.to_lowercase()),
+        );
+
         for pattern in &self.blocked_patterns {
             // Check full path
             if pattern.matches(&path_str) {
@@ -128,8 +135,20 @@ impl PathWhitelist {
     /// Check if path is within an allowed directory
     fn is_in_allowed_directory(&self, path: &Path) -> bool {
         for allowed in &self.allowed_paths {
-            if path.starts_with(allowed) {
-                return true;
+            #[cfg(not(windows))]
+            {
+                if path.starts_with(allowed) {
+                    return true;
+                }
+            }
+            #[cfg(windows)]
+            {
+                // Case-insensitive comparison on Windows
+                let path_lower = path.to_string_lossy().to_lowercase();
+                let allowed_lower = allowed.to_string_lossy().to_lowercase();
+                if path_lower.starts_with(&allowed_lower) {
+                    return true;
+                }
             }
         }
         false
@@ -158,14 +177,15 @@ impl PathWhitelist {
             return None;
         }
 
-        // Normalize path separators
-        let normalized = user_path.replace('\\', "/");
-
-        // URL decode
-        let decoded = match urlencoding::decode(&normalized) {
+        // URL decode first (before normalizing separators, so encoded
+        // backslashes like %5C are decoded before normalization)
+        let decoded = match urlencoding::decode(user_path) {
             Ok(d) => d.to_string(),
-            Err(_) => normalized,
+            Err(_) => user_path.to_string(),
         };
+
+        // Normalize path separators after decoding
+        let decoded = decoded.replace('\\', "/");
 
         // Check for double encoding
         if let Ok(double_decoded) = urlencoding::decode(&decoded) {

@@ -69,9 +69,23 @@ impl AuditLogger {
             let username = std::env::var("USERNAME").unwrap_or_else(|_| "".to_string());
             if !username.is_empty() {
                 // Remove inherited permissions and grant only current user
-                let _ = std::process::Command::new("icacls")
+                match std::process::Command::new("icacls")
                     .args([&*path_str, "/inheritance:r", "/grant", &format!("{}:RW", username)])
-                    .output();
+                    .output()
+                {
+                    Ok(output) if !output.status.success() => {
+                        tracing::warn!(
+                            "icacls failed for {}: exit code {:?}, stderr: {}",
+                            path_str,
+                            output.status.code(),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to run icacls for {}: {}", path_str, e);
+                    }
+                    _ => {}
+                }
             }
         }
 

@@ -7,6 +7,8 @@ JWT token that the agent can use for authentication.
 """
 
 import argparse
+import os
+import platform
 import requests
 import json
 import yaml
@@ -17,7 +19,13 @@ import re
 
 def load_config():
     """Load agent config to get device ID."""
-    config_paths = [
+    config_paths = []
+    if platform.system() == "Windows":
+        appdata = os.environ.get('APPDATA', '')
+        if appdata:
+            config_paths.append(Path(appdata) / "knowledge-nexus-agent/config.yaml")
+        config_paths.append(Path.home() / "AppData/Roaming/knowledge-nexus-agent/config.yaml")
+    config_paths += [
         Path.home() / "Library/Application Support/knowledge-nexus-agent/config.yaml",
         Path.home() / ".config/knowledge-nexus-agent/config.yaml",
     ]

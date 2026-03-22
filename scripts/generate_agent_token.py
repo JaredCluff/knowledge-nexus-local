@@ -9,6 +9,8 @@ with the Agent Hub WebSocket endpoint.
 import argparse
 import jwt
 import json
+import os
+import platform
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
@@ -61,7 +63,13 @@ def update_agent_config(token: str, config_path: str = None) -> None:
     """
     if not config_path:
         # Try to find config in standard locations
-        possible_paths = [
+        possible_paths = []
+        if platform.system() == "Windows":
+            appdata = os.environ.get('APPDATA', '')
+            if appdata:
+                possible_paths.append(Path(appdata) / "knowledge-nexus-agent/config.yaml")
+            possible_paths.append(Path.home() / "AppData/Roaming/knowledge-nexus-agent/config.yaml")
+        possible_paths += [
             Path.home() / "Library/Application Support/knowledge-nexus-agent/config.yaml",
             Path.home() / ".config/knowledge-nexus-agent/config.yaml",
             Path("config.yaml"),
@@ -147,7 +155,13 @@ def main():
         # Try to read from config
         config_path = args.config
         if not config_path:
-            possible_paths = [
+            possible_paths = []
+            if platform.system() == "Windows":
+                appdata = os.environ.get('APPDATA', '')
+                if appdata:
+                    possible_paths.append(Path(appdata) / "knowledge-nexus-agent/config.yaml")
+                possible_paths.append(Path.home() / "AppData/Roaming/knowledge-nexus-agent/config.yaml")
+            possible_paths += [
                 Path.home() / "Library/Application Support/knowledge-nexus-agent/config.yaml",
                 Path.home() / ".config/knowledge-nexus-agent/config.yaml",
             ]

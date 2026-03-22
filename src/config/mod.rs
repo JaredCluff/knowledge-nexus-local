@@ -900,17 +900,35 @@ fn restrict_config_file_permissions(path: &std::path::Path) -> Result<()> {
         let username = std::env::var("USERNAME").unwrap_or_default();
         if !username.is_empty() {
             let path_str = path.to_string_lossy();
-            let _ = std::process::Command::new("icacls")
+            match std::process::Command::new("icacls")
                 .args([&*path_str, "/inheritance:r"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status();
+                .status()
+            {
+                Ok(status) if !status.success() => {
+                    tracing::warn!("icacls /inheritance:r failed for {}: exit code {:?}", path_str, status.code());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to run icacls /inheritance:r for {}: {}", path_str, e);
+                }
+                _ => {}
+            }
             let grant = format!("{}:(R,W)", username);
-            let _ = std::process::Command::new("icacls")
+            match std::process::Command::new("icacls")
                 .args([&*path_str, "/grant:r", &grant])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status();
+                .status()
+            {
+                Ok(status) if !status.success() => {
+                    tracing::warn!("icacls /grant:r failed for {}: exit code {:?}", path_str, status.code());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to run icacls /grant:r for {}: {}", path_str, e);
+                }
+                _ => {}
+            }
         }
     }
     Ok(())

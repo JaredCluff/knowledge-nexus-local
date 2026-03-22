@@ -1056,7 +1056,7 @@ mod tests {
             id: "cc1".into(),
             connector_type: "local_files".into(),
             name: "My Documents".into(),
-            config: serde_json::json!({"path": "/home/docs"}),
+            config: serde_json::json!({"path": std::env::temp_dir().join("test-docs").to_string_lossy().to_string()}),
             store_id: "s1".into(),
             created_at: ts.clone(),
             updated_at: ts,
