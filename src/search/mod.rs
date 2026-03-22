@@ -298,7 +298,7 @@ pub(super) fn is_excluded_by_indexing(path: &Path, indexing: &IndexingConfig) ->
     let path_str = path.to_string_lossy();
 
     for excluded in &indexing.exclude_paths {
-        if path_str.contains(excluded) {
+        if crate::path_utils::str_path_contains(&path_str, excluded) {
             return true;
         }
     }
