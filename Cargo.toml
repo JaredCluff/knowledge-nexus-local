@@ -1,5 +1,5 @@
 [workspace]
-members = ["k2k-common"]
+members = []
 resolver = "2"
 
 [package]
@@ -107,7 +107,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
 # Shared K2K library
-k2k-common = { path = "k2k-common" }
+k2k = { path = "../k2k" }
 
 # Async utilities
 async-trait = "0.1"

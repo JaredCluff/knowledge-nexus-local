@@ -3377,8 +3377,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "k2k-common"
-version = "0.1.0"
+name = "k2k"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3431,7 +3431,7 @@ dependencies = [
  "hex",
  "hostname",
  "jsonwebtoken",
- "k2k-common",
+ "k2k",
  "lancedb",
  "libc",
  "mdns-sd",

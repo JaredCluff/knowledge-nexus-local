@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 // Re-export PROTOCOL_VERSION from k2k-common for server code that needs it.
-pub use k2k_common::PROTOCOL_VERSION;
+pub use k2k::PROTOCOL_VERSION;
 
 // ============================================================================
 // Request Types

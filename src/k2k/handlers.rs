@@ -47,7 +47,7 @@ pub async fn handle_health(State(state): State<Arc<K2KServerState>>) -> Json<Hea
 
 pub async fn handle_list_capabilities(
     State(state): State<Arc<K2KServerState>>,
-) -> Json<k2k_common::CapabilitiesResponse> {
+) -> Json<k2k::CapabilitiesResponse> {
     Json(state.capability_registry.get_response())
 }
 
@@ -58,8 +58,8 @@ pub async fn handle_list_capabilities(
 pub async fn handle_submit_task(
     State(state): State<Arc<K2KServerState>>,
     Extension(claims): Extension<K2KClaims>,
-    Json(mut req): Json<k2k_common::TaskRequest>,
-) -> Result<(StatusCode, HeaderMap, Json<k2k_common::TaskSubmitResponse>), (StatusCode, Json<K2KError>)> {
+    Json(mut req): Json<k2k::TaskRequest>,
+) -> Result<(StatusCode, HeaderMap, Json<k2k::TaskSubmitResponse>), (StatusCode, Json<K2KError>)> {
     // Inject the authenticated client_id from JWT claims so the task queue
     // can apply per-client rate limiting and storage quota checks.
     req.client_id = claims.client_id.clone();
@@ -119,7 +119,7 @@ pub async fn handle_get_task(
     State(state): State<Arc<K2KServerState>>,
     Extension(claims): Extension<K2KClaims>,
     Path(task_id): Path<String>,
-) -> Result<Json<k2k_common::TaskStatusResponse>, (StatusCode, Json<K2KError>)> {
+) -> Result<Json<k2k::TaskStatusResponse>, (StatusCode, Json<K2KError>)> {
     match state.task_queue.get_status_for_client(&task_id, &claims.client_id).await {
         Some(status) => Ok(Json(status)),
         None => Err((
@@ -164,10 +164,10 @@ pub async fn handle_task_events(
                     }
                     let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
                     let event_type = match event.event_type {
-                        k2k_common::TaskEventType::StatusChanged => "status_changed",
-                        k2k_common::TaskEventType::Progress => "progress",
-                        k2k_common::TaskEventType::Completed => "completed",
-                        k2k_common::TaskEventType::Failed => "failed",
+                        k2k::TaskEventType::StatusChanged => "status_changed",
+                        k2k::TaskEventType::Progress => "progress",
+                        k2k::TaskEventType::Completed => "completed",
+                        k2k::TaskEventType::Failed => "failed",
                     };
                     yield Ok(Event::default().event(event_type).data(data));
                 }

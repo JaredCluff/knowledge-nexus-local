@@ -7,7 +7,7 @@
 //!
 //! Remote-handler capabilities are forwarded via HTTP to the configured endpoint.
 
-use k2k_common::{AgentCapability, CapabilitiesResponse, CapabilityCategory};
+use k2k::{AgentCapability, CapabilitiesResponse, CapabilityCategory};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
