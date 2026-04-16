@@ -447,7 +447,7 @@ impl Store for SurrealStore {
     async fn upsert_k2k_client(&self, c: &K2KClient) -> Result<()> {
         self.db()
             .query(
-                "UPDATE type::thing('k2k_client', $id) CONTENT {
+                "UPSERT type::thing('k2k_client', $id) CONTENT {
                     public_key_pem: $public_key_pem,
                     client_name: $client_name,
                     registered_at: $registered_at,
@@ -555,7 +555,7 @@ impl Store for SurrealStore {
     async fn upsert_discovered_node(&self, n: &DiscoveredNode) -> Result<()> {
         self.db()
             .query(
-                "UPDATE type::thing('discovered_node', $id) CONTENT {
+                "UPSERT type::thing('discovered_node', $id) CONTENT {
                     host: $host, port: $port, endpoint: $endpoint,
                     capabilities: $capabilities,
                     last_seen: $last_seen, healthy: $healthy
