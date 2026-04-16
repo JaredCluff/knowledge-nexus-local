@@ -5,21 +5,21 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::info;
 
-use crate::db::{Database, FederationAgreement};
+use crate::store::{Store, FederationAgreement};
 
 #[allow(dead_code)]
 pub struct FederationManager {
-    db: Arc<Database>,
+    db: Arc<dyn Store>,
 }
 
 #[allow(dead_code)]
 impl FederationManager {
-    pub fn new(db: Arc<Database>) -> Self {
+    pub fn new(db: Arc<dyn Store>) -> Self {
         Self { db }
     }
 
     /// Create a federation agreement with a remote node
-    pub fn create_agreement(
+    pub async fn create_agreement(
         &self,
         local_store_id: &str,
         remote_node_id: &str,
@@ -35,7 +35,7 @@ impl FederationManager {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        self.db.create_federation_agreement(&agreement)?;
+        self.db.create_federation_agreement(&agreement).await?;
         info!(
             "Created federation agreement: store {} <-> node {} ({})",
             local_store_id, remote_node_id, access_type
@@ -45,13 +45,13 @@ impl FederationManager {
     }
 
     /// List all federation agreements
-    pub fn list_agreements(&self) -> Result<Vec<FederationAgreement>> {
-        self.db.list_federation_agreements()
+    pub async fn list_agreements(&self) -> Result<Vec<FederationAgreement>> {
+        self.db.list_federation_agreements().await
     }
 
     /// List agreements for a specific remote node
-    pub fn agreements_for_node(&self, remote_node_id: &str) -> Result<Vec<FederationAgreement>> {
-        let all = self.db.list_federation_agreements()?;
+    pub async fn agreements_for_node(&self, remote_node_id: &str) -> Result<Vec<FederationAgreement>> {
+        let all = self.db.list_federation_agreements().await?;
         Ok(all
             .into_iter()
             .filter(|a| a.remote_node_id == remote_node_id)
@@ -59,15 +59,15 @@ impl FederationManager {
     }
 
     /// Remove a federation agreement
-    pub fn remove_agreement(&self, agreement_id: &str) -> Result<()> {
-        self.db.delete_federation_agreement(agreement_id)?;
+    pub async fn remove_agreement(&self, agreement_id: &str) -> Result<()> {
+        self.db.delete_federation_agreement(agreement_id).await?;
         info!("Removed federation agreement: {}", agreement_id);
         Ok(())
     }
 
     /// Check if a remote node has read access to a local store
-    pub fn has_read_access(&self, remote_node_id: &str, local_store_id: &str) -> Result<bool> {
-        let agreements = self.db.list_federation_agreements()?;
+    pub async fn has_read_access(&self, remote_node_id: &str, local_store_id: &str) -> Result<bool> {
+        let agreements = self.db.list_federation_agreements().await?;
         Ok(agreements.iter().any(|a| {
             a.remote_node_id == remote_node_id
                 && a.local_store_id == local_store_id

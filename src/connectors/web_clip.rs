@@ -9,7 +9,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::traits::{ConnectorCapabilities, K2KConnector};
-use crate::db::{Article, Database};
+use crate::store::{Article, Store};
 use crate::k2k::models::K2KResult;
 use crate::knowledge::ArticleService;
 
@@ -32,12 +32,12 @@ pub struct WebClipResponse {
 }
 
 pub struct WebClipReceiver {
-    db: Arc<Database>,
+    db: Arc<dyn Store>,
     article_service: Arc<ArticleService>,
 }
 
 impl WebClipReceiver {
-    pub fn new(db: Arc<Database>, article_service: Arc<ArticleService>) -> Self {
+    pub fn new(db: Arc<dyn Store>, article_service: Arc<ArticleService>) -> Self {
         Self {
             db,
             article_service,
@@ -67,9 +67,10 @@ impl WebClipReceiver {
             None => {
                 let owner = self
                     .db
-                    .get_owner_user()?
+                    .get_owner_user()
+                    .await?
                     .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
-                let stores = self.db.list_stores_for_user(&owner.id)?;
+                let stores = self.db.list_stores_for_user(&owner.id).await?;
                 stores
                     .into_iter()
                     .find(|s| s.store_type == "personal")
@@ -80,11 +81,13 @@ impl WebClipReceiver {
 
         let store = self
             .db
-            .get_store(&store_id)?
+            .get_store(&store_id)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("Store not found: {}", store_id))?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let article_id = Uuid::new_v4().to_string();
+        let content_hash = crate::store::hash::content_hash(&clip.content);
 
         let article = Article {
             id: article_id.clone(),
@@ -92,6 +95,8 @@ impl WebClipReceiver {
             title: clip.title.clone(),
             content: clip.content.clone(),
             source_type: "web_clip".to_string(),
+            source_id: clip.url.clone(),
+            content_hash,
             tags: serde_json::json!(clip.tags),
             embedded_at: None,
             created_at: now.clone(),

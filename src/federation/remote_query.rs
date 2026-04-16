@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::{debug, info, warn};
 
-use crate::db::DiscoveredNode;
+use crate::store::DiscoveredNode;
 use crate::discovery::NodeRegistry;
 use crate::k2k::models::{K2KQueryResponse, K2KResult, ResultProvenance};
 use crate::router::executor::StoreSearchResult;
@@ -34,7 +34,7 @@ impl RemoteQueryExecutor {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<StoreSearchResult>> {
-        let nodes = self.registry.list_healthy_nodes()?;
+        let nodes = self.registry.list_healthy_nodes().await?;
 
         if nodes.is_empty() {
             debug!("No healthy remote nodes to query");

@@ -109,6 +109,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Shared K2K library
 k2k = { path = "../k2k" }
 
+# Embedded multi-model DB (relational + FTS + graph) — pure-Rust KV backend.
+# kv-mem is used by in-memory unit + integration tests only.
+surrealdb = { version = "2", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
+
 # Async utilities
 async-trait = "0.1"
 async-stream = "0.3"

@@ -4,19 +4,19 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::db::{Article, Database};
+use crate::store::{Article, Store};
 use crate::embeddings::EmbeddingModel;
 use crate::vectordb::{ChunkMetadata, DocumentMetadata, VectorDB};
 
 pub struct ArticleService {
-    db: Arc<Database>,
+    db: Arc<dyn Store>,
     vectordb: Arc<VectorDB>,
     embedding_model: Arc<Mutex<EmbeddingModel>>,
 }
 
 impl ArticleService {
     pub fn new(
-        db: Arc<Database>,
+        db: Arc<dyn Store>,
         vectordb: Arc<VectorDB>,
         embedding_model: Arc<Mutex<EmbeddingModel>>,
     ) -> Self {
@@ -29,7 +29,7 @@ impl ArticleService {
 
     /// Create an article, auto-embed it into vector store
     pub async fn create(&self, article: &Article, store_collection: &str) -> Result<()> {
-        self.db.create_article(article)?;
+        self.db.create_article(article).await?;
 
         // Chunk and embed
         self.embed_article(article, store_collection).await?;
@@ -38,7 +38,7 @@ impl ArticleService {
         let mut updated = article.clone();
         updated.embedded_at = Some(chrono::Utc::now().to_rfc3339());
         updated.updated_at = chrono::Utc::now().to_rfc3339();
-        self.db.update_article(&updated)?;
+        self.db.update_article(&updated).await?;
 
         info!("Created and embedded article: {}", article.title);
         Ok(())
@@ -46,36 +46,41 @@ impl ArticleService {
 
     /// Update article, re-embed
     pub async fn update(&self, article: &Article, store_collection: &str) -> Result<()> {
+        // Ensure content_hash reflects current content
+        let mut article = article.clone();
+        article.content_hash = crate::store::hash::content_hash(&article.content);
+
         // Delete old vectors
         self.vectordb.delete_document(&article.id).await.ok();
 
-        self.db.update_article(article)?;
+        self.db.update_article(&article).await?;
 
         // Re-embed
-        self.embed_article(article, store_collection).await?;
+        self.embed_article(&article, store_collection).await?;
 
-        let mut updated = article.clone();
+        let title = article.title.clone();
+        let mut updated = article;
         updated.embedded_at = Some(chrono::Utc::now().to_rfc3339());
-        self.db.update_article(&updated)?;
+        self.db.update_article(&updated).await?;
 
-        info!("Updated and re-embedded article: {}", article.title);
+        info!("Updated and re-embedded article: {}", title);
         Ok(())
     }
 
     /// Delete article and its vectors
     pub async fn delete(&self, article_id: &str) -> Result<()> {
         self.vectordb.delete_document(article_id).await.ok();
-        self.db.delete_article(article_id)?;
+        self.db.delete_article(article_id).await?;
         info!("Deleted article: {}", article_id);
         Ok(())
     }
 
-    pub fn get(&self, id: &str) -> Result<Option<Article>> {
-        self.db.get_article(id)
+    pub async fn get(&self, id: &str) -> Result<Option<Article>> {
+        self.db.get_article(id).await
     }
 
-    pub fn list_for_store(&self, store_id: &str) -> Result<Vec<Article>> {
-        self.db.list_articles_for_store(store_id)
+    pub async fn list_for_store(&self, store_id: &str) -> Result<Vec<Article>> {
+        self.db.list_articles_for_store(store_id).await
     }
 
     /// Chunk text and embed into vector store

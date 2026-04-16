@@ -178,6 +178,7 @@ impl MDNSService {
                 if let Err(e) =
                     self.registry
                         .register_node(&node_id, &host, port, &endpoint, capabilities)
+                        .await
                 {
                     warn!("Failed to register discovered node: {}", e);
                 }

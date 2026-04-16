@@ -2,34 +2,34 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::db::{Conversation, Database, Message};
+use crate::store::{Conversation, Store, Message};
 
 pub struct ConversationService {
-    db: Arc<Database>,
+    db: Arc<dyn Store>,
 }
 
 impl ConversationService {
-    pub fn new(db: Arc<Database>) -> Self {
+    pub fn new(db: Arc<dyn Store>) -> Self {
         Self { db }
     }
 
-    pub fn create(&self, conv: &Conversation) -> Result<()> {
-        self.db.create_conversation(conv)
+    pub async fn create(&self, conv: &Conversation) -> Result<()> {
+        self.db.create_conversation(conv).await
     }
 
-    pub fn get(&self, id: &str) -> Result<Option<Conversation>> {
-        self.db.get_conversation(id)
+    pub async fn get(&self, id: &str) -> Result<Option<Conversation>> {
+        self.db.get_conversation(id).await
     }
 
-    pub fn list_for_user(&self, user_id: &str) -> Result<Vec<Conversation>> {
-        self.db.list_conversations_for_user(user_id)
+    pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<Conversation>> {
+        self.db.list_conversations_for_user(user_id).await
     }
 
-    pub fn add_message(&self, msg: &Message) -> Result<()> {
-        self.db.create_message(msg)
+    pub async fn add_message(&self, msg: &Message) -> Result<()> {
+        self.db.create_message(msg).await
     }
 
-    pub fn get_messages(&self, conversation_id: &str) -> Result<Vec<Message>> {
-        self.db.list_messages_for_conversation(conversation_id)
+    pub async fn get_messages(&self, conversation_id: &str) -> Result<Vec<Message>> {
+        self.db.list_messages_for_conversation(conversation_id).await
     }
 }
