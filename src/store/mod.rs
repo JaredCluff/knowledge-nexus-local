@@ -135,7 +135,7 @@ impl SurrealStore {
         Ok(Self { db: Arc::new(db) })
     }
 
-    fn db(&self) -> &Surreal<Any> {
+    pub(crate) fn db(&self) -> &Surreal<Any> {
         &self.db
     }
 }
