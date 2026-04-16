@@ -131,6 +131,21 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         lines: usize,
     },
+
+    /// Migrate a 0.8 SQLite database into 1.0.0 SurrealDB format.
+    Migrate {
+        /// Source database format. Only `sqlite` is supported.
+        #[arg(long, default_value = "sqlite")]
+        from: String,
+
+        /// Target database format. Only `surrealdb` is supported.
+        #[arg(long, default_value = "surrealdb")]
+        to: String,
+
+        /// Re-run even if `migration_completed` marker exists.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -273,6 +288,37 @@ fn main() -> Result<()> {
             }
             Commands::Logs { follow, lines } => {
                 cmd_logs(follow, lines).await?;
+            }
+            Commands::Migrate { from, to, force } => {
+                if from != "sqlite" {
+                    anyhow::bail!("--from only supports 'sqlite' in 1.0.0 (got {})", from);
+                }
+                if to != "surrealdb" {
+                    anyhow::bail!("--to only supports 'surrealdb' in 1.0.0 (got {})", to);
+                }
+                let sqlite_path = config::sqlite_path();
+                let surreal_dir = config::data_dir().join("surreal");
+                if !sqlite_path.exists() {
+                    anyhow::bail!(
+                        "No legacy SQLite DB found at {:?}. Nothing to migrate.",
+                        sqlite_path
+                    );
+                }
+                info!(
+                    "Starting migration: {:?} → {:?} (force={})",
+                    sqlite_path, surreal_dir, force
+                );
+                let report = migrate::migrate(&sqlite_path, &surreal_dir, force).await?;
+                println!(
+                    "Migration complete:\n  \
+                     users: {}\n  stores: {}\n  articles: {}\n  conversations: {}\n  \
+                     messages: {}\n  k2k_clients: {}\n  federation_agreements: {}\n  \
+                     discovered_nodes: {}\n  connector_configs: {}",
+                    report.users, report.stores, report.articles,
+                    report.conversations, report.messages, report.k2k_clients,
+                    report.federation_agreements, report.discovered_nodes,
+                    report.connector_configs,
+                );
             }
         }
         Ok(())
