@@ -658,6 +658,18 @@ impl Store for SurrealStore {
     }
 }
 
+/// Convenience alias used across the codebase.
+pub type DynStore = dyn Store;
+
+/// Boxed, arc'd instance. Handed into every service that used to hold
+/// `Arc<Database>`.
+pub type SharedStore = Arc<DynStore>;
+
+/// Wrap a concrete `SurrealStore` into the shared trait object.
+pub fn shared(store: SurrealStore) -> SharedStore {
+    Arc::new(store)
+}
+
 #[cfg(test)]
 mod store_tests {
     use super::*;
