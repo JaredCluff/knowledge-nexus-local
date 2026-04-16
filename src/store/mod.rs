@@ -638,7 +638,24 @@ impl Store for SurrealStore {
         Ok(())
     }
 
-    async fn fts_search_articles(&self, _q: &str, _l: usize) -> Result<Vec<Article>> { unimplemented!() }
+    async fn fts_search_articles(&self, query: &str, limit: usize) -> Result<Vec<Article>> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id,
+                        search::score(0) + search::score(1) AS _rank
+                 FROM article
+                 WHERE title @0@ $q OR content @1@ $q
+                 ORDER BY _rank DESC
+                 LIMIT $limit",
+            )
+            .bind(("q", query.to_string()))
+            .bind(("limit", limit_i64))
+            .await?;
+        let rows: Vec<Article> = resp.take(0)?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -873,6 +890,56 @@ mod federation_tests {
         assert_eq!(s.list_connector_configs().await.unwrap().len(), 1);
         s.delete_connector_config("cc1").await.unwrap();
         assert!(s.list_connector_configs().await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod fts_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    #[tokio::test]
+    async fn test_fts_matches_title_and_content() {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "N".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        for (id, title, content) in [
+            ("a1", "Rust ownership", "The borrow checker enforces rules."),
+            ("a2", "Vector databases", "LanceDB provides columnar storage."),
+            ("a3", "Async Rust", "Tokio is a popular runtime for async."),
+        ] {
+            s.create_article(&Article {
+                id: id.into(), store_id: "s1".into(),
+                title: title.into(), content: content.into(),
+                source_type: "user".into(), source_id: "".into(),
+                content_hash: format!("hash-{id}"),
+                tags: serde_json::json!([]),
+                embedded_at: None,
+                created_at: ts.clone(), updated_at: ts.clone(),
+            }).await.unwrap();
+        }
+
+        let hits = s.fts_search_articles("rust", 10).await.unwrap();
+        let ids: Vec<String> = hits.iter().map(|a| a.id.clone()).collect();
+        assert!(ids.contains(&"a1".to_string()));
+        assert!(ids.contains(&"a3".to_string()));
+        assert!(!ids.contains(&"a2".to_string()));
+
+        let hits = s.fts_search_articles("LanceDB", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "a2");
     }
 }
 
