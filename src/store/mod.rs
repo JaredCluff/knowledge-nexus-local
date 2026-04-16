@@ -11,8 +11,13 @@ pub mod schema;
 
 pub use models::*;
 
-use anyhow::Result;
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use surrealdb::engine::any::{connect, Any};
+use surrealdb::Surreal;
 
 /// Repository trait for the knowledge-nexus-local relational layer.
 ///
@@ -82,4 +87,87 @@ pub trait Store: Send + Sync {
         store_id: &str,
         content_hash: &str,
     ) -> Result<Option<Article>>;
+}
+
+const SURREAL_NS: &str = "knowledge_nexus";
+const SURREAL_DB: &str = "local";
+
+/// Concrete `Store` impl backed by an embedded SurrealDB.
+pub struct SurrealStore {
+    db: Arc<Surreal<Any>>,
+}
+
+impl SurrealStore {
+    /// Open an on-disk SurrealDB at `path` using the pure-Rust `kv-surrealkv`
+    /// backend. Creates the directory if it does not exist, applies DDL, and
+    /// records the schema version.
+    pub async fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir_all(path)?;
+
+        let endpoint = format!("surrealkv://{}", path.display());
+        let db = connect(endpoint.as_str())
+            .await
+            .with_context(|| format!("Failed to open SurrealDB at {:?}", path))?;
+        db.use_ns(SURREAL_NS).use_db(SURREAL_DB).await?;
+        migrations::run_migrations(&db).await?;
+
+        // Restrict DB directory to owner-only so other local users cannot
+        // read indexed content. Applied after open so the file handles exist.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("Failed to chmod {:?} to 0o700", path))?;
+        }
+
+        tracing::info!("SurrealDB opened at {:?}", path);
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// In-memory store for tests.
+    pub async fn open_in_memory() -> Result<Self> {
+        let db = connect("memory").await?;
+        db.use_ns(SURREAL_NS).use_db(SURREAL_DB).await?;
+        migrations::run_migrations(&db).await?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    fn db(&self) -> &Surreal<Any> {
+        &self.db
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_open_in_memory_applies_schema() {
+        let store = SurrealStore::open_in_memory().await.unwrap();
+        // Schema-version row should exist.
+        let mut resp = store
+            .db()
+            .query("SELECT version FROM _schema_version")
+            .await
+            .unwrap();
+        let versions: Vec<serde_json::Value> = resp.take(0).unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_open_on_disk_applies_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("surreal");
+        let store = SurrealStore::open(&path).await.unwrap();
+        let mut resp = store
+            .db()
+            .query("SELECT version FROM _schema_version")
+            .await
+            .unwrap();
+        let versions: Vec<serde_json::Value> = resp.take(0).unwrap();
+        assert_eq!(versions.len(), 1);
+    }
 }
