@@ -13,7 +13,6 @@ mod config;
 mod connection;
 mod connectors;
 pub mod constants;
-mod db;
 mod migrate;
 mod store;
 mod discovery;
