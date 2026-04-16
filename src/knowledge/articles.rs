@@ -46,19 +46,24 @@ impl ArticleService {
 
     /// Update article, re-embed
     pub async fn update(&self, article: &Article, store_collection: &str) -> Result<()> {
+        // Ensure content_hash reflects current content
+        let mut article = article.clone();
+        article.content_hash = crate::store::hash::content_hash(&article.content);
+
         // Delete old vectors
         self.vectordb.delete_document(&article.id).await.ok();
 
-        self.db.update_article(article).await?;
+        self.db.update_article(&article).await?;
 
         // Re-embed
-        self.embed_article(article, store_collection).await?;
+        self.embed_article(&article, store_collection).await?;
 
-        let mut updated = article.clone();
+        let title = article.title.clone();
+        let mut updated = article;
         updated.embedded_at = Some(chrono::Utc::now().to_rfc3339());
         self.db.update_article(&updated).await?;
 
-        info!("Updated and re-embedded article: {}", article.title);
+        info!("Updated and re-embedded article: {}", title);
         Ok(())
     }
 

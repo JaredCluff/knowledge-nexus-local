@@ -20,7 +20,7 @@ pub async fn run_migrations(db: &Surreal<Any>) -> Result<()> {
 
     let applied_at = chrono::Utc::now().to_rfc3339();
     db.query(
-        "CREATE _schema_version CONTENT { version: $version, applied_at: $applied_at }",
+        "UPSERT type::thing('_schema_version', 'current') CONTENT { version: $version, applied_at: $applied_at }",
     )
     .bind(("version", schema::SCHEMA_VERSION))
     .bind(("applied_at", applied_at))

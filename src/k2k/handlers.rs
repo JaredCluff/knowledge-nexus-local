@@ -772,6 +772,7 @@ pub async fn handle_update_article(
     }
     if let Some(content) = req.content {
         article.content = content;
+        article.content_hash = crate::store::hash::content_hash(&article.content);
     }
     if let Some(tags) = req.tags {
         article.tags = serde_json::json!(tags);
