@@ -46,6 +46,7 @@ DEFINE FIELD IF NOT EXISTS source_type ON article TYPE string DEFAULT "user";
 DEFINE FIELD IF NOT EXISTS source_id ON article TYPE string DEFAULT "";
 DEFINE FIELD IF NOT EXISTS content_hash ON article TYPE string DEFAULT "";
 DEFINE FIELD IF NOT EXISTS tags ON article TYPE array DEFAULT [];
+DEFINE FIELD IF NOT EXISTS tags.* ON article TYPE string;
 DEFINE FIELD IF NOT EXISTS embedded_at ON article TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at ON article TYPE string;
 DEFINE FIELD IF NOT EXISTS updated_at ON article TYPE string;
@@ -106,6 +107,7 @@ DEFINE FIELD IF NOT EXISTS port ON discovered_node TYPE int
     ASSERT $value >= 1 AND $value <= 65535;
 DEFINE FIELD IF NOT EXISTS endpoint ON discovered_node TYPE string;
 DEFINE FIELD IF NOT EXISTS capabilities ON discovered_node TYPE array DEFAULT [];
+DEFINE FIELD IF NOT EXISTS capabilities.* ON discovered_node TYPE string;
 DEFINE FIELD IF NOT EXISTS last_seen ON discovered_node TYPE string;
 DEFINE FIELD IF NOT EXISTS healthy ON discovered_node TYPE bool DEFAULT true;
 
