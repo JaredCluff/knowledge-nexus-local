@@ -140,6 +140,99 @@ impl SurrealStore {
     }
 }
 
+#[async_trait]
+impl Store for SurrealStore {
+    // Users
+    async fn create_user(&self, user: &User) -> Result<()> {
+        self.db()
+            .query(
+                "CREATE type::thing('user', $id) CONTENT {
+                    username: $username,
+                    display_name: $display_name,
+                    is_owner: $is_owner,
+                    settings: $settings,
+                    created_at: $created_at,
+                    updated_at: $updated_at
+                }",
+            )
+            .bind(("id", user.id.clone()))
+            .bind(("username", user.username.clone()))
+            .bind(("display_name", user.display_name.clone()))
+            .bind(("is_owner", user.is_owner))
+            .bind(("settings", user.settings.clone()))
+            .bind(("created_at", user.created_at.clone()))
+            .bind(("updated_at", user.updated_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn get_user(&self, id: &str) -> Result<Option<User>> {
+        let mut resp = self
+            .db()
+            .query("SELECT *, meta::id(id) AS id FROM type::thing('user', $id)")
+            .bind(("id", id.to_string()))
+            .await?;
+        let users: Vec<User> = resp.take(0)?;
+        Ok(users.into_iter().next())
+    }
+
+    async fn get_owner_user(&self) -> Result<Option<User>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM user WHERE is_owner = true LIMIT 1",
+            )
+            .await?;
+        let users: Vec<User> = resp.take(0)?;
+        Ok(users.into_iter().next())
+    }
+
+    async fn list_users(&self) -> Result<Vec<User>> {
+        let mut resp = self
+            .db()
+            .query("SELECT *, meta::id(id) AS id FROM user ORDER BY created_at")
+            .await?;
+        let users: Vec<User> = resp.take(0)?;
+        Ok(users)
+    }
+
+    // Stubs for everything else — replaced in Tasks 9-14
+    async fn create_store(&self, _s: &KnowledgeStore) -> Result<()> { unimplemented!() }
+    async fn get_store(&self, _id: &str) -> Result<Option<KnowledgeStore>> { unimplemented!() }
+    async fn list_stores(&self) -> Result<Vec<KnowledgeStore>> { unimplemented!() }
+    async fn list_stores_for_user(&self, _o: &str) -> Result<Vec<KnowledgeStore>> { unimplemented!() }
+    async fn create_article(&self, _a: &Article) -> Result<()> { unimplemented!() }
+    async fn get_article(&self, _id: &str) -> Result<Option<Article>> { unimplemented!() }
+    async fn update_article(&self, _a: &Article) -> Result<()> { unimplemented!() }
+    async fn delete_article(&self, _id: &str) -> Result<()> { unimplemented!() }
+    async fn list_articles_for_store(&self, _s: &str) -> Result<Vec<Article>> { unimplemented!() }
+    async fn count_articles_for_owner(&self, _o: &str) -> Result<usize> { unimplemented!() }
+    async fn create_conversation(&self, _c: &Conversation) -> Result<()> { unimplemented!() }
+    async fn get_conversation(&self, _id: &str) -> Result<Option<Conversation>> { unimplemented!() }
+    async fn list_conversations_for_user(&self, _u: &str) -> Result<Vec<Conversation>> { unimplemented!() }
+    async fn create_message(&self, _m: &Message) -> Result<()> { unimplemented!() }
+    async fn list_messages_for_conversation(&self, _c: &str) -> Result<Vec<Message>> { unimplemented!() }
+    async fn upsert_k2k_client(&self, _c: &K2KClient) -> Result<()> { unimplemented!() }
+    async fn get_k2k_client(&self, _c: &str) -> Result<Option<K2KClient>> { unimplemented!() }
+    async fn list_k2k_clients(&self) -> Result<Vec<K2KClient>> { unimplemented!() }
+    async fn list_pending_k2k_clients(&self) -> Result<Vec<K2KClient>> { unimplemented!() }
+    async fn update_k2k_client_status(&self, _c: &str, _s: &str) -> Result<()> { unimplemented!() }
+    async fn delete_k2k_client(&self, _c: &str) -> Result<()> { unimplemented!() }
+    async fn create_federation_agreement(&self, _a: &FederationAgreement) -> Result<()> { unimplemented!() }
+    async fn list_federation_agreements(&self) -> Result<Vec<FederationAgreement>> { unimplemented!() }
+    async fn delete_federation_agreement(&self, _id: &str) -> Result<()> { unimplemented!() }
+    async fn upsert_discovered_node(&self, _n: &DiscoveredNode) -> Result<()> { unimplemented!() }
+    async fn list_discovered_nodes(&self) -> Result<Vec<DiscoveredNode>> { unimplemented!() }
+    async fn mark_node_unhealthy(&self, _n: &str) -> Result<()> { unimplemented!() }
+    async fn delete_discovered_node(&self, _n: &str) -> Result<()> { unimplemented!() }
+    async fn create_connector_config(&self, _c: &ConnectorConfig) -> Result<()> { unimplemented!() }
+    async fn list_connector_configs(&self) -> Result<Vec<ConnectorConfig>> { unimplemented!() }
+    async fn delete_connector_config(&self, _id: &str) -> Result<()> { unimplemented!() }
+    async fn fts_search_articles(&self, _q: &str, _l: usize) -> Result<Vec<Article>> { unimplemented!() }
+    async fn find_article_by_hash(&self, _s: &str, _h: &str) -> Result<Option<Article>> { unimplemented!() }
+}
+
 #[cfg(test)]
 mod open_tests {
     use super::*;
@@ -169,5 +262,40 @@ mod open_tests {
             .unwrap();
         let versions: Vec<serde_json::Value> = resp.take(0).unwrap();
         assert_eq!(versions.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod user_tests {
+    use super::*;
+
+    fn now() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    #[tokio::test]
+    async fn test_user_crud() {
+        let store = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        let user = User {
+            id: "u1".into(),
+            username: "alice".into(),
+            display_name: "Alice".into(),
+            is_owner: true,
+            settings: serde_json::json!({}),
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        store.create_user(&user).await.unwrap();
+
+        let fetched = store.get_user("u1").await.unwrap().expect("user exists");
+        assert_eq!(fetched.username, "alice");
+        assert!(fetched.is_owner);
+
+        let owner = store.get_owner_user().await.unwrap().expect("owner exists");
+        assert_eq!(owner.id, "u1");
+
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 1);
     }
 }
