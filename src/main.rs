@@ -32,6 +32,7 @@ mod vectordb;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use store::Store;
 use tracing::{info, Level};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::FmtSubscriber;
@@ -330,6 +331,76 @@ async fn cmd_init(hub_url: Option<String>, force: bool) -> Result<()> {
     config::init_config(hub_url, force).await
 }
 
+/// Open the SurrealDB store, creating the owner user on first run.
+/// Refuses to start if a legacy SQLite DB exists but no migration has run.
+async fn open_store_or_bail(cfg: &config::Config) -> Result<std::sync::Arc<dyn store::Store>> {
+    let surreal_dir = config::data_dir().join("surreal");
+    let sqlite_path = config::sqlite_path();
+    let surreal_exists = surreal_dir.exists()
+        && surreal_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false);
+    let migration_complete = migrate::is_migrated(&surreal_dir);
+    let legacy_sqlite_exists = sqlite_path.exists();
+
+    match (surreal_exists, migration_complete, legacy_sqlite_exists) {
+        (true, true, _) => {
+            info!("Opening SurrealDB at {:?}", surreal_dir);
+        }
+        (true, false, _) => {
+            anyhow::bail!(
+                "SurrealDB directory {:?} exists but has no `migration_completed` marker. \
+                 A previous migration was interrupted. Run: \
+                 `knowledge-nexus-agent migrate --force` to retry.",
+                surreal_dir
+            );
+        }
+        (false, _, true) => {
+            anyhow::bail!(
+                "Legacy SQLite DB at {:?} detected, but no SurrealDB yet. Run: \
+                 `knowledge-nexus-agent migrate --from sqlite --to surrealdb` to upgrade.",
+                sqlite_path
+            );
+        }
+        (false, _, false) => {
+            info!("No existing database — creating fresh SurrealDB at {:?}", surreal_dir);
+        }
+    }
+
+    let surreal_store = store::SurrealStore::open(&surreal_dir).await?;
+
+    if surreal_store.get_owner_user().await?.is_none() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let store_id = uuid::Uuid::new_v4().to_string();
+
+        let user = store::User {
+            id: user_id.clone(),
+            username: cfg.device.name.clone(),
+            display_name: cfg.device.name.clone(),
+            is_owner: true,
+            settings: serde_json::json!({}),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        surreal_store.create_user(&user).await?;
+        info!("Created default owner user: {}", user.username);
+
+        let ks = store::KnowledgeStore {
+            id: store_id.clone(),
+            owner_id: user_id,
+            store_type: "personal".into(),
+            name: format!("{}'s Knowledge", cfg.device.name),
+            lancedb_collection: format!("store_{}", store_id),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        surreal_store.create_store(&ks).await?;
+        info!("Created default personal store: {}", ks.name);
+    }
+
+    Ok(std::sync::Arc::new(surreal_store))
+}
+
 async fn cmd_start_services() -> Result<()> {
     info!("Starting Knowledge Nexus Agent...");
 
@@ -382,41 +453,8 @@ async fn cmd_start_services() -> Result<()> {
         }
     }
 
-    // Initialize SQLite database
-    let sqlite_path = config::sqlite_path();
-    info!("Opening database at {:?}", sqlite_path);
-    let database = std::sync::Arc::new(db::Database::open(&sqlite_path)?);
-
-    // Create default owner user + personal store on first run
-    if database.get_owner_user()?.is_none() {
-        let now = chrono::Utc::now().to_rfc3339();
-        let user_id = uuid::Uuid::new_v4().to_string();
-        let store_id = uuid::Uuid::new_v4().to_string();
-
-        let user = db::User {
-            id: user_id.clone(),
-            username: cfg.device.name.clone(),
-            display_name: cfg.device.name.clone(),
-            is_owner: true,
-            settings: serde_json::json!({}),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        };
-        database.create_user(&user)?;
-        info!("Created default owner user: {}", user.username);
-
-        let store = db::KnowledgeStore {
-            id: store_id.clone(),
-            owner_id: user_id.clone(),
-            store_type: "personal".into(),
-            name: format!("{}'s Knowledge", cfg.device.name),
-            lancedb_collection: format!("store_{}", store_id),
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        database.create_store(&store)?;
-        info!("Created default personal store: {}", store.name);
-    }
+    // Open SurrealDB (with migration-detection guard)
+    let store = open_store_or_bail(&cfg).await?;
 
     // Initialize shared resources for K2K server
     let vectordb = if cfg.k2k.enabled {
@@ -453,7 +491,7 @@ async fn cmd_start_services() -> Result<()> {
     // Create node registry (shared between K2K server and mDNS)
     let node_registry = if cfg.k2k.enabled {
         Some(std::sync::Arc::new(discovery::NodeRegistry::new(
-            database.clone(),
+            store.clone(),
         )))
     } else {
         None
@@ -461,7 +499,7 @@ async fn cmd_start_services() -> Result<()> {
 
     // Start K2K federation server (if enabled) with restart logic
     let k2k_cfg = cfg.clone();
-    let k2k_db = database.clone();
+    let k2k_db = store.clone();
     let k2k_handle = if cfg.k2k.enabled {
         let vdb = vectordb.expect("VectorDB should be initialized");
         let emb = embedding_model.expect("EmbeddingModel should be initialized");
