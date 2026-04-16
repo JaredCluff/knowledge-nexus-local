@@ -19,7 +19,7 @@ use super::models::*;
 use super::server::K2KServerState;
 use crate::config::load_capability_mesh_config;
 use crate::connectors::web_clip::WebClipRequest;
-use crate::db;
+use crate::store as db;
 use crate::vectordb::VectorSearchResult;
 
 // ============================================================================
@@ -461,6 +461,7 @@ pub async fn handle_routed_query(
         None => state
             .db
             .get_owner_user()
+            .await
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -494,7 +495,7 @@ pub async fn handle_list_stores(
     State(state): State<Arc<K2KServerState>>,
     Extension(claims): Extension<K2KClaims>,
 ) -> Result<Json<Vec<db::KnowledgeStore>>, (StatusCode, Json<K2KError>)> {
-    let stores = state.db.list_stores_for_user(&claims.client_id).map_err(|e| {
+    let stores = state.db.list_stores_for_user(&claims.client_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(K2KError::internal_error(e.to_string())),
@@ -539,6 +540,7 @@ pub async fn handle_create_article(
     let store = state
         .db
         .get_store(&req.store_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -582,12 +584,15 @@ pub async fn handle_create_article(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
+    let content_hash = crate::store::hash::content_hash(&req.content);
     let article = db::Article {
         id: Uuid::new_v4().to_string(),
         store_id: req.store_id,
         title: req.title,
         content: req.content,
         source_type: req.source_type,
+        source_id: String::new(),
+        content_hash,
         tags: serde_json::json!(req.tags),
         embedded_at: None,
         created_at: now.clone(),
@@ -616,6 +621,7 @@ pub async fn handle_get_article(
     let article = state
         .article_service
         .get(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -634,6 +640,7 @@ pub async fn handle_get_article(
     let store = state
         .db
         .get_store(&article.store_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -702,6 +709,7 @@ pub async fn handle_update_article(
     let mut article = state
         .article_service
         .get(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -718,6 +726,7 @@ pub async fn handle_update_article(
     let store = state
         .db
         .get_store(&article.store_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -793,6 +802,7 @@ pub async fn handle_delete_article(
     let article = state
         .article_service
         .get(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -809,6 +819,7 @@ pub async fn handle_delete_article(
     let store = state
         .db
         .get_store(&article.store_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -863,6 +874,7 @@ pub async fn handle_list_store_articles(
     let store = state
         .db
         .get_store(&store_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -902,6 +914,7 @@ pub async fn handle_list_store_articles(
     let articles = state
         .article_service
         .list_for_store(&store_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -942,7 +955,7 @@ pub async fn handle_create_conversation(
         updated_at: now,
     };
 
-    state.conversation_service.create(&conv).map_err(|e| {
+    state.conversation_service.create(&conv).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(K2KError::internal_error(e.to_string())),
@@ -967,6 +980,7 @@ pub async fn handle_get_conversation(
     let conv = state
         .conversation_service
         .get(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -989,7 +1003,7 @@ pub async fn handle_get_conversation(
         ));
     }
 
-    let messages = state.conversation_service.get_messages(&id).map_err(|e| {
+    let messages = state.conversation_service.get_messages(&id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(K2KError::internal_error(e.to_string())),
@@ -1020,6 +1034,7 @@ pub async fn handle_add_message(
     let conv = state
         .conversation_service
         .get(&conversation_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1049,7 +1064,7 @@ pub async fn handle_add_message(
         created_at: now,
     };
 
-    state.conversation_service.add_message(&msg).map_err(|e| {
+    state.conversation_service.add_message(&msg).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(K2KError::internal_error(e.to_string())),
@@ -1069,6 +1084,7 @@ pub async fn handle_list_user_conversations(
     let convs = state
         .conversation_service
         .list_for_user(&claims.client_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1099,6 +1115,7 @@ pub async fn handle_extract_knowledge(
     let conv = state
         .conversation_service
         .get(&conversation_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1122,6 +1139,7 @@ pub async fn handle_extract_knowledge(
     let store = state
         .db
         .get_store(&req.store_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1161,7 +1179,7 @@ pub async fn handle_extract_knowledge(
 pub async fn handle_list_pending_clients(
     State(state): State<Arc<K2KServerState>>,
 ) -> Result<Json<Vec<db::K2KClient>>, (StatusCode, Json<K2KError>)> {
-    let clients = state.db.list_pending_k2k_clients().map_err(|e| {
+    let clients = state.db.list_pending_k2k_clients().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(K2KError::internal_error(e.to_string())),
@@ -1182,6 +1200,7 @@ pub async fn handle_approve_client(
     state
         .db
         .update_k2k_client_status(&req.client_id, "approved")
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1205,6 +1224,7 @@ pub async fn handle_reject_client(
     state
         .db
         .update_k2k_client_status(&req.client_id, "rejected")
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1264,7 +1284,7 @@ fn truncate_content(content: &str, max_len: usize) -> String {
 pub async fn handle_list_nodes(
     State(state): State<Arc<K2KServerState>>,
 ) -> Result<Json<Vec<db::DiscoveredNode>>, (StatusCode, Json<K2KError>)> {
-    let nodes = state.db.list_discovered_nodes().map_err(|e| {
+    let nodes = state.db.list_discovered_nodes().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(K2KError::internal_error(e.to_string())),
@@ -1297,6 +1317,7 @@ pub async fn handle_create_federation(
     let local_store = state
         .db
         .get_store(&req.local_store_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1328,6 +1349,7 @@ pub async fn handle_create_federation(
     state
         .db
         .create_federation_agreement(&agreement)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1343,7 +1365,7 @@ pub async fn handle_list_federations(
     Extension(claims): Extension<K2KClaims>,
 ) -> Result<Json<Vec<db::FederationAgreement>>, (StatusCode, Json<K2KError>)> {
     // Only return federation agreements for stores owned by the requesting client.
-    let client_stores = state.db.list_stores_for_user(&claims.client_id).map_err(|e| {
+    let client_stores = state.db.list_stores_for_user(&claims.client_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(K2KError::internal_error(e.to_string())),
@@ -1351,7 +1373,7 @@ pub async fn handle_list_federations(
     })?;
     let client_store_ids: std::collections::HashSet<String> =
         client_stores.into_iter().map(|s| s.id).collect();
-    let all_agreements = state.db.list_federation_agreements().map_err(|e| {
+    let all_agreements = state.db.list_federation_agreements().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(K2KError::internal_error(e.to_string())),
@@ -1377,7 +1399,7 @@ pub async fn handle_web_clip(
     // Without this check any authenticated client could inject content into
     // another client's store by specifying its store_id (IDOR).
     if let Some(ref store_id) = req.store_id {
-        let store = state.db.get_store(store_id).map_err(|e| {
+        let store = state.db.get_store(store_id).await.map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(K2KError::internal_error(e.to_string())),

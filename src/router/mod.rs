@@ -9,7 +9,7 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::db::Database;
+use crate::store::Store;
 use crate::embeddings::EmbeddingModel;
 use crate::federation::RemoteQueryExecutor;
 use crate::k2k::models::K2KQueryResponse;
@@ -34,7 +34,7 @@ pub struct LocalRouter {
 
 impl LocalRouter {
     pub fn new(
-        db: Arc<Database>,
+        db: Arc<dyn Store>,
         vectordb: Arc<VectorDB>,
         embedding_model: Arc<Mutex<EmbeddingModel>>,
         hybrid_searcher: Option<Arc<HybridSearcher>>,
@@ -67,7 +67,7 @@ impl LocalRouter {
             .unwrap_or_else(|| self.classifier.classify(query));
 
         // 2. Plan which stores to query
-        let stores = self.planner.plan(user_id, &scope)?;
+        let stores = self.planner.plan(user_id, &scope).await?;
         let store_names: Vec<String> = stores.iter().map(|s| s.name.clone()).collect();
         let store_collections: Vec<(String, String, String)> = stores
             .iter()

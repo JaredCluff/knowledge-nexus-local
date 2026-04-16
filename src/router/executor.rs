@@ -100,7 +100,7 @@ impl QueryExecutor {
 
             // If hybrid searcher is available, run keyword search and merge
             let final_results = if let Some(ref hybrid) = self.hybrid_searcher {
-                match hybrid.keyword_search(query, top_k) {
+                match hybrid.keyword_search(query, top_k).await {
                     Ok(keyword_results) if !keyword_results.is_empty() => {
                         debug!(
                             "Hybrid search: {} vector + {} keyword results for store {}",

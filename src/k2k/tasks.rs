@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::db::Database;
+use crate::store::Store;
 
 // ============================================================================
 // Per-Client Rate Limiter
@@ -167,7 +167,7 @@ pub struct TaskQueue {
     /// Limits config (for storage quota).
     limits: TaskQueueLimits,
     /// Database reference for article count queries.
-    db: Option<Arc<Database>>,
+    db: Option<Arc<dyn Store>>,
 }
 
 impl TaskQueue {
@@ -178,7 +178,7 @@ impl TaskQueue {
     pub fn with_limits(
         max_concurrent: usize,
         limits: TaskQueueLimits,
-        db: Option<Arc<Database>>,
+        db: Option<Arc<dyn Store>>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         let per_client_limiter = Arc::new(PerClientRateLimiter::new(
@@ -251,7 +251,7 @@ impl TaskQueue {
         // --- Per-client storage quota check (knowledge_store capability) ---
         if request.capability_id == "knowledge_store" && self.limits.max_articles_per_client > 0 {
             if let Some(ref db) = self.db {
-                match db.count_articles_for_owner(client_id) {
+                match db.count_articles_for_owner(client_id).await {
                     Ok(count) if count >= self.limits.max_articles_per_client => {
                         warn!(
                             "[TASKS] Client '{}' storage quota exceeded: {} >= {} articles",

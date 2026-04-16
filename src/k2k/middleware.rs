@@ -54,7 +54,7 @@ pub async fn require_k2k_auth(
         let key_manager = state.key_manager.lock().await;
 
         // Check client status
-        let status = key_manager.get_client_status(&client_id);
+        let status = key_manager.get_client_status(&client_id).await;
         match status.as_deref() {
             Some("approved") => {} // OK
             Some("pending") => {

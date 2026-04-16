@@ -19,7 +19,7 @@ use super::task_handlers::{SemanticSearchHandler, WebSearchHandler};
 use super::tasks::{TaskQueue, TaskQueueLimits};
 use crate::config::{load_capability_mesh_config, Config};
 use crate::connectors::{ConnectorRegistry, WebClipReceiver};
-use crate::db::Database;
+use crate::store::Store;
 use crate::discovery::NodeRegistry;
 use crate::embeddings::EmbeddingModel;
 use crate::federation::RemoteQueryExecutor;
@@ -33,7 +33,7 @@ pub struct K2KServerState {
     pub key_manager: Mutex<KeyManager>,
     pub vectordb: Arc<VectorDB>,
     pub embedding_model: Arc<Mutex<EmbeddingModel>>,
-    pub db: Arc<Database>,
+    pub db: Arc<dyn Store>,
     pub router: Arc<LocalRouter>,
     pub article_service: Arc<ArticleService>,
     pub conversation_service: Arc<ConversationService>,
@@ -56,7 +56,7 @@ impl K2KServer {
         config_dir: std::path::PathBuf,
         vectordb: Arc<VectorDB>,
         embedding_model: Arc<Mutex<EmbeddingModel>>,
-        db: Arc<Database>,
+        db: Arc<dyn Store>,
         connector_registry: Arc<ConnectorRegistry>,
         node_registry: Option<Arc<NodeRegistry>>,
     ) -> anyhow::Result<Self> {

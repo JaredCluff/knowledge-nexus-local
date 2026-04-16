@@ -5,23 +5,23 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::db::Database;
+use crate::store::Store;
 use crate::k2k::models::{K2KResult, ResultProvenance};
 
 const RRF_K: f32 = 60.0;
 
 pub struct HybridSearcher {
-    db: Arc<Database>,
+    db: Arc<dyn Store>,
 }
 
 impl HybridSearcher {
-    pub fn new(db: Arc<Database>) -> Self {
+    pub fn new(db: Arc<dyn Store>) -> Self {
         Self { db }
     }
 
-    /// Perform FTS5 keyword search on articles
-    pub fn keyword_search(&self, query: &str, limit: usize) -> Result<Vec<K2KResult>> {
-        let results = self.db.fts_search_articles(query, limit)?;
+    /// Perform FTS keyword search on articles
+    pub async fn keyword_search(&self, query: &str, limit: usize) -> Result<Vec<K2KResult>> {
+        let results = self.db.fts_search_articles(query, limit).await?;
         Ok(results
             .into_iter()
             .enumerate()

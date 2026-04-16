@@ -13,7 +13,7 @@ use tokio::fs;
 use tracing::{error, info};
 
 use super::models::{ClientKey, K2KClaims};
-use crate::db::Database;
+use crate::store::Store;
 
 pub struct KeyManager {
     #[allow(dead_code)]
@@ -21,12 +21,12 @@ pub struct KeyManager {
     public_key: RsaPublicKey,
     registered_clients: HashMap<String, ClientKey>,
     config_dir: PathBuf,
-    db: Option<Arc<Database>>,
+    db: Option<Arc<dyn Store>>,
 }
 
 impl KeyManager {
     /// Create or load KeyManager with optional database backing
-    pub async fn new(config_dir: impl AsRef<Path>, db: Option<Arc<Database>>) -> Result<Self> {
+    pub async fn new(config_dir: impl AsRef<Path>, db: Option<Arc<dyn Store>>) -> Result<Self> {
         let config_dir = config_dir.as_ref().to_path_buf();
 
         // Ensure config directory exists
@@ -61,20 +61,20 @@ impl KeyManager {
 
         // Load registered clients from DB first, then fall back to JSON
         let registered_clients = if let Some(ref db) = db {
-            let db_clients = db.list_k2k_clients()?;
+            let db_clients = db.list_k2k_clients().await?;
             if db_clients.is_empty() && clients_path.exists() {
                 // Migrate from JSON to DB
                 info!("Migrating K2K clients from JSON to SQLite");
                 let json_clients = Self::load_clients_from_json(&clients_path).await?;
                 for client in json_clients.values() {
-                    let db_client = crate::db::K2KClient {
+                    let db_client = crate::store::K2KClient {
                         client_id: client.client_id.clone(),
                         public_key_pem: client.public_key_pem.clone(),
                         client_name: client.client_name.clone(),
                         registered_at: client.registered_at.to_rfc3339(),
                         status: "approved".to_string(), // Migrated clients are auto-approved
                     };
-                    db.upsert_k2k_client(&db_client)?;
+                    db.upsert_k2k_client(&db_client).await?;
                 }
                 json_clients
             } else {
@@ -151,14 +151,14 @@ impl KeyManager {
 
         // Persist to DB if available, otherwise fall back to JSON
         if let Some(ref db) = self.db {
-            let db_client = crate::db::K2KClient {
+            let db_client = crate::store::K2KClient {
                 client_id: client_key.client_id,
                 public_key_pem: client_key.public_key_pem,
                 client_name: client_key.client_name,
                 registered_at: client_key.registered_at.to_rfc3339(),
                 status: status.to_string(),
             };
-            db.upsert_k2k_client(&db_client)?;
+            db.upsert_k2k_client(&db_client).await?;
         } else {
             self.save_clients_to_json().await?;
         }
@@ -254,9 +254,10 @@ impl KeyManager {
     }
 
     /// Get client status from DB (approved/pending/rejected)
-    pub fn get_client_status(&self, client_id: &str) -> Option<String> {
+    pub async fn get_client_status(&self, client_id: &str) -> Option<String> {
         if let Some(ref db) = self.db {
             db.get_k2k_client(client_id)
+                .await
                 .ok()
                 .flatten()
                 .map(|c| c.status)
