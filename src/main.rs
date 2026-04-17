@@ -971,6 +971,20 @@ async fn cmd_reindex_quantizer(quantizer_version: &str, store_id: &str) -> Resul
     );
 
     let surreal_dir = config::data_dir().join("surreal");
+    let surreal_exists = surreal_dir.exists()
+        && surreal_dir
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+    let migration_complete = migrate::is_migrated(&surreal_dir);
+
+    if !surreal_exists || !migration_complete {
+        anyhow::bail!(
+            "SurrealDB is not ready at {:?}. Run `knowledge-nexus-agent migrate` first.",
+            surreal_dir
+        );
+    }
+
     let db = store::SurrealStore::open(&surreal_dir).await?;
 
     let store_record = db

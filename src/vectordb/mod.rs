@@ -440,7 +440,7 @@ impl VectorDB {
             parent_heading: None,
             indexed_at: now.clone(),
             document_modified_at: modified_at.to_string(),
-            quantizer_version: "ivf_pq_v1".to_string(),
+            quantizer_version: self.quantizer_version().to_string(),
         };
 
         self.insert_document(&doc_meta, &[(chunk_meta, embedding.to_vec())])
