@@ -19,6 +19,8 @@ use tracing::{debug, info};
 use crate::config;
 use crate::embeddings::EMBEDDING_DIM;
 
+pub mod quantizer;
+
 const TABLE_NAME: &str = "documents";
 const CHUNKS_TABLE: &str = "chunks";
 
