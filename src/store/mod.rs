@@ -138,6 +138,28 @@ impl SurrealStore {
     pub(crate) fn db(&self) -> &Surreal<Any> {
         &self.db
     }
+
+    /// Update only the `quantizer_version` field on a knowledge store.
+    ///
+    /// Used by the `reindex --quantizer` CLI command. Not on the `Store` trait
+    /// because it is a SurrealDB-specific operation for now.
+    pub async fn update_store_quantizer_version(
+        &self,
+        store_id: &str,
+        quantizer_version: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db()
+            .query(
+                "UPDATE type::thing('knowledge_store', $id) SET quantizer_version = $qv, updated_at = $now",
+            )
+            .bind(("id", store_id.to_string()))
+            .bind(("qv", quantizer_version.to_string()))
+            .bind(("now", now))
+            .await?
+            .check()?;
+        Ok(())
+    }
 }
 
 #[async_trait]
