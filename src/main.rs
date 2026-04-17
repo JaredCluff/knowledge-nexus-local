@@ -458,7 +458,17 @@ async fn cmd_start_services() -> Result<()> {
     // Initialize shared resources for K2K server
     let vectordb = if cfg.k2k.enabled {
         info!("Initializing vector database for K2K server...");
-        Some(std::sync::Arc::new(vectordb::VectorDB::new().await?))
+        // Resolve quantizer from the default store's quantizer_version
+        let quantizer = {
+            let registry = vectordb::quantizer::QuantizerRegistry::new();
+            let stores = store.list_stores().await?;
+            let version = stores
+                .first()
+                .map(|s| s.quantizer_version.as_str())
+                .unwrap_or("ivf_pq_v1");
+            registry.resolve(version)?
+        };
+        Some(std::sync::Arc::new(vectordb::VectorDB::open(quantizer).await?))
     } else {
         None
     };
