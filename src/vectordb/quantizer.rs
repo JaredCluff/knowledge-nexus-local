@@ -77,7 +77,10 @@ impl VectorQuantizer for IvfPqQuantizer {
     async fn build_index(&self, table: &Table) -> Result<()> {
         let row_count = table.count_rows(None).await?;
         if row_count < 256 {
-            // Not enough rows to train an IVF-PQ index — skip silently.
+            tracing::warn!(
+                "IvfPqQuantizer: only {} rows, skipping index creation (need >= 256)",
+                row_count
+            );
             return Ok(());
         }
 
@@ -140,6 +143,10 @@ impl VectorQuantizer for Int8Quantizer {
     async fn build_index(&self, table: &Table) -> Result<()> {
         let row_count = table.count_rows(None).await?;
         if row_count < 256 {
+            tracing::warn!(
+                "Int8Quantizer: only {} rows, skipping index creation (need >= 256)",
+                row_count
+            );
             return Ok(());
         }
 
@@ -422,6 +429,73 @@ mod tests {
         let results = q.search(&table, &query, &filter).await.unwrap();
         let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
         assert!(total_rows > 0, "expected at least one result");
+    }
+
+    #[tokio::test]
+    async fn test_ivf_pq_search_with_where_clause() {
+        let dir = TempDir::new().unwrap();
+        let schema = chunks_schema();
+        let db = connect(dir.path().to_string_lossy().as_ref())
+            .execute()
+            .await
+            .unwrap();
+
+        // Insert 6 rows: 3 with source_type "local", 3 with "github"
+        let embedding_array = make_embedding_array(6, 0.1);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["c0", "c1", "c2", "c3", "c4", "c5"])),
+                Arc::new(StringArray::from(vec!["d0", "d1", "d2", "d3", "d4", "d5"])),
+                embedding_array,
+                Arc::new(StringArray::from(vec!["/a", "/b", "/c", "/d", "/e", "/f"])),
+                Arc::new(StringArray::from(vec!["A", "B", "C", "D", "E", "F"])),
+                Arc::new(StringArray::from(vec![
+                    "local", "local", "local", "github", "github", "github",
+                ])),
+                Arc::new(StringArray::from(vec!["t0", "t1", "t2", "t3", "t4", "t5"])),
+                Arc::new(UInt32Array::from(vec![0u32, 1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec![
+                    "2024-01-01T00:00:00Z",
+                    "2024-01-01T00:00:00Z",
+                    "2024-01-01T00:00:00Z",
+                    "2024-01-01T00:00:00Z",
+                    "2024-01-01T00:00:00Z",
+                    "2024-01-01T00:00:00Z",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let table = db
+            .create_table("chunks", Box::new(batches))
+            .execute()
+            .await
+            .unwrap();
+
+        let q = IvfPqQuantizer;
+        let query = vec![0.1f32; EMBEDDING_DIM];
+        let filter = QuantizerFilter {
+            limit: Some(10),
+            where_clause: Some("source_type = 'github'".to_string()),
+        };
+        let results = q.search(&table, &query, &filter).await.unwrap();
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "expected exactly 3 'github' results");
+
+        // Verify all returned rows have source_type = "github"
+        for batch in &results {
+            let source_types = batch
+                .column_by_name("source_type")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                assert_eq!(source_types.value(i), "github");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
