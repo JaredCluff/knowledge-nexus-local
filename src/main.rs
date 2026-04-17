@@ -116,6 +116,15 @@ enum Commands {
         /// Force full reindex (ignore cache)
         #[arg(long)]
         force: bool,
+
+        /// Rebuild LanceDB index with a specific quantizer.
+        /// Supported: ivf_pq_v1, int8_v1, turboquant_v1
+        #[arg(long)]
+        quantizer: Option<String>,
+
+        /// Target store ID (required when --quantizer is set)
+        #[arg(long)]
+        store: Option<String>,
     },
 
     /// Open local search UI in browser
@@ -280,8 +289,19 @@ fn main() -> Result<()> {
             Commands::Search { query, limit } => {
                 cmd_search(&query, limit).await?;
             }
-            Commands::Reindex { force } => {
-                cmd_reindex(force).await?;
+            Commands::Reindex {
+                force,
+                quantizer,
+                store: store_id,
+            } => {
+                if let Some(ref qv) = quantizer {
+                    let sid = store_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("--store is required when --quantizer is specified")
+                    })?;
+                    cmd_reindex_quantizer(qv, sid).await?;
+                } else {
+                    cmd_reindex(force).await?;
+                }
             }
             Commands::Ui => {
                 cmd_ui().await?;
@@ -458,7 +478,17 @@ async fn cmd_start_services() -> Result<()> {
     // Initialize shared resources for K2K server
     let vectordb = if cfg.k2k.enabled {
         info!("Initializing vector database for K2K server...");
-        Some(std::sync::Arc::new(vectordb::VectorDB::new().await?))
+        // Resolve quantizer from the default store's quantizer_version
+        let quantizer = {
+            let registry = vectordb::quantizer::QuantizerRegistry::new();
+            let stores = store.list_stores().await?;
+            let version = stores
+                .first()
+                .map(|s| s.quantizer_version.as_str())
+                .unwrap_or("ivf_pq_v1");
+            registry.resolve(version)?
+        };
+        Some(std::sync::Arc::new(vectordb::VectorDB::open(quantizer).await?))
     } else {
         None
     };
@@ -928,6 +958,55 @@ async fn cmd_search(query: &str, limit: usize) -> Result<()> {
         println!();
     }
 
+    Ok(())
+}
+
+async fn cmd_reindex_quantizer(quantizer_version: &str, store_id: &str) -> Result<()> {
+    let registry = vectordb::quantizer::QuantizerRegistry::new();
+    let quantizer = registry.resolve(quantizer_version)?;
+
+    info!(
+        "Rebuilding LanceDB index for store '{}' with quantizer '{}'",
+        store_id, quantizer_version
+    );
+
+    let surreal_dir = config::data_dir().join("surreal");
+    let surreal_exists = surreal_dir.exists()
+        && surreal_dir
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+    let migration_complete = migrate::is_migrated(&surreal_dir);
+
+    if !surreal_exists || !migration_complete {
+        anyhow::bail!(
+            "SurrealDB is not ready at {:?}. Run `knowledge-nexus-agent migrate` first.",
+            surreal_dir
+        );
+    }
+
+    let db = store::SurrealStore::open(&surreal_dir).await?;
+
+    let store_record = db
+        .get_store(store_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Store '{}' not found", store_id))?;
+
+    println!(
+        "Store '{}': switching quantizer from '{}' to '{}'",
+        store_record.name, store_record.quantizer_version, quantizer_version
+    );
+
+    let vectordb = vectordb::VectorDB::open(quantizer).await?;
+    vectordb.build_index().await?;
+
+    db.update_store_quantizer_version(store_id, quantizer_version)
+        .await?;
+
+    println!(
+        "Reindex complete. Store now uses quantizer '{}'.",
+        quantizer_version
+    );
     Ok(())
 }
 

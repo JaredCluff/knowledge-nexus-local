@@ -9,15 +9,16 @@ use arrow_array::{
     UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
-use futures_util::TryStreamExt;
 use lancedb::connect;
-use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::config;
 use crate::embeddings::EMBEDDING_DIM;
+use crate::vectordb::quantizer::{QuantizerFilter, VectorQuantizer};
+
+pub mod quantizer;
 
 const TABLE_NAME: &str = "documents";
 const CHUNKS_TABLE: &str = "chunks";
@@ -101,6 +102,9 @@ pub struct ChunkMetadata {
     // Timestamps
     pub indexed_at: String,
     pub document_modified_at: String,
+
+    /// Which VectorQuantizer impl was active when this chunk was indexed.
+    pub quantizer_version: String,
 }
 
 /// Search result from vector database
@@ -122,27 +126,27 @@ pub struct VectorSearchResult {
 /// Vector database wrapper
 pub struct VectorDB {
     db: lancedb::Connection,
+    quantizer: Arc<dyn VectorQuantizer>,
 }
 
 impl VectorDB {
-    /// Create or open the vector database
-    pub async fn new() -> Result<Self> {
+    /// Create or open the vector database with a specific quantizer.
+    pub async fn open(quantizer: Arc<dyn VectorQuantizer>) -> Result<Self> {
         let db_path = config::data_dir().join("vectordb");
         std::fs::create_dir_all(&db_path)?;
-
         info!("Opening vector database at: {}", db_path.display());
-
         let db = connect(db_path.to_string_lossy().as_ref())
             .execute()
             .await
             .context("Failed to connect to LanceDB")?;
-
-        let vectordb = Self { db };
-
-        // Ensure tables exist
+        let vectordb = Self { db, quantizer };
         vectordb.ensure_tables().await?;
-
         Ok(vectordb)
+    }
+
+    /// Backwards-compatible constructor — uses IvfPqQuantizer as default.
+    pub async fn new() -> Result<Self> {
+        Self::open(Arc::new(quantizer::IvfPqQuantizer)).await
     }
 
     /// Ensure all tables exist
@@ -248,6 +252,7 @@ impl VectorDB {
             // Timestamps
             Field::new("indexed_at", DataType::Utf8, false),
             Field::new("document_modified_at", DataType::Utf8, false),
+            Field::new("quantizer_version", DataType::Utf8, false),
         ]));
 
         let batch = RecordBatch::new_empty(schema.clone());
@@ -358,6 +363,7 @@ impl VectorDB {
                 Arc::new(StringArray::from(vec![meta.parent_heading.as_deref()])),
                 Arc::new(StringArray::from(vec![meta.indexed_at.as_str()])),
                 Arc::new(StringArray::from(vec![meta.document_modified_at.as_str()])),
+                Arc::new(StringArray::from(vec![meta.quantizer_version.as_str()])),
             ],
         )?;
 
@@ -434,6 +440,7 @@ impl VectorDB {
             parent_heading: None,
             indexed_at: now.clone(),
             document_modified_at: modified_at.to_string(),
+            quantizer_version: self.quantizer_version().to_string(),
         };
 
         self.insert_document(&doc_meta, &[(chunk_meta, embedding.to_vec())])
@@ -447,74 +454,86 @@ impl VectorDB {
         limit: usize,
     ) -> Result<Vec<VectorSearchResult>> {
         let table = self.db.open_table(CHUNKS_TABLE).execute().await?;
-
-        let results = table
-            .vector_search(query_embedding.to_vec())?
-            .limit(limit)
-            .execute()
-            .await?;
+        let filter = QuantizerFilter {
+            limit: Some(limit),
+            ..Default::default()
+        };
+        let batches = self.quantizer.search(&table, query_embedding, &filter).await?;
 
         let mut search_results = Vec::new();
-        let batches: Vec<RecordBatch> = results.try_collect().await?;
+        for batch in &batches {
+            self.parse_search_batch(batch, &mut search_results);
+        }
+        Ok(search_results)
+    }
 
-        for batch in batches {
-            let chunk_ids = batch
-                .column_by_name("chunk_id")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let paths = batch
-                .column_by_name("document_path")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let titles = batch
-                .column_by_name("document_title")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let source_types = batch
-                .column_by_name("source_type")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let texts = batch
-                .column_by_name("text")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let chunk_indices = batch
-                .column_by_name("chunk_index")
-                .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
-            let modified_dates = batch
-                .column_by_name("document_modified_at")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let distances = batch
-                .column_by_name("_distance")
-                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+    /// Parse a single RecordBatch from a vector search into VectorSearchResult entries.
+    fn parse_search_batch(&self, batch: &RecordBatch, results: &mut Vec<VectorSearchResult>) {
+        let chunk_ids = batch
+            .column_by_name("chunk_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let paths = batch
+            .column_by_name("document_path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let titles = batch
+            .column_by_name("document_title")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let source_types = batch
+            .column_by_name("source_type")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let texts = batch
+            .column_by_name("text")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let chunk_indices = batch
+            .column_by_name("chunk_index")
+            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+        let modified_dates = batch
+            .column_by_name("document_modified_at")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let distances = batch
+            .column_by_name("_distance")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
 
-            if let (
-                Some(chunk_ids),
-                Some(paths),
-                Some(titles),
-                Some(source_types),
-                Some(distances),
-            ) = (chunk_ids, paths, titles, source_types, distances)
-            {
-                for i in 0..batch.num_rows() {
-                    let distance = distances.value(i);
-                    let score = 1.0 - distance;
+        if let (
+            Some(chunk_ids),
+            Some(paths),
+            Some(titles),
+            Some(source_types),
+            Some(distances),
+        ) = (chunk_ids, paths, titles, source_types, distances)
+        {
+            for i in 0..batch.num_rows() {
+                let distance = distances.value(i);
+                let score = 1.0 - distance;
 
-                    search_results.push(VectorSearchResult {
-                        id: chunk_ids.value(i).to_string(),
-                        path: paths.value(i).to_string(),
-                        title: titles.value(i).to_string(),
-                        score,
-                        size_bytes: 0, // Would need to join with documents table
-                        modified_at: modified_dates
-                            .map(|m| m.value(i).to_string())
-                            .unwrap_or_default(),
-                        content_type: "".to_string(),
-                        source_type: source_types.value(i).to_string(),
-                        document_type: None,
-                        chunk_text: texts.map(|t| t.value(i).to_string()),
-                        chunk_index: chunk_indices.map(|c| c.value(i)),
-                    });
-                }
+                results.push(VectorSearchResult {
+                    id: chunk_ids.value(i).to_string(),
+                    path: paths.value(i).to_string(),
+                    title: titles.value(i).to_string(),
+                    score,
+                    size_bytes: 0, // Would need to join with documents table
+                    modified_at: modified_dates
+                        .map(|m| m.value(i).to_string())
+                        .unwrap_or_default(),
+                    content_type: "".to_string(),
+                    source_type: source_types.value(i).to_string(),
+                    document_type: None,
+                    chunk_text: texts.map(|t| t.value(i).to_string()),
+                    chunk_index: chunk_indices.map(|c| c.value(i)),
+                });
             }
         }
+    }
 
-        Ok(search_results)
+    /// Build (or rebuild) the vector index using the active quantizer.
+    pub async fn build_index(&self) -> Result<()> {
+        let table = self.db.open_table(CHUNKS_TABLE).execute().await?;
+        self.quantizer.build_index(&table).await
+    }
+
+    /// Return the active quantizer's version string.
+    pub fn quantizer_version(&self) -> &str {
+        self.quantizer.version()
     }
 
     /// Delete a document and all its chunks
@@ -646,6 +665,7 @@ impl VectorDB {
             Field::new("parent_heading", DataType::Utf8, true),
             Field::new("indexed_at", DataType::Utf8, false),
             Field::new("document_modified_at", DataType::Utf8, false),
+            Field::new("quantizer_version", DataType::Utf8, false),
         ]))
     }
 }

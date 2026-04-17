@@ -20,6 +20,7 @@ path = "src/main.rs"
 [features]
 default = ["tray"]
 tray = ["dep:tray-icon", "dep:png", "dep:open"]
+turboquant = []
 
 [dependencies]
 # Async runtime
