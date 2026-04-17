@@ -48,6 +48,8 @@ pub async fn search_files(config: &Config, query: &str, limit: usize) -> Result<
 
     // Initialize components
     let mut embedding_model = EmbeddingModel::new()?;
+    // TODO(P2): VectorDB::new() defaults to IvfPqQuantizer. Should resolve
+    // from the store's quantizer_version once search_files() has access to store config.
     let vectordb = VectorDB::new().await?;
 
     // Generate query embedding
@@ -171,6 +173,8 @@ pub async fn reindex_all(config: &Config, force: bool) -> Result<()> {
     info!("Starting full reindex (force={})", force);
 
     let mut embedding_model = EmbeddingModel::new()?;
+    // TODO(P2): VectorDB::new() defaults to IvfPqQuantizer. Should resolve
+    // from the store's quantizer_version once reindex_all() has access to store config.
     let vectordb = VectorDB::new().await?;
 
     // Clear existing index if force
