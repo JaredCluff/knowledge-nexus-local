@@ -51,6 +51,8 @@ pub async fn start_watcher(config: Config) -> Result<()> {
 
     // Initialize components
     let mut embedding_model = EmbeddingModel::new()?;
+    // TODO(P2): VectorDB::new() defaults to IvfPqQuantizer. Should resolve
+    // from the store's quantizer_version once start_watcher() has access to store config.
     let vectordb = VectorDB::new().await?;
 
     // Process events

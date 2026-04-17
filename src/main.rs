@@ -997,6 +997,20 @@ async fn cmd_reindex_quantizer(quantizer_version: &str, store_id: &str) -> Resul
         store_record.name, store_record.quantizer_version, quantizer_version
     );
 
+    // NOTE: build_index() rebuilds the LanceDB index on the global `chunks`
+    // table, affecting ALL stores — not just `store_id`. This is acceptable
+    // while there is a single shared LanceDB directory. If multi-store support
+    // adds per-store LanceDB collections, this must be scoped.
+    let stores = db.list_stores().await?;
+    if stores.len() > 1 {
+        eprintln!(
+            "Warning: {} stores exist. build_index rebuilds the global LanceDB \
+             index, affecting all stores — not just '{}'.",
+            stores.len(),
+            store_id,
+        );
+    }
+
     let vectordb = vectordb::VectorDB::open(quantizer).await?;
     vectordb.build_index().await?;
 
