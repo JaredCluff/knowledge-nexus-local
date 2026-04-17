@@ -103,6 +103,9 @@ pub struct ChunkMetadata {
     // Timestamps
     pub indexed_at: String,
     pub document_modified_at: String,
+
+    /// Which VectorQuantizer impl was active when this chunk was indexed.
+    pub quantizer_version: String,
 }
 
 /// Search result from vector database
@@ -250,6 +253,7 @@ impl VectorDB {
             // Timestamps
             Field::new("indexed_at", DataType::Utf8, false),
             Field::new("document_modified_at", DataType::Utf8, false),
+            Field::new("quantizer_version", DataType::Utf8, false),
         ]));
 
         let batch = RecordBatch::new_empty(schema.clone());
@@ -360,6 +364,7 @@ impl VectorDB {
                 Arc::new(StringArray::from(vec![meta.parent_heading.as_deref()])),
                 Arc::new(StringArray::from(vec![meta.indexed_at.as_str()])),
                 Arc::new(StringArray::from(vec![meta.document_modified_at.as_str()])),
+                Arc::new(StringArray::from(vec![meta.quantizer_version.as_str()])),
             ],
         )?;
 
@@ -436,6 +441,7 @@ impl VectorDB {
             parent_heading: None,
             indexed_at: now.clone(),
             document_modified_at: modified_at.to_string(),
+            quantizer_version: "ivf_pq_v1".to_string(),
         };
 
         self.insert_document(&doc_meta, &[(chunk_meta, embedding.to_vec())])
@@ -648,6 +654,7 @@ impl VectorDB {
             Field::new("parent_heading", DataType::Utf8, true),
             Field::new("indexed_at", DataType::Utf8, false),
             Field::new("document_modified_at", DataType::Utf8, false),
+            Field::new("quantizer_version", DataType::Utf8, false),
         ]))
     }
 }

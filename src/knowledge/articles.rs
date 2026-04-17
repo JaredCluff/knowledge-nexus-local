@@ -116,6 +116,7 @@ impl ArticleService {
                 parent_heading: None,
                 indexed_at: now.clone(),
                 document_modified_at: article.updated_at.clone(),
+                quantizer_version: "ivf_pq_v1".to_string(),
             };
 
             chunk_data.push((chunk_meta, embedding));
