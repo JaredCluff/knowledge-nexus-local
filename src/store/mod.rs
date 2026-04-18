@@ -128,6 +128,12 @@ pub trait Store: Send + Sync {
     async fn list_tags_for_article(&self, article_id: &str) -> Result<Vec<Tag>>;
     async fn list_related_articles(&self, article_id: &str) -> Result<Vec<Article>>;
     async fn list_articles_without_mentions(&self, store_id: &str) -> Result<Vec<Article>>;
+
+    // Graph queries (P4)
+    async fn search_entities_by_name(&self, store_id: &str, terms: &[&str]) -> Result<Vec<Entity>>;
+    async fn list_articles_for_entities(&self, entity_ids: &[&str]) -> Result<Vec<(Article, f64)>>;
+    async fn count_entities_by_type(&self, store_id: &str) -> Result<std::collections::HashMap<String, usize>>;
+    async fn list_co_mentioned_entities(&self, entity_id: &str) -> Result<Vec<(Entity, usize)>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -1091,6 +1097,147 @@ impl Store for SurrealStore {
             .await?;
         Ok(resp.take(0)?)
     }
+
+    async fn search_entities_by_name(&self, store_id: &str, terms: &[&str]) -> Result<Vec<Entity>> {
+        if terms.is_empty() {
+            return Ok(vec![]);
+        }
+        // Build OR conditions for exact and prefix matches (case-insensitive)
+        let mut conditions = Vec::new();
+        let mut binds: Vec<(String, String)> = Vec::new();
+        for (i, term) in terms.iter().enumerate() {
+            let lower = term.to_lowercase();
+            let param = format!("term_{}", i);
+            conditions.push(format!(
+                "(string::lowercase(name) = ${p} OR string::lowercase(name) CONTAINS ${p})",
+                p = param
+            ));
+            binds.push((param, lower));
+        }
+        let where_clause = conditions.join(" OR ");
+        let query = format!(
+            "SELECT *, meta::id(id) AS id FROM entity WHERE store_id = $store_id AND ({}) ORDER BY mention_count DESC",
+            where_clause
+        );
+        let mut q = self.db().query(&query).bind(("store_id", store_id.to_string()));
+        for (param, value) in binds {
+            q = q.bind((param, value));
+        }
+        let mut resp = q.await.context("search_entities_by_name query failed")?;
+        let rows: Vec<Entity> = resp.take(0).unwrap_or_default();
+        Ok(rows)
+    }
+
+    async fn list_articles_for_entities(&self, entity_ids: &[&str]) -> Result<Vec<(Article, f64)>> {
+        if entity_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        // Collect unique article IDs with max confidence across all entity lookups.
+        // We query per entity using type::thing() to correctly match SurrealDB record IDs.
+        let mut article_confidences: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for &eid in entity_ids {
+            let mut resp = self.db()
+                .query(
+                    "SELECT meta::id(in) AS article_id, confidence
+                     FROM mentions
+                     WHERE out = type::thing('entity', $entity_id)"
+                )
+                .bind(("entity_id", eid.to_string()))
+                .await
+                .context("list_articles_for_entities query failed")?;
+            let edges: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+            for edge in &edges {
+                let aid = edge.get("article_id").and_then(|v| v.as_str()).unwrap_or_default();
+                let conf = edge.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let entry = article_confidences.entry(aid.to_string()).or_insert(0.0);
+                if conf > *entry {
+                    *entry = conf;
+                }
+            }
+        }
+
+        // Fetch articles
+        let mut results = Vec::new();
+        for (aid, confidence) in &article_confidences {
+            if let Some(article) = self.get_article(aid).await? {
+                results.push((article, *confidence));
+            }
+        }
+        // Sort by confidence descending
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results)
+    }
+
+    async fn count_entities_by_type(&self, store_id: &str) -> Result<std::collections::HashMap<String, usize>> {
+        let mut resp = self.db()
+            .query("SELECT entity_type, count() AS count FROM entity WHERE store_id = $store_id GROUP BY entity_type")
+            .bind(("store_id", store_id.to_string()))
+            .await
+            .context("count_entities_by_type query failed")?;
+        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+
+        let mut counts = std::collections::HashMap::new();
+        for row in rows {
+            let etype = row.get("entity_type").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let count = row.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            counts.insert(etype, count);
+        }
+        Ok(counts)
+    }
+
+    async fn list_co_mentioned_entities(&self, entity_id: &str) -> Result<Vec<(Entity, usize)>> {
+        // Find articles mentioning this entity, then find other entities those articles also mention.
+        // We aggregate co-occurrence counts in Rust to avoid GROUP BY syntax differences.
+
+        // Step 1: get articles that mention this entity
+        let mut resp = self.db()
+            .query("SELECT VALUE meta::id(in) FROM mentions WHERE out = type::thing('entity', $entity_id)")
+            .bind(("entity_id", entity_id.to_string()))
+            .await
+            .context("list_co_mentioned_entities step1 failed")?;
+        let article_ids: Vec<String> = resp.take::<Vec<serde_json::Value>>(0)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+
+        if article_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Step 2: for each article, collect co-mentioned entity IDs (excluding target)
+        let mut co_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for article_id in &article_ids {
+            let mut resp2 = self.db()
+                .query(
+                    "SELECT VALUE meta::id(out) FROM mentions
+                     WHERE in = type::thing('article', $article_id)
+                     AND out != type::thing('entity', $entity_id)"
+                )
+                .bind(("article_id", article_id.clone()))
+                .bind(("entity_id", entity_id.to_string()))
+                .await
+                .context("list_co_mentioned_entities step2 failed")?;
+            let co_ids: Vec<String> = resp2.take::<Vec<serde_json::Value>>(0)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            for co_id in co_ids {
+                *co_counts.entry(co_id).or_insert(0) += 1;
+            }
+        }
+
+        // Step 3: fetch entities and sort by count descending
+        let mut results = Vec::new();
+        for (co_id, count) in &co_counts {
+            if let Some(entity) = self.get_entity(co_id).await? {
+                results.push((entity, *count));
+            }
+        }
+        results.sort_by(|a, b| b.1.cmp(&a.1));
+        Ok(results)
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -1543,6 +1690,174 @@ mod entity_tests {
         s.upsert_entity_and_increment(&entity).await.unwrap();
         let got = s.get_entity("tool:rust").await.unwrap().unwrap();
         assert_eq!(got.mention_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_search_entities_by_name() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Create entities
+        s.create_entity(&Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: Some("Systems language".into()), store_id: "s1".into(),
+            mention_count: 5, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "tool:tokio".into(), name: "Tokio".into(), entity_type: "tool".into(),
+            description: Some("Async runtime".into()), store_id: "s1".into(),
+            mention_count: 3, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "concept:async-runtime".into(), name: "async runtime".into(),
+            entity_type: "concept".into(), description: None, store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Exact match
+        let results = s.search_entities_by_name("s1", &["Rust"]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "tool:rust");
+
+        // Prefix match
+        let results = s.search_entities_by_name("s1", &["Tok"]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "tool:tokio");
+
+        // Multi-word match
+        let results = s.search_entities_by_name("s1", &["async"]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "concept:async-runtime");
+
+        // No match
+        let results = s.search_entities_by_name("s1", &["Python"]).await.unwrap();
+        assert!(results.is_empty());
+
+        // Multiple terms
+        let results = s.search_entities_by_name("s1", &["Rust", "Tokio"]).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Wrong store
+        let results = s.search_entities_by_name("s2", &["Rust"]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_articles_for_entities() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Create articles
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Rust Guide".into(),
+            content: "About Rust".into(), source_type: "user".into(),
+            source_id: String::new(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a2".into(), store_id: "s1".into(), title: "Tokio Deep Dive".into(),
+            content: "About Tokio".into(), source_type: "user".into(),
+            source_id: String::new(), content_hash: "h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Create entities
+        s.create_entity(&Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: None, store_id: "s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Create mentions edges
+        s.create_mentions_edge("a1", "tool:rust", "written in Rust", 0.95).await.unwrap();
+        s.create_mentions_edge("a2", "tool:rust", "uses Rust", 0.80).await.unwrap();
+
+        // Batch lookup
+        let results = s.list_articles_for_entities(&["tool:rust"]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        // Should include confidence
+        assert!(results.iter().any(|(a, c)| a.id == "a1" && (*c - 0.95).abs() < 0.01));
+        assert!(results.iter().any(|(a, c)| a.id == "a2" && (*c - 0.80).abs() < 0.01));
+
+        // Empty input
+        let results = s.list_articles_for_entities(&[]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_count_entities_by_type() {
+        let s = fixture().await;
+        let ts = now();
+
+        s.create_entity(&Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: None, store_id: "s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "tool:tokio".into(), name: "Tokio".into(), entity_type: "tool".into(),
+            description: None, store_id: "s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "person:linus".into(), name: "Linus Torvalds".into(), entity_type: "person".into(),
+            description: None, store_id: "s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        let counts = s.count_entities_by_type("s1").await.unwrap();
+        assert_eq!(counts.get("tool"), Some(&2));
+        assert_eq!(counts.get("person"), Some(&1));
+        assert_eq!(counts.get("concept"), None);
+    }
+
+    #[tokio::test]
+    async fn test_list_co_mentioned_entities() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Create articles
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Rust Async".into(),
+            content: "C".into(), source_type: "user".into(),
+            source_id: String::new(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a2".into(), store_id: "s1".into(), title: "More Rust".into(),
+            content: "C".into(), source_type: "user".into(),
+            source_id: String::new(), content_hash: "h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Create entities
+        for (id, name, etype) in [
+            ("tool:rust", "Rust", "tool"),
+            ("tool:tokio", "Tokio", "tool"),
+            ("concept:async", "async", "concept"),
+        ] {
+            s.create_entity(&Entity {
+                id: id.into(), name: name.into(), entity_type: etype.into(),
+                description: None, store_id: "s1".into(), mention_count: 1,
+                created_at: ts.clone(), updated_at: ts.clone(),
+            }).await.unwrap();
+        }
+
+        // a1 mentions rust + tokio, a2 mentions rust + async
+        s.create_mentions_edge("a1", "tool:rust", "e", 0.9).await.unwrap();
+        s.create_mentions_edge("a1", "tool:tokio", "e", 0.9).await.unwrap();
+        s.create_mentions_edge("a2", "tool:rust", "e", 0.9).await.unwrap();
+        s.create_mentions_edge("a2", "concept:async", "e", 0.9).await.unwrap();
+
+        // Co-mentioned with rust: tokio (1 shared article a1) + async (1 shared article a2)
+        let co = s.list_co_mentioned_entities("tool:rust").await.unwrap();
+        assert_eq!(co.len(), 2);
+        // Both have 1 shared article
+        assert!(co.iter().all(|(_, count)| *count == 1));
     }
 }
 
