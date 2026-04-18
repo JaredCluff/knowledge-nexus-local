@@ -98,6 +98,12 @@ pub trait Store: Send + Sync {
     async fn create_tag(&self, tag: &Tag) -> Result<()>;
     async fn list_tags_for_store(&self, store_id: &str) -> Result<Vec<Tag>>;
     async fn upsert_tag(&self, tag: &Tag) -> Result<()>;
+
+    // Dedup queue (P3)
+    async fn create_dedup_entry(&self, entry: &DedupQueueEntry) -> Result<()>;
+    async fn list_pending_dedup(&self, store_id: &str) -> Result<Vec<DedupQueueEntry>>;
+    async fn get_dedup_entry(&self, id: &str) -> Result<Option<DedupQueueEntry>>;
+    async fn resolve_dedup_entry(&self, id: &str, status: &str) -> Result<()>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -805,6 +811,78 @@ impl Store for SurrealStore {
             .check()?;
         Ok(())
     }
+
+    // Dedup queue CRUD (P3)
+    async fn create_dedup_entry(&self, e: &DedupQueueEntry) -> Result<()> {
+        self.db()
+            .query(
+                "CREATE type::thing('dedup_queue', $id) CONTENT {
+                    store_id: $store_id,
+                    incoming_title: $incoming_title,
+                    incoming_content: $incoming_content,
+                    incoming_source_type: $incoming_source_type,
+                    incoming_source_id: $incoming_source_id,
+                    matched_article_id: $matched_article_id,
+                    content_hash: $content_hash,
+                    status: $status,
+                    created_at: $created_at,
+                    resolved_at: $resolved_at
+                }",
+            )
+            .bind(("id", e.id.clone()))
+            .bind(("store_id", e.store_id.clone()))
+            .bind(("incoming_title", e.incoming_title.clone()))
+            .bind(("incoming_content", e.incoming_content.clone()))
+            .bind(("incoming_source_type", e.incoming_source_type.clone()))
+            .bind(("incoming_source_id", e.incoming_source_id.clone()))
+            .bind(("matched_article_id", e.matched_article_id.clone()))
+            .bind(("content_hash", e.content_hash.clone()))
+            .bind(("status", e.status.clone()))
+            .bind(("created_at", e.created_at.clone()))
+            .bind(("resolved_at", e.resolved_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn list_pending_dedup(&self, store_id: &str) -> Result<Vec<DedupQueueEntry>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM dedup_queue
+                 WHERE store_id = $store_id AND status = 'pending'
+                 ORDER BY created_at DESC",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn get_dedup_entry(&self, id: &str) -> Result<Option<DedupQueueEntry>> {
+        let mut resp = self
+            .db()
+            .query("SELECT *, meta::id(id) AS id FROM type::thing('dedup_queue', $id)")
+            .bind(("id", id.to_string()))
+            .await?;
+        let rows: Vec<DedupQueueEntry> = resp.take(0)?;
+        Ok(rows.into_iter().next())
+    }
+
+    async fn resolve_dedup_entry(&self, id: &str, status: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db()
+            .query(
+                "UPDATE type::thing('dedup_queue', $id) MERGE {
+                    status: $status, resolved_at: $resolved_at
+                }",
+            )
+            .bind(("id", id.to_string()))
+            .bind(("status", status.to_string()))
+            .bind(("resolved_at", now))
+            .await?
+            .check()?;
+        Ok(())
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -1269,5 +1347,58 @@ mod tag_tests {
         // Upsert same tag should not fail
         s.upsert_tag(&tag).await.unwrap();
         assert_eq!(s.list_tags_for_store("s1").await.unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_dedup_queue_crud() {
+        let s = fixture().await;
+        let ts = now();
+        let entry = DedupQueueEntry {
+            id: "dq1".into(),
+            store_id: "s1".into(),
+            incoming_title: "Dup Article".into(),
+            incoming_content: "Some content".into(),
+            incoming_source_type: "user".into(),
+            incoming_source_id: None,
+            matched_article_id: "a1".into(),
+            content_hash: "hash123".into(),
+            status: "pending".into(),
+            created_at: ts.clone(),
+            resolved_at: None,
+        };
+        s.create_dedup_entry(&entry).await.unwrap();
+
+        let pending = s.list_pending_dedup("s1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].incoming_title, "Dup Article");
+
+        // Resolve
+        s.resolve_dedup_entry("dq1", "rejected").await.unwrap();
+        let pending = s.list_pending_dedup("s1").await.unwrap();
+        assert_eq!(pending.len(), 0);
     }
 }
