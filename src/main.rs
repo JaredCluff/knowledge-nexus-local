@@ -1563,3 +1563,94 @@ async fn cmd_logs(follow: bool, lines: usize) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod graph_search_tests {
+    use super::*;
+    use store::{Article, Entity, Store, SurrealStore, KnowledgeStore, User};
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_graph_search_integration() {
+        let s = fixture().await;
+        let ts = now();
+
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Rust Async Programming".into(),
+            content: "Rust provides powerful async capabilities using Tokio runtime".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a2".into(), store_id: "s1".into(), title: "Go Concurrency".into(),
+            content: "Go uses goroutines for concurrent programming".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a3".into(), store_id: "s1".into(), title: "Tokio Internals".into(),
+            content: "Deep dive into how Tokio scheduler works".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "h3".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_entity(&Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: Some("Systems programming language".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "tool:tokio".into(), name: "Tokio".into(), entity_type: "tool".into(),
+            description: Some("Async runtime for Rust".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_mentions_edge("a1", "tool:rust", "Rust provides", 0.95).await.unwrap();
+        s.create_mentions_edge("a1", "tool:tokio", "using Tokio", 0.90).await.unwrap();
+        s.create_mentions_edge("a3", "tool:tokio", "Tokio scheduler", 0.92).await.unwrap();
+        s.create_or_update_related_to_edge("a1", "a3", 1, 0.5).await.unwrap();
+
+        let cfg = config::RetrievalConfig::default();
+        let db: std::sync::Arc<dyn Store> = std::sync::Arc::new(s);
+        let searcher = retrieval::GraphSearcher::new(db, cfg);
+
+        // "Rust" → should find a1 (direct mention)
+        let output = searcher.search("Rust", "s1", 10).await.unwrap();
+        assert!(!output.results.is_empty());
+        assert!(output.entity_coverage > 0.0);
+        assert!(output.results.iter().any(|r| r.article_id == "a1"));
+
+        // "Tokio" → should find a1 and a3
+        let output = searcher.search("Tokio", "s1", 10).await.unwrap();
+        assert!(output.results.len() >= 2);
+        let ids: Vec<&str> = output.results.iter().map(|r| r.article_id.as_str()).collect();
+        assert!(ids.contains(&"a1"));
+        assert!(ids.contains(&"a3"));
+
+        // "Go" → no entity match, empty results
+        let output = searcher.search("Go", "s1", 10).await.unwrap();
+        assert!(output.results.is_empty());
+        assert_eq!(output.entity_coverage, 0.0);
+    }
+}

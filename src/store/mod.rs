@@ -2236,75 +2236,7 @@ mod p3_integration_tests {
         assert_eq!(without[0].id, "a2");
     }
 
-    #[tokio::test]
-    async fn test_graph_search_integration() {
-        let s = fixture().await;
-        let ts = now();
-
-        // Create two articles
-        s.create_article(&Article {
-            id: "a1".into(), store_id: "s1".into(), title: "Rust Async Programming".into(),
-            content: "Rust provides powerful async capabilities using Tokio runtime".into(),
-            source_type: "user".into(), source_id: String::new(), content_hash: "h1".into(),
-            tags: serde_json::json!([]), embedded_at: None,
-            created_at: ts.clone(), updated_at: ts.clone(),
-        }).await.unwrap();
-        s.create_article(&Article {
-            id: "a2".into(), store_id: "s1".into(), title: "Go Concurrency".into(),
-            content: "Go uses goroutines for concurrent programming".into(),
-            source_type: "user".into(), source_id: String::new(), content_hash: "h2".into(),
-            tags: serde_json::json!([]), embedded_at: None,
-            created_at: ts.clone(), updated_at: ts.clone(),
-        }).await.unwrap();
-        s.create_article(&Article {
-            id: "a3".into(), store_id: "s1".into(), title: "Tokio Internals".into(),
-            content: "Deep dive into how Tokio scheduler works".into(),
-            source_type: "user".into(), source_id: String::new(), content_hash: "h3".into(),
-            tags: serde_json::json!([]), embedded_at: None,
-            created_at: ts.clone(), updated_at: ts.clone(),
-        }).await.unwrap();
-
-        // Create entities
-        s.create_entity(&Entity {
-            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
-            description: Some("Systems programming language".into()), store_id: "s1".into(),
-            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
-        }).await.unwrap();
-        s.create_entity(&Entity {
-            id: "tool:tokio".into(), name: "Tokio".into(), entity_type: "tool".into(),
-            description: Some("Async runtime for Rust".into()), store_id: "s1".into(),
-            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
-        }).await.unwrap();
-
-        // Create MENTIONS edges
-        s.create_mentions_edge("a1", "tool:rust", "Rust provides", 0.95).await.unwrap();
-        s.create_mentions_edge("a1", "tool:tokio", "using Tokio", 0.90).await.unwrap();
-        s.create_mentions_edge("a3", "tool:tokio", "Tokio scheduler", 0.92).await.unwrap();
-
-        // Create RELATED_TO edge (a1 and a3 share tokio)
-        s.create_or_update_related_to_edge("a1", "a3", 1, 0.5).await.unwrap();
-
-        // Test GraphSearcher
-        let config = crate::config::RetrievalConfig::default();
-        let db: std::sync::Arc<dyn Store> = std::sync::Arc::new(s);
-        let searcher = crate::retrieval::GraphSearcher::new(db, config);
-
-        // Search for "Rust" — should find a1 (direct mention)
-        let output = searcher.search("Rust", "s1", 10).await.unwrap();
-        assert!(!output.results.is_empty());
-        assert!(output.entity_coverage > 0.0);
-        assert!(output.results.iter().any(|r| r.article_id == "a1"));
-
-        // Search for "Tokio" — should find a1 and a3 (both mention tokio)
-        let output = searcher.search("Tokio", "s1", 10).await.unwrap();
-        assert!(output.results.len() >= 2);
-        let article_ids: Vec<&str> = output.results.iter().map(|r| r.article_id.as_str()).collect();
-        assert!(article_ids.contains(&"a1"));
-        assert!(article_ids.contains(&"a3"));
-
-        // Search for "Go" — should find nothing (no entity for Go)
-        let output = searcher.search("Go", "s1", 10).await.unwrap();
-        assert!(output.results.is_empty());
-        assert_eq!(output.entity_coverage, 0.0);
-    }
+    // test_graph_search_integration lives in the binary test target
+    // (see tests below) because it needs crate::config and crate::retrieval
+    // which are only compiled in the binary crate.
 }
