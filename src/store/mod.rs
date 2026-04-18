@@ -87,6 +87,45 @@ pub trait Store: Send + Sync {
         store_id: &str,
         content_hash: &str,
     ) -> Result<Option<Article>>;
+
+    // Entities (P3)
+    async fn create_entity(&self, entity: &Entity) -> Result<()>;
+    async fn get_entity(&self, id: &str) -> Result<Option<Entity>>;
+    async fn list_entities_for_store(&self, store_id: &str) -> Result<Vec<Entity>>;
+    async fn upsert_entity(&self, entity: &Entity) -> Result<()>;
+
+    /// Atomically increment an entity's mention_count by 1. Creates the entity
+    /// if it doesn't exist (upsert semantics).
+    async fn upsert_entity_and_increment(
+        &self,
+        entity: &Entity,
+    ) -> Result<()>;
+
+    // Tags (P3)
+    async fn create_tag(&self, tag: &Tag) -> Result<()>;
+    async fn list_tags_for_store(&self, store_id: &str) -> Result<Vec<Tag>>;
+    async fn upsert_tag(&self, tag: &Tag) -> Result<()>;
+
+    // Dedup queue (P3)
+    async fn create_dedup_entry(&self, entry: &DedupQueueEntry) -> Result<()>;
+    async fn list_pending_dedup(&self, store_id: &str) -> Result<Vec<DedupQueueEntry>>;
+    async fn get_dedup_entry(&self, id: &str) -> Result<Option<DedupQueueEntry>>;
+    async fn resolve_dedup_entry(&self, id: &str, status: &str) -> Result<()>;
+
+    // Graph edges (P3)
+    async fn create_mentions_edge(
+        &self, article_id: &str, entity_id: &str, excerpt: &str, confidence: f64,
+    ) -> Result<()>;
+    async fn create_tagged_edge(&self, article_id: &str, tag_id: &str) -> Result<()>;
+    async fn create_or_update_related_to_edge(
+        &self, from_article_id: &str, to_article_id: &str,
+        shared_entity_count: i64, strength: f64,
+    ) -> Result<()>;
+    async fn list_entities_for_article(&self, article_id: &str) -> Result<Vec<Entity>>;
+    async fn list_articles_for_entity(&self, entity_id: &str) -> Result<Vec<Article>>;
+    async fn list_tags_for_article(&self, article_id: &str) -> Result<Vec<Tag>>;
+    async fn list_related_articles(&self, article_id: &str) -> Result<Vec<Article>>;
+    async fn list_articles_without_mentions(&self, store_id: &str) -> Result<Vec<Article>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -678,6 +717,377 @@ impl Store for SurrealStore {
         let rows: Vec<Article> = resp.take(0)?;
         Ok(rows)
     }
+
+    // Entity CRUD (P3)
+    async fn create_entity(&self, e: &Entity) -> Result<()> {
+        self.db()
+            .query(
+                "CREATE type::thing('entity', $id) CONTENT {
+                    name: $name, entity_type: $entity_type,
+                    description: $description, store_id: $store_id,
+                    mention_count: $mention_count,
+                    created_at: $created_at, updated_at: $updated_at
+                }",
+            )
+            .bind(("id", e.id.clone()))
+            .bind(("name", e.name.clone()))
+            .bind(("entity_type", e.entity_type.clone()))
+            .bind(("description", e.description.clone()))
+            .bind(("store_id", e.store_id.clone()))
+            .bind(("mention_count", e.mention_count))
+            .bind(("created_at", e.created_at.clone()))
+            .bind(("updated_at", e.updated_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn get_entity(&self, id: &str) -> Result<Option<Entity>> {
+        let mut resp = self
+            .db()
+            .query("SELECT *, meta::id(id) AS id FROM type::thing('entity', $id)")
+            .bind(("id", id.to_string()))
+            .await?;
+        let rows: Vec<Entity> = resp.take(0)?;
+        Ok(rows.into_iter().next())
+    }
+
+    async fn list_entities_for_store(&self, store_id: &str) -> Result<Vec<Entity>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM entity
+                 WHERE store_id = $store_id ORDER BY mention_count DESC",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn upsert_entity(&self, e: &Entity) -> Result<()> {
+        self.db()
+            .query(
+                "UPSERT type::thing('entity', $id) CONTENT {
+                    name: $name, entity_type: $entity_type,
+                    description: $description, store_id: $store_id,
+                    mention_count: $mention_count,
+                    created_at: $created_at, updated_at: $updated_at
+                }",
+            )
+            .bind(("id", e.id.clone()))
+            .bind(("name", e.name.clone()))
+            .bind(("entity_type", e.entity_type.clone()))
+            .bind(("description", e.description.clone()))
+            .bind(("store_id", e.store_id.clone()))
+            .bind(("mention_count", e.mention_count))
+            .bind(("created_at", e.created_at.clone()))
+            .bind(("updated_at", e.updated_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn upsert_entity_and_increment(&self, e: &Entity) -> Result<()> {
+        // Single UPSERT query that atomically creates or updates the entity.
+        // SurrealDB does NOT apply schema defaults before SET in UPSERT, so
+        // fields are NONE on first creation — the IS NONE guards are required.
+        // For new entities: mention_count = $mention_count (caller passes 1).
+        // For existing: mention_count increments by 1.
+        // created_at is preserved on update (only set on creation).
+        self.db()
+            .query(
+                "UPSERT type::thing('entity', $id) SET
+                    name = $name,
+                    entity_type = $entity_type,
+                    description = $description,
+                    store_id = $store_id,
+                    mention_count = IF mention_count IS NONE THEN $mention_count ELSE mention_count + 1 END,
+                    created_at = IF created_at IS NONE THEN $created_at ELSE created_at END,
+                    updated_at = $updated_at",
+            )
+            .bind(("id", e.id.clone()))
+            .bind(("name", e.name.clone()))
+            .bind(("entity_type", e.entity_type.clone()))
+            .bind(("description", e.description.clone()))
+            .bind(("store_id", e.store_id.clone()))
+            .bind(("mention_count", e.mention_count))
+            .bind(("created_at", e.created_at.clone()))
+            .bind(("updated_at", e.updated_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    // Tag CRUD (P3)
+    async fn create_tag(&self, t: &Tag) -> Result<()> {
+        self.db()
+            .query(
+                "CREATE type::thing('tag', $id) CONTENT {
+                    name: $name, store_id: $store_id,
+                    created_at: $created_at
+                }",
+            )
+            .bind(("id", t.id.clone()))
+            .bind(("name", t.name.clone()))
+            .bind(("store_id", t.store_id.clone()))
+            .bind(("created_at", t.created_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn list_tags_for_store(&self, store_id: &str) -> Result<Vec<Tag>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM tag
+                 WHERE store_id = $store_id ORDER BY name",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn upsert_tag(&self, t: &Tag) -> Result<()> {
+        self.db()
+            .query(
+                "UPSERT type::thing('tag', $id) CONTENT {
+                    name: $name, store_id: $store_id,
+                    created_at: $created_at
+                }",
+            )
+            .bind(("id", t.id.clone()))
+            .bind(("name", t.name.clone()))
+            .bind(("store_id", t.store_id.clone()))
+            .bind(("created_at", t.created_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    // Dedup queue CRUD (P3)
+    async fn create_dedup_entry(&self, e: &DedupQueueEntry) -> Result<()> {
+        self.db()
+            .query(
+                "CREATE type::thing('dedup_queue', $id) CONTENT {
+                    store_id: $store_id,
+                    incoming_title: $incoming_title,
+                    incoming_content: $incoming_content,
+                    incoming_source_type: $incoming_source_type,
+                    incoming_source_id: $incoming_source_id,
+                    matched_article_id: $matched_article_id,
+                    content_hash: $content_hash,
+                    status: $status,
+                    created_at: $created_at,
+                    resolved_at: $resolved_at
+                }",
+            )
+            .bind(("id", e.id.clone()))
+            .bind(("store_id", e.store_id.clone()))
+            .bind(("incoming_title", e.incoming_title.clone()))
+            .bind(("incoming_content", e.incoming_content.clone()))
+            .bind(("incoming_source_type", e.incoming_source_type.clone()))
+            .bind(("incoming_source_id", e.incoming_source_id.clone()))
+            .bind(("matched_article_id", e.matched_article_id.clone()))
+            .bind(("content_hash", e.content_hash.clone()))
+            .bind(("status", e.status.clone()))
+            .bind(("created_at", e.created_at.clone()))
+            .bind(("resolved_at", e.resolved_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn list_pending_dedup(&self, store_id: &str) -> Result<Vec<DedupQueueEntry>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM dedup_queue
+                 WHERE store_id = $store_id AND status = 'pending'
+                 ORDER BY created_at DESC",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn get_dedup_entry(&self, id: &str) -> Result<Option<DedupQueueEntry>> {
+        let mut resp = self
+            .db()
+            .query("SELECT *, meta::id(id) AS id FROM type::thing('dedup_queue', $id)")
+            .bind(("id", id.to_string()))
+            .await?;
+        let rows: Vec<DedupQueueEntry> = resp.take(0)?;
+        Ok(rows.into_iter().next())
+    }
+
+    async fn resolve_dedup_entry(&self, id: &str, status: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db()
+            .query(
+                "UPDATE type::thing('dedup_queue', $id) MERGE {
+                    status: $status, resolved_at: $resolved_at
+                }",
+            )
+            .bind(("id", id.to_string()))
+            .bind(("status", status.to_string()))
+            .bind(("resolved_at", now))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    // Graph edge methods (P3)
+    async fn create_mentions_edge(
+        &self, article_id: &str, entity_id: &str, excerpt: &str, confidence: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db()
+            .query(
+                "LET $from = type::thing('article', $article_id);
+                 LET $to   = type::thing('entity',  $entity_id);
+                 DELETE FROM mentions WHERE in = $from AND out = $to;
+                 RELATE $from->mentions->$to CONTENT {
+                    excerpt: $excerpt,
+                    confidence: $confidence,
+                    created_at: $now
+                }",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .bind(("entity_id", entity_id.to_string()))
+            .bind(("excerpt", excerpt.to_string()))
+            .bind(("confidence", confidence))
+            .bind(("now", now))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn create_tagged_edge(&self, article_id: &str, tag_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db()
+            .query(
+                "LET $from = type::thing('article', $article_id);
+                 LET $to   = type::thing('tag',     $tag_id);
+                 RELATE $from->tagged->$to CONTENT {
+                    created_at: $now
+                }",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .bind(("tag_id", tag_id.to_string()))
+            .bind(("now", now))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn create_or_update_related_to_edge(
+        &self, from_article_id: &str, to_article_id: &str,
+        shared_entity_count: i64, strength: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        // Delete existing edge if any, then recreate. This avoids duplicate edge errors.
+        self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to   = type::thing('article', $to_id);
+                 DELETE FROM related_to WHERE in = $from AND out = $to;
+                 RELATE $from->related_to->$to CONTENT {
+                    shared_entity_count: $count,
+                    strength: $strength,
+                    created_at: $now,
+                    updated_at: $now
+                }",
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("count", shared_entity_count))
+            .bind(("strength", strength))
+            .bind(("now", now))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn list_entities_for_article(&self, article_id: &str) -> Result<Vec<Entity>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM entity
+                 WHERE id IN (
+                    SELECT VALUE out FROM mentions
+                    WHERE in = type::thing('article', $article_id)
+                 )",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn list_articles_for_entity(&self, entity_id: &str) -> Result<Vec<Article>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM article
+                 WHERE id IN (
+                    SELECT VALUE in FROM mentions
+                    WHERE out = type::thing('entity', $entity_id)
+                 )",
+            )
+            .bind(("entity_id", entity_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn list_tags_for_article(&self, article_id: &str) -> Result<Vec<Tag>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM tag
+                 WHERE id IN (
+                    SELECT VALUE out FROM tagged
+                    WHERE in = type::thing('article', $article_id)
+                 )",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn list_related_articles(&self, article_id: &str) -> Result<Vec<Article>> {
+        // Query both directions since RELATED_TO edges are created unidirectionally
+        // (from the newly ingested article to existing articles).
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM article
+                 WHERE id IN (
+                    SELECT VALUE out FROM related_to
+                    WHERE in = type::thing('article', $article_id)
+                 )
+                 OR id IN (
+                    SELECT VALUE in FROM related_to
+                    WHERE out = type::thing('article', $article_id)
+                 )",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn list_articles_without_mentions(&self, store_id: &str) -> Result<Vec<Article>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM article
+                 WHERE store_id = $store_id
+                 AND id NOT IN (SELECT VALUE in FROM mentions)
+                 ORDER BY created_at DESC",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -1041,5 +1451,470 @@ mod user_tests {
 
         let users = store.list_users().await.unwrap();
         assert_eq!(users.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod entity_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_entity_crud() {
+        let s = fixture().await;
+        let ts = now();
+        let entity = Entity {
+            id: "tool:rust".into(),
+            name: "Rust".into(),
+            entity_type: "tool".into(),
+            description: Some("Systems programming language".into()),
+            store_id: "s1".into(),
+            mention_count: 0,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        };
+        s.create_entity(&entity).await.unwrap();
+
+        let got = s.get_entity("tool:rust").await.unwrap().expect("exists");
+        assert_eq!(got.name, "Rust");
+        assert_eq!(got.entity_type, "tool");
+
+        let list = s.list_entities_for_store("s1").await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        // Upsert: increment mention_count
+        let mut updated = entity.clone();
+        updated.mention_count = 1;
+        updated.updated_at = now();
+        s.upsert_entity(&updated).await.unwrap();
+        let got = s.get_entity("tool:rust").await.unwrap().unwrap();
+        assert_eq!(got.mention_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_entity_and_increment() {
+        let s = fixture().await;
+        let ts = now();
+        let entity = Entity {
+            id: "tool:rust".into(),
+            name: "Rust".into(),
+            entity_type: "tool".into(),
+            description: Some("Systems language".into()),
+            store_id: "s1".into(),
+            mention_count: 1,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        };
+
+        // First call: creates entity with mention_count = 1 (0 default + 1)
+        s.upsert_entity_and_increment(&entity).await.unwrap();
+        let got = s.get_entity("tool:rust").await.unwrap().expect("exists");
+        assert_eq!(got.mention_count, 1);
+        let original_created = got.created_at.clone();
+
+        // Second call: increments to 2, preserves created_at
+        s.upsert_entity_and_increment(&entity).await.unwrap();
+        let got = s.get_entity("tool:rust").await.unwrap().unwrap();
+        assert_eq!(got.mention_count, 2);
+        assert_eq!(got.created_at, original_created);
+
+        // Third call: increments to 3
+        s.upsert_entity_and_increment(&entity).await.unwrap();
+        let got = s.get_entity("tool:rust").await.unwrap().unwrap();
+        assert_eq!(got.mention_count, 3);
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_tag_crud() {
+        let s = fixture().await;
+        let ts = now();
+        let tag = Tag {
+            id: "machine-learning".into(),
+            name: "Machine Learning".into(),
+            store_id: "s1".into(),
+            created_at: ts.clone(),
+        };
+        s.create_tag(&tag).await.unwrap();
+
+        let list = s.list_tags_for_store("s1").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Machine Learning");
+
+        // Upsert same tag should not fail
+        s.upsert_tag(&tag).await.unwrap();
+        assert_eq!(s.list_tags_for_store("s1").await.unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_dedup_queue_crud() {
+        let s = fixture().await;
+        let ts = now();
+        let entry = DedupQueueEntry {
+            id: "dq1".into(),
+            store_id: "s1".into(),
+            incoming_title: "Dup Article".into(),
+            incoming_content: "Some content".into(),
+            incoming_source_type: "user".into(),
+            incoming_source_id: None,
+            matched_article_id: "a1".into(),
+            content_hash: "hash123".into(),
+            status: "pending".into(),
+            created_at: ts.clone(),
+            resolved_at: None,
+        };
+        s.create_dedup_entry(&entry).await.unwrap();
+
+        let pending = s.list_pending_dedup("s1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].incoming_title, "Dup Article");
+
+        // Resolve
+        s.resolve_dedup_entry("dq1", "rejected").await.unwrap();
+        let pending = s.list_pending_dedup("s1").await.unwrap();
+        assert_eq!(pending.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod graph_edge_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Rust Guide".into(),
+            content: "Learn Rust".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a2".into(), store_id: "s1".into(), title: "Async Rust".into(),
+            content: "Tokio and async".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: None, store_id: "s1".into(), mention_count: 0,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_tag(&Tag {
+            id: "programming".into(), name: "Programming".into(),
+            store_id: "s1".into(), created_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_mentions_edge() {
+        let s = fixture().await;
+        s.create_mentions_edge("a1", "tool:rust", "written in Rust", 0.95).await.unwrap();
+
+        let entities = s.list_entities_for_article("a1").await.unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "Rust");
+
+        let articles = s.list_articles_for_entity("tool:rust").await.unwrap();
+        assert_eq!(articles.len(), 1);
+        assert_eq!(articles[0].id, "a1");
+    }
+
+    #[tokio::test]
+    async fn test_tagged_edge() {
+        let s = fixture().await;
+        s.create_tagged_edge("a1", "programming").await.unwrap();
+
+        let tags = s.list_tags_for_article("a1").await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "Programming");
+    }
+
+    #[tokio::test]
+    async fn test_related_to_edge() {
+        let s = fixture().await;
+        s.create_or_update_related_to_edge("a1", "a2", 1, 0.5).await.unwrap();
+
+        let related = s.list_related_articles("a1").await.unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].id, "a2");
+
+        // Update strength
+        s.create_or_update_related_to_edge("a1", "a2", 2, 0.8).await.unwrap();
+        // Should still be 1 edge, not 2
+        let related = s.list_related_articles("a1").await.unwrap();
+        assert_eq!(related.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod p3_integration_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_full_graph_pipeline() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Create two articles
+        for (id, title, content, hash) in [
+            ("a1", "Rust Async", "Tokio and Rust async programming", "h1"),
+            ("a2", "Systems Rust", "Rust for systems programming with Tokio", "h2"),
+        ] {
+            s.create_article(&Article {
+                id: id.into(), store_id: "s1".into(), title: title.into(),
+                content: content.into(), source_type: "user".into(),
+                source_id: "".into(), content_hash: hash.into(),
+                tags: serde_json::json!([]), embedded_at: None,
+                created_at: ts.clone(), updated_at: ts.clone(),
+            }).await.unwrap();
+        }
+
+        // Create entities
+        let rust_entity = Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: Some("Systems language".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        };
+        s.upsert_entity(&rust_entity).await.unwrap();
+
+        let tokio_entity = Entity {
+            id: "tool:tokio".into(), name: "Tokio".into(), entity_type: "tool".into(),
+            description: Some("Async runtime".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        };
+        s.upsert_entity(&tokio_entity).await.unwrap();
+
+        // Create MENTIONS edges
+        s.create_mentions_edge("a1", "tool:rust", "Rust async", 0.9).await.unwrap();
+        s.create_mentions_edge("a1", "tool:tokio", "Tokio and", 0.9).await.unwrap();
+        s.create_mentions_edge("a2", "tool:rust", "Rust for systems", 0.9).await.unwrap();
+        s.create_mentions_edge("a2", "tool:tokio", "with Tokio", 0.85).await.unwrap();
+
+        // Verify entity lookup
+        let entities_a1 = s.list_entities_for_article("a1").await.unwrap();
+        assert_eq!(entities_a1.len(), 2);
+
+        let articles_rust = s.list_articles_for_entity("tool:rust").await.unwrap();
+        assert_eq!(articles_rust.len(), 2);
+
+        // Create RELATED_TO edge: a1 and a2 share 2 entities out of 2+2-2=2, strength=1.0
+        s.create_or_update_related_to_edge("a1", "a2", 2, 1.0).await.unwrap();
+
+        let related = s.list_related_articles("a1").await.unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].id, "a2");
+    }
+
+    #[tokio::test]
+    async fn test_dedup_and_review_flow() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Create original article
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Original".into(),
+            content: "Original content".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "hash1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Simulate dedup detection
+        let dup_entry = DedupQueueEntry {
+            id: "dq1".into(), store_id: "s1".into(),
+            incoming_title: "Duplicate".into(),
+            incoming_content: "Original content".into(),
+            incoming_source_type: "user".into(),
+            incoming_source_id: None,
+            matched_article_id: "a1".into(),
+            content_hash: "hash1".into(),
+            status: "pending".into(),
+            created_at: ts.clone(), resolved_at: None,
+        };
+        s.create_dedup_entry(&dup_entry).await.unwrap();
+
+        // List pending
+        let pending = s.list_pending_dedup("s1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // Reject
+        s.resolve_dedup_entry("dq1", "rejected").await.unwrap();
+        assert_eq!(s.list_pending_dedup("s1").await.unwrap().len(), 0);
+
+        let resolved = s.get_dedup_entry("dq1").await.unwrap().unwrap();
+        assert_eq!(resolved.status, "rejected");
+        assert!(resolved.resolved_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tag_migration_flow() {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Create tag and tagged edge manually (simulating post-migration state)
+        s.upsert_tag(&Tag {
+            id: "rust".into(), name: "rust".into(),
+            store_id: "s1".into(), created_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Test".into(),
+            content: "Content".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_tagged_edge("a1", "rust").await.unwrap();
+
+        let tags = s.list_tags_for_article("a1").await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].id, "rust");
+
+        let store_tags = s.list_tags_for_store("s1").await.unwrap();
+        assert_eq!(store_tags.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_articles_without_mentions() {
+        let s = fixture().await;
+        let ts = now();
+
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Has mentions".into(),
+            content: "C1".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a2".into(), store_id: "s1".into(), title: "No mentions".into(),
+            content: "C2".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.upsert_entity(&Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: None, store_id: "s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_mentions_edge("a1", "tool:rust", "in Rust", 0.9).await.unwrap();
+
+        let without = s.list_articles_without_mentions("s1").await.unwrap();
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].id, "a2");
     }
 }

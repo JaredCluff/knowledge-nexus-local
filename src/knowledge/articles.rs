@@ -4,14 +4,26 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::info;
 
+use crate::config::ExtractionConfig;
+use crate::knowledge::entity_extractor::{EntityExtractor, entity_id};
 use crate::store::{Article, Store};
 use crate::embeddings::EmbeddingModel;
 use crate::vectordb::{ChunkMetadata, DocumentMetadata, VectorDB};
+
+/// Result of an article creation attempt.
+#[derive(Debug)]
+pub enum CreateResult {
+    /// Article was created and embedded successfully.
+    Created,
+    /// Article was a duplicate; queued for review. Contains the existing article's ID.
+    Duplicate { existing_id: String },
+}
 
 pub struct ArticleService {
     db: Arc<dyn Store>,
     vectordb: Arc<VectorDB>,
     embedding_model: Arc<Mutex<EmbeddingModel>>,
+    extractor: Option<EntityExtractor>,
 }
 
 impl ArticleService {
@@ -19,16 +31,60 @@ impl ArticleService {
         db: Arc<dyn Store>,
         vectordb: Arc<VectorDB>,
         embedding_model: Arc<Mutex<EmbeddingModel>>,
+        extraction_config: Option<ExtractionConfig>,
     ) -> Self {
+        let extractor = extraction_config
+            .filter(|c| c.enabled)
+            .map(EntityExtractor::new);
         Self {
             db,
             vectordb,
             embedding_model,
+            extractor,
         }
     }
 
-    /// Create an article, auto-embed it into vector store
-    pub async fn create(&self, article: &Article, store_collection: &str) -> Result<()> {
+    /// Create an article, auto-embed it into vector store.
+    ///
+    /// Performs a content-hash dedup check first. If an article with the same
+    /// hash already exists in the same store, the incoming article is queued
+    /// for human review and the existing article's ID is returned instead.
+    pub async fn create(&self, article: &Article, store_collection: &str) -> Result<CreateResult> {
+        // --- P3 dedup check ---
+        if !article.content_hash.is_empty() {
+            if let Some(existing) = self
+                .db
+                .find_article_by_hash(&article.store_id, &article.content_hash)
+                .await?
+            {
+                tracing::info!(
+                    "Dedup: incoming article '{}' matches existing '{}' (hash {})",
+                    article.title,
+                    existing.id,
+                    article.content_hash,
+                );
+                let entry = crate::store::DedupQueueEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    store_id: article.store_id.clone(),
+                    incoming_title: article.title.clone(),
+                    incoming_content: article.content.clone(),
+                    incoming_source_type: article.source_type.clone(),
+                    incoming_source_id: if article.source_id.is_empty() {
+                        None
+                    } else {
+                        Some(article.source_id.clone())
+                    },
+                    matched_article_id: existing.id.clone(),
+                    content_hash: article.content_hash.clone(),
+                    status: "pending".into(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    resolved_at: None,
+                };
+                self.db.create_dedup_entry(&entry).await?;
+                return Ok(CreateResult::Duplicate { existing_id: existing.id });
+            }
+        }
+
         self.db.create_article(article).await?;
 
         // Chunk and embed
@@ -41,7 +97,7 @@ impl ArticleService {
         self.db.update_article(&updated).await?;
 
         info!("Created and embedded article: {}", article.title);
-        Ok(())
+        Ok(CreateResult::Created)
     }
 
     /// Update article, re-embed
@@ -153,7 +209,129 @@ impl ArticleService {
             .insert_document(&doc_meta, &chunk_data)
             .await?;
 
+        // --- P3 entity extraction ---
+        if let Some(ref extractor) = self.extractor {
+            match extractor.extract(&article.title, &article.content).await {
+                Ok(extracted) => {
+                    if let Err(e) = self.process_extracted_entities(article, &extracted).await {
+                        tracing::warn!(
+                            "Entity extraction post-processing failed for article '{}': {}",
+                            article.id, e
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Entity extraction failed for article '{}': {} — skipping",
+                        article.id, e
+                    );
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Process entities extracted by the LLM: upsert entities, create MENTIONS
+    /// edges, and compute RELATED_TO edges with other articles sharing entities.
+    async fn process_extracted_entities(
+        &self,
+        article: &Article,
+        extracted: &[crate::knowledge::entity_extractor::ExtractedEntity],
+    ) -> Result<()> {
+        if extracted.is_empty() {
+            return Ok(());
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut entity_ids = Vec::new();
+
+        for ext in extracted {
+            let eid = entity_id(&ext.entity_type, &ext.name);
+
+            // Atomic upsert: creates entity if new (mention_count=1), or
+            // increments mention_count if it already exists — no read-modify-write race.
+            let entity = crate::store::Entity {
+                id: eid.clone(),
+                name: ext.name.clone(),
+                entity_type: ext.entity_type.clone(),
+                description: ext.description.clone(),
+                store_id: article.store_id.clone(),
+                mention_count: 1,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            self.db.upsert_entity_and_increment(&entity).await?;
+
+            // Create MENTIONS edge
+            let excerpt = ext.excerpt.clone().unwrap_or_default();
+            self.db
+                .create_mentions_edge(&article.id, &eid, &excerpt, ext.confidence)
+                .await?;
+
+            entity_ids.push(eid);
+        }
+
+        // Compute RELATED_TO edges: find other articles sharing these entities
+        self.compute_related_to_edges(article, &entity_ids).await?;
+
+        tracing::info!(
+            "Extracted {} entities for article '{}'",
+            entity_ids.len(),
+            article.title
+        );
+        Ok(())
+    }
+
+    /// For each entity this article mentions, find other articles that also
+    /// mention it. For each pair, compute Jaccard similarity and create or
+    /// update a RELATED_TO edge.
+    async fn compute_related_to_edges(
+        &self,
+        article: &Article,
+        entity_ids: &[String],
+    ) -> Result<()> {
+        let my_entity_count = entity_ids.len() as f64;
+        // Collect all related article IDs and how many entities they share
+        let mut shared_counts: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+
+        for eid in entity_ids {
+            let articles = self.db.list_articles_for_entity(eid).await?;
+            for other in &articles {
+                if other.id != article.id {
+                    *shared_counts.entry(other.id.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        for (other_id, shared) in &shared_counts {
+            // Get entity count for the other article
+            let other_entities = self.db.list_entities_for_article(other_id).await?;
+            let other_count = other_entities.len() as f64;
+            // Jaccard: shared / (A + B - shared)
+            let denominator = my_entity_count + other_count - *shared as f64;
+            let strength = if denominator > 0.0 {
+                *shared as f64 / denominator
+            } else {
+                0.0
+            };
+            self.db
+                .create_or_update_related_to_edge(&article.id, other_id, *shared, strength)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Backfill entities for an already-stored article. Called by the
+    /// `extract-entities` CLI command for articles that were stored before P3.
+    pub async fn backfill_entities(
+        &self,
+        article: &Article,
+        entities: &[crate::knowledge::entity_extractor::ExtractedEntity],
+    ) -> Result<()> {
+        self.process_extracted_entities(article, entities).await
     }
 }
 
