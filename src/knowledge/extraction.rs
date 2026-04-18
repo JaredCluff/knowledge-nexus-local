@@ -53,9 +53,15 @@ impl KnowledgeExtractor {
             updated_at: now,
         };
 
-        self.article_service
-            .create(&article, store_collection)
-            .await?;
+        match self.article_service.create(&article, store_collection).await? {
+            crate::knowledge::articles::CreateResult::Created => {}
+            crate::knowledge::articles::CreateResult::Duplicate { existing_id } => {
+                tracing::info!(
+                    "Conversation extract was a duplicate of article {}",
+                    existing_id
+                );
+            }
+        }
 
         Ok(article)
     }

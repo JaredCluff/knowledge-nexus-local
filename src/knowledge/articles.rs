@@ -8,6 +8,15 @@ use crate::store::{Article, Store};
 use crate::embeddings::EmbeddingModel;
 use crate::vectordb::{ChunkMetadata, DocumentMetadata, VectorDB};
 
+/// Result of an article creation attempt.
+#[derive(Debug)]
+pub enum CreateResult {
+    /// Article was created and embedded successfully.
+    Created,
+    /// Article was a duplicate; queued for review. Contains the existing article's ID.
+    Duplicate { existing_id: String },
+}
+
 pub struct ArticleService {
     db: Arc<dyn Store>,
     vectordb: Arc<VectorDB>,
@@ -27,8 +36,47 @@ impl ArticleService {
         }
     }
 
-    /// Create an article, auto-embed it into vector store
-    pub async fn create(&self, article: &Article, store_collection: &str) -> Result<()> {
+    /// Create an article, auto-embed it into vector store.
+    ///
+    /// Performs a content-hash dedup check first. If an article with the same
+    /// hash already exists in the same store, the incoming article is queued
+    /// for human review and the existing article's ID is returned instead.
+    pub async fn create(&self, article: &Article, store_collection: &str) -> Result<CreateResult> {
+        // --- P3 dedup check ---
+        if !article.content_hash.is_empty() {
+            if let Some(existing) = self
+                .db
+                .find_article_by_hash(&article.store_id, &article.content_hash)
+                .await?
+            {
+                tracing::info!(
+                    "Dedup: incoming article '{}' matches existing '{}' (hash {})",
+                    article.title,
+                    existing.id,
+                    article.content_hash,
+                );
+                let entry = crate::store::DedupQueueEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    store_id: article.store_id.clone(),
+                    incoming_title: article.title.clone(),
+                    incoming_content: article.content.clone(),
+                    incoming_source_type: article.source_type.clone(),
+                    incoming_source_id: if article.source_id.is_empty() {
+                        None
+                    } else {
+                        Some(article.source_id.clone())
+                    },
+                    matched_article_id: existing.id.clone(),
+                    content_hash: article.content_hash.clone(),
+                    status: "pending".into(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    resolved_at: None,
+                };
+                self.db.create_dedup_entry(&entry).await?;
+                return Ok(CreateResult::Duplicate { existing_id: existing.id });
+            }
+        }
+
         self.db.create_article(article).await?;
 
         // Chunk and embed
@@ -41,7 +89,7 @@ impl ArticleService {
         self.db.update_article(&updated).await?;
 
         info!("Created and embedded article: {}", article.title);
-        Ok(())
+        Ok(CreateResult::Created)
     }
 
     /// Update article, re-embed
