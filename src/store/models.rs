@@ -114,6 +114,62 @@ pub struct ConnectorConfig {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entity {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+    pub description: Option<String>,
+    pub store_id: String,
+    pub mention_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub store_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupQueueEntry {
+    pub id: String,
+    pub store_id: String,
+    pub incoming_title: String,
+    pub incoming_content: String,
+    pub incoming_source_type: String,
+    pub incoming_source_id: Option<String>,
+    pub matched_article_id: String,
+    pub content_hash: String,
+    pub status: String,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+/// Row returned when querying a MENTIONS edge with entity fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MentionsEdge {
+    pub article_id: String,
+    pub entity_id: String,
+    pub excerpt: String,
+    pub confidence: f64,
+    pub created_at: String,
+}
+
+/// Row returned when querying a RELATED_TO edge between two articles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelatedToEdge {
+    pub from_article_id: String,
+    pub to_article_id: String,
+    pub shared_entity_count: i64,
+    pub strength: f64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +209,60 @@ mod tests {
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("ivf_pq_v1"));
+    }
+
+    #[test]
+    fn test_entity_serde_round_trip() {
+        let e = Entity {
+            id: "tool:rust".into(),
+            name: "Rust".into(),
+            entity_type: "tool".into(),
+            description: Some("Systems programming language".into()),
+            store_id: "s1".into(),
+            mention_count: 3,
+            created_at: "2026-04-17T00:00:00Z".into(),
+            updated_at: "2026-04-17T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let decoded: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id, "tool:rust");
+        assert_eq!(decoded.entity_type, "tool");
+        assert_eq!(decoded.description, Some("Systems programming language".into()));
+        assert_eq!(decoded.mention_count, 3);
+    }
+
+    #[test]
+    fn test_tag_serde_round_trip() {
+        let t = Tag {
+            id: "machine-learning".into(),
+            name: "Machine Learning".into(),
+            store_id: "s1".into(),
+            created_at: "2026-04-17T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let decoded: Tag = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id, "machine-learning");
+        assert_eq!(decoded.name, "Machine Learning");
+    }
+
+    #[test]
+    fn test_dedup_queue_entry_serde_round_trip() {
+        let d = DedupQueueEntry {
+            id: "dq1".into(),
+            store_id: "s1".into(),
+            incoming_title: "Duplicate Article".into(),
+            incoming_content: "Content here".into(),
+            incoming_source_type: "user".into(),
+            incoming_source_id: None,
+            matched_article_id: "a1".into(),
+            content_hash: "abc123".into(),
+            status: "pending".into(),
+            created_at: "2026-04-17T00:00:00Z".into(),
+            resolved_at: None,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let decoded: DedupQueueEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.status, "pending");
+        assert!(decoded.resolved_at.is_none());
     }
 }

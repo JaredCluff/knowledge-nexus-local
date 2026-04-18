@@ -1,10 +1,9 @@
-//! SurrealQL DDL for the 1.0.0 relational layer.
+//! SurrealQL DDL for the 1.0.0 relational layer, including P3 graph edges
+//! (`MENTIONS`, `TAGGED`, `RELATED_TO`) and entity/tag tables.
 //!
-//! The schema is SCHEMAFULL — unknown fields are rejected. Graph edges
-//! (`MENTIONS`, `TAGGED`, etc.) and entity/tag tables are added in P3 and
-//! are intentionally absent from this file.
+//! The schema is SCHEMAFULL — unknown fields are rejected.
 
-pub const SCHEMA_VERSION: &str = "1.0.0-p1";
+pub const SCHEMA_VERSION: &str = "1.0.0-p3";
 
 /// Returns the full SurrealQL DDL script. Idempotent: every statement uses
 /// `IF NOT EXISTS` or `OVERWRITE` so re-running on an initialized DB is a
@@ -126,5 +125,69 @@ DEFINE INDEX IF NOT EXISTS connector_config_store_idx
 DEFINE TABLE IF NOT EXISTS _schema_version SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS version ON _schema_version TYPE string;
 DEFINE FIELD IF NOT EXISTS applied_at ON _schema_version TYPE string;
+
+-- Entity (P3)
+DEFINE TABLE IF NOT EXISTS entity SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS name ON entity TYPE string;
+DEFINE FIELD IF NOT EXISTS entity_type ON entity TYPE string
+    ASSERT $value IN ["topic", "person", "project", "tool", "concept", "reference"];
+DEFINE FIELD IF NOT EXISTS description ON entity TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS store_id ON entity TYPE string;
+DEFINE FIELD IF NOT EXISTS mention_count ON entity TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS created_at ON entity TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON entity TYPE string;
+DEFINE INDEX IF NOT EXISTS entity_store_name_type_unique
+    ON entity FIELDS store_id, name, entity_type UNIQUE;
+DEFINE INDEX IF NOT EXISTS entity_store_idx ON entity FIELDS store_id;
+
+-- Tag (P3)
+DEFINE TABLE IF NOT EXISTS tag SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS name ON tag TYPE string;
+DEFINE FIELD IF NOT EXISTS store_id ON tag TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON tag TYPE string;
+DEFINE INDEX IF NOT EXISTS tag_store_name_unique ON tag FIELDS store_id, name UNIQUE;
+
+-- Dedup queue (P3)
+DEFINE TABLE IF NOT EXISTS dedup_queue SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS store_id ON dedup_queue TYPE string;
+DEFINE FIELD IF NOT EXISTS incoming_title ON dedup_queue TYPE string;
+DEFINE FIELD IF NOT EXISTS incoming_content ON dedup_queue TYPE string;
+DEFINE FIELD IF NOT EXISTS incoming_source_type ON dedup_queue TYPE string;
+DEFINE FIELD IF NOT EXISTS incoming_source_id ON dedup_queue TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS matched_article_id ON dedup_queue TYPE string;
+DEFINE FIELD IF NOT EXISTS content_hash ON dedup_queue TYPE string;
+DEFINE FIELD IF NOT EXISTS status ON dedup_queue TYPE string DEFAULT "pending"
+    ASSERT $value IN ["pending", "rejected", "merged"];
+DEFINE FIELD IF NOT EXISTS created_at ON dedup_queue TYPE string;
+DEFINE FIELD IF NOT EXISTS resolved_at ON dedup_queue TYPE option<string>;
+DEFINE INDEX IF NOT EXISTS dedup_queue_status_idx ON dedup_queue FIELDS status;
+DEFINE INDEX IF NOT EXISTS dedup_queue_store_idx ON dedup_queue FIELDS store_id;
+DEFINE INDEX IF NOT EXISTS dedup_queue_hash_idx ON dedup_queue FIELDS store_id, content_hash;
+
+-- TAGGED edge table (P3): article -> tag
+DEFINE TABLE IF NOT EXISTS tagged SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS in ON tagged TYPE record<article>;
+DEFINE FIELD IF NOT EXISTS out ON tagged TYPE record<tag>;
+DEFINE FIELD IF NOT EXISTS created_at ON tagged TYPE string;
+DEFINE INDEX IF NOT EXISTS tagged_unique ON tagged FIELDS in, out UNIQUE;
+
+-- MENTIONS edge table (P3): article -> entity
+DEFINE TABLE IF NOT EXISTS mentions SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS in ON mentions TYPE record<article>;
+DEFINE FIELD IF NOT EXISTS out ON mentions TYPE record<entity>;
+DEFINE FIELD IF NOT EXISTS excerpt ON mentions TYPE string;
+DEFINE FIELD IF NOT EXISTS confidence ON mentions TYPE float DEFAULT 0.0;
+DEFINE FIELD IF NOT EXISTS created_at ON mentions TYPE string;
+DEFINE INDEX IF NOT EXISTS mentions_unique ON mentions FIELDS in, out UNIQUE;
+
+-- RELATED_TO edge table (P3): article -> article
+DEFINE TABLE IF NOT EXISTS related_to SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS in ON related_to TYPE record<article>;
+DEFINE FIELD IF NOT EXISTS out ON related_to TYPE record<article>;
+DEFINE FIELD IF NOT EXISTS shared_entity_count ON related_to TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS strength ON related_to TYPE float DEFAULT 0.0;
+DEFINE FIELD IF NOT EXISTS created_at ON related_to TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON related_to TYPE string;
+DEFINE INDEX IF NOT EXISTS related_to_unique ON related_to FIELDS in, out UNIQUE;
 "#
 }
