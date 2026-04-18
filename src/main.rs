@@ -141,6 +141,12 @@ enum Commands {
         lines: usize,
     },
 
+    /// Review duplicate article queue
+    DedupReview {
+        #[command(subcommand)]
+        action: DedupReviewAction,
+    },
+
     /// Migrate a 0.8 SQLite database into 1.0.0 SurrealDB format.
     Migrate {
         /// Source database format. Only `sqlite` is supported.
@@ -177,6 +183,28 @@ enum PathsAction {
 
     /// List configured paths
     List,
+}
+
+#[derive(Subcommand)]
+enum DedupReviewAction {
+    /// List pending duplicate entries
+    List {
+        /// Store ID to filter by
+        #[arg(long)]
+        store: String,
+    },
+
+    /// Reject a duplicate (discard incoming content)
+    Reject {
+        /// Dedup queue entry ID
+        id: String,
+    },
+
+    /// Merge a duplicate (replace existing article with incoming content)
+    Merge {
+        /// Dedup queue entry ID
+        id: String,
+    },
 }
 
 /// Ensures the PID file is cleaned up if startup fails or process exits.
@@ -308,6 +336,9 @@ fn main() -> Result<()> {
             }
             Commands::Logs { follow, lines } => {
                 cmd_logs(follow, lines).await?;
+            }
+            Commands::DedupReview { action } => {
+                cmd_dedup_review(action).await?;
             }
             Commands::Migrate { from, to, force } => {
                 if from != "sqlite" {
@@ -1051,6 +1082,94 @@ async fn cmd_ui() -> Result<()> {
     std::process::Command::new("cmd")
         .args(["/C", "start", &url])
         .spawn()?;
+
+    Ok(())
+}
+
+async fn cmd_dedup_review(action: DedupReviewAction) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+
+    match action {
+        DedupReviewAction::List { store } => {
+            let pending = db.list_pending_dedup(&store).await?;
+            if pending.is_empty() {
+                println!("No pending duplicates for store '{}'.", store);
+                return Ok(());
+            }
+            println!("Pending duplicates ({}):\n", pending.len());
+            for entry in &pending {
+                println!(
+                    "  ID: {}\n  Incoming: \"{}\"\n  Matches: article {}\n  Hash: {}\n  Date: {}\n",
+                    entry.id, entry.incoming_title, entry.matched_article_id,
+                    entry.content_hash, entry.created_at,
+                );
+            }
+        }
+        DedupReviewAction::Reject { id } => {
+            let entry = db
+                .get_dedup_entry(&id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Dedup entry '{}' not found", id))?;
+            if entry.status != "pending" {
+                anyhow::bail!("Entry '{}' is already resolved (status: {})", id, entry.status);
+            }
+            db.resolve_dedup_entry(&id, "rejected").await?;
+            println!("Rejected duplicate '{}'. Incoming content discarded.", id);
+        }
+        DedupReviewAction::Merge { id } => {
+            let entry = db
+                .get_dedup_entry(&id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Dedup entry '{}' not found", id))?;
+            if entry.status != "pending" {
+                anyhow::bail!("Entry '{}' is already resolved (status: {})", id, entry.status);
+            }
+
+            // Get the existing article
+            let existing = db
+                .get_article(&entry.matched_article_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Matched article '{}' no longer exists",
+                        entry.matched_article_id
+                    )
+                })?;
+
+            // Prepare article with incoming content; ArticleService::update()
+            // handles content_hash, persistence, re-embedding, and embedded_at.
+            let mut updated = existing;
+            updated.title = entry.incoming_title.clone();
+            updated.content = entry.incoming_content.clone();
+            updated.updated_at = chrono::Utc::now().to_rfc3339();
+
+            // Re-embed using ArticleService (needs VectorDB + embedding model)
+            let store_record = db
+                .get_store(&updated.store_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Store '{}' not found", updated.store_id))?;
+
+            let registry = vectordb::quantizer::QuantizerRegistry::new();
+            let quantizer = registry.resolve(&store_record.quantizer_version)?;
+            let vdb = std::sync::Arc::new(vectordb::VectorDB::open(quantizer).await?);
+            let emb = embeddings::EmbeddingModel::new()?;
+            let emb_arc = std::sync::Arc::new(tokio::sync::Mutex::new(emb));
+
+            let article_svc = knowledge::ArticleService::new(
+                db.clone(), vdb, emb_arc, Some(cfg.extraction.clone()),
+            );
+            article_svc
+                .update(&updated, &store_record.lancedb_collection)
+                .await?;
+
+            db.resolve_dedup_entry(&id, "merged").await?;
+            println!(
+                "Merged duplicate '{}' into article '{}'. Content updated and re-embedded.",
+                id, entry.matched_article_id
+            );
+        }
+    }
 
     Ok(())
 }
