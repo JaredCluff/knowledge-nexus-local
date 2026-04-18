@@ -101,7 +101,7 @@ enum Commands {
         action: PathsAction,
     },
 
-    /// Search local files (offline mode)
+    /// Search articles (hybrid: vector + keyword + graph)
     Search {
         /// Search query
         query: String,
@@ -109,6 +109,14 @@ enum Commands {
         /// Maximum results
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Restrict to a specific store ID
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Show detailed provenance info (signal sources, RRF scores)
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Reindex all files
@@ -325,8 +333,8 @@ fn main() -> Result<()> {
             Commands::Paths { action } => {
                 cmd_paths(action).await?;
             }
-            Commands::Search { query, limit } => {
-                cmd_search(&query, limit).await?;
+            Commands::Search { query, limit, store, verbose } => {
+                cmd_search(&query, limit, store.as_deref(), verbose).await?;
             }
             Commands::Reindex {
                 force,
@@ -983,22 +991,61 @@ async fn cmd_paths(action: PathsAction) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_search(query: &str, limit: usize) -> Result<()> {
+async fn cmd_search(query: &str, limit: usize, store_filter: Option<&str>, verbose: bool) -> Result<()> {
     info!("Searching for: {}", query);
 
     let cfg = config::load_config().await?;
-    let results = search::search_files(&cfg, query, limit).await?;
+    let db = open_store_or_bail(&cfg).await?;
 
-    if results.is_empty() {
+    // Get owner user for the router
+    let owner = db.get_owner_user().await?
+        .ok_or_else(|| anyhow::anyhow!("No owner user found. Run `init` first."))?;
+
+    // Initialize retrieval stack
+    let registry = vectordb::quantizer::QuantizerRegistry::new();
+    // Find default store to get quantizer version
+    let stores = db.list_stores_for_user(&owner.id).await?;
+    let default_store = stores.first()
+        .ok_or_else(|| anyhow::anyhow!("No knowledge stores found. Create articles first."))?;
+    let quantizer = registry.resolve(&default_store.quantizer_version)?;
+    let vdb = std::sync::Arc::new(vectordb::VectorDB::open(quantizer).await?);
+    let emb = embeddings::EmbeddingModel::new()?;
+    let emb_arc = std::sync::Arc::new(tokio::sync::Mutex::new(emb));
+    let hybrid = Some(std::sync::Arc::new(
+        retrieval::HybridSearcher::new(db.clone()),
+    ));
+
+    let router = router::LocalRouter::new(
+        db.clone(), vdb, emb_arc, hybrid, None, cfg.retrieval.clone(),
+    );
+
+    let response = router.route(query, &owner.id, store_filter, limit).await?;
+
+    if response.results.is_empty() {
         println!("No results found for: {}", query);
         return Ok(());
     }
 
-    println!("Found {} results:\n", results.len());
-    for (i, result) in results.iter().enumerate() {
-        println!("{}. {} (score: {:.2})", i + 1, result.path, result.score);
-        if let Some(snippet) = &result.snippet {
+    println!("Found {} results ({}ms):\n", response.total_results, response.query_time_ms);
+    for (i, result) in response.results.iter().enumerate() {
+        println!("{}. [{:.2}] {}", i + 1, result.confidence, result.title);
+        // Show summary snippet
+        let snippet = if result.summary.len() > 150 {
+            let end = (0..=150)
+                .rev()
+                .find(|&j| result.summary.is_char_boundary(j))
+                .unwrap_or(0);
+            format!("{}...", &result.summary[..end])
+        } else {
+            result.summary.clone()
+        };
+        if !snippet.is_empty() {
             println!("   {}", snippet);
+        }
+        if verbose {
+            if let Some(ref prov) = result.provenance {
+                println!("   via: {} (rank: {}, rrf: {:.4})", prov.store_type, prov.original_rank, prov.rrf_score);
+            }
         }
         println!();
     }
