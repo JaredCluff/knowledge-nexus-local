@@ -1243,6 +1243,7 @@ async fn cmd_extract_entities(store_id: &str, limit: Option<usize>) -> Result<()
             Ok(entities) => {
                 if entities.is_empty() {
                     println!("no entities found");
+                    success_count += 1;
                 } else {
                     if let Err(e) = article_svc
                         .backfill_entities(&article, &entities)

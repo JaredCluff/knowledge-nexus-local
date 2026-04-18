@@ -8,8 +8,10 @@ pub mod hash;
 pub mod migrations;
 pub mod models;
 pub mod schema;
+pub mod slugify;
 
 pub use models::*;
+pub use slugify::{entity_id, slugify};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -969,6 +971,7 @@ impl Store for SurrealStore {
             .query(
                 "LET $from = type::thing('article', $article_id);
                  LET $to   = type::thing('tag',     $tag_id);
+                 DELETE FROM tagged WHERE in = $from AND out = $to;
                  RELATE $from->tagged->$to CONTENT {
                     created_at: $now
                 }",
