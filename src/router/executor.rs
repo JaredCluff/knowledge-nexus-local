@@ -4,9 +4,11 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use tracing::debug;
 
+use crate::config::RetrievalConfig;
 use crate::embeddings::EmbeddingModel;
 use crate::k2k::models::{K2KResult, ResultProvenance};
-use crate::retrieval::HybridSearcher;
+use crate::retrieval::{HybridSearcher, GraphSearcher};
+use crate::retrieval::hybrid::{RankedSignal, merge_signals};
 use crate::vectordb::VectorDB;
 
 /// Results from a single store search
@@ -21,6 +23,8 @@ pub struct QueryExecutor {
     vectordb: Arc<VectorDB>,
     embedding_model: Arc<Mutex<EmbeddingModel>>,
     hybrid_searcher: Option<Arc<HybridSearcher>>,
+    graph_searcher: Option<Arc<GraphSearcher>>,
+    retrieval_config: RetrievalConfig,
 }
 
 impl QueryExecutor {
@@ -28,11 +32,15 @@ impl QueryExecutor {
         vectordb: Arc<VectorDB>,
         embedding_model: Arc<Mutex<EmbeddingModel>>,
         hybrid_searcher: Option<Arc<HybridSearcher>>,
+        graph_searcher: Option<Arc<GraphSearcher>>,
+        retrieval_config: RetrievalConfig,
     ) -> Self {
         Self {
             vectordb,
             embedding_model,
             hybrid_searcher,
+            graph_searcher,
+            retrieval_config,
         }
     }
 
@@ -98,27 +106,59 @@ impl QueryExecutor {
                 })
                 .collect();
 
-            // If hybrid searcher is available, run keyword search and merge
-            let final_results = if let Some(ref hybrid) = self.hybrid_searcher {
+            // Keyword search (if available)
+            let keyword_results = if let Some(ref hybrid) = self.hybrid_searcher {
                 match hybrid.keyword_search(query, top_k).await {
-                    Ok(keyword_results) if !keyword_results.is_empty() => {
+                    Ok(kw) if !kw.is_empty() => {
                         debug!(
                             "Hybrid search: {} vector + {} keyword results for store {}",
-                            vector_results.len(),
-                            keyword_results.len(),
-                            store_id
+                            vector_results.len(), kw.len(), store_id
                         );
-                        hybrid.merge_hybrid(vector_results, keyword_results, top_k)
+                        kw
                     }
-                    Ok(_) => vector_results,
+                    Ok(_) => vec![],
                     Err(e) => {
                         debug!("Keyword search failed (using vector only): {}", e);
-                        vector_results
+                        vec![]
                     }
                 }
             } else {
-                vector_results
+                vec![]
             };
+
+            // Graph search (if available)
+            let (graph_results, entity_coverage) = if let Some(ref graph) = self.graph_searcher {
+                match graph.search(query, store_id, top_k).await {
+                    Ok(output) => {
+                        debug!(
+                            "Graph search: {} results, coverage {:.2} for store {}",
+                            output.results.len(), output.entity_coverage, store_id
+                        );
+                        (output.results, output.entity_coverage)
+                    }
+                    Err(e) => {
+                        debug!("Graph search failed (continuing without): {}", e);
+                        (vec![], 0.0)
+                    }
+                }
+            } else {
+                (vec![], 0.0)
+            };
+
+            // Build signals for N-way RRF merge
+            let cfg = &self.retrieval_config;
+            let graph_weight = cfg.graph_weight_max * entity_coverage;
+            let mut signals = vec![
+                RankedSignal { results: vector_results, weight: cfg.vector_weight },
+            ];
+            if !keyword_results.is_empty() {
+                signals.push(RankedSignal { results: keyword_results, weight: cfg.keyword_weight });
+            }
+            if !graph_results.is_empty() && graph_weight > 0.0 {
+                signals.push(RankedSignal { results: graph_results, weight: graph_weight });
+            }
+
+            let final_results = merge_signals(signals, top_k, cfg.rrf_k);
 
             all_results.push(StoreSearchResult {
                 store_id: store_id.clone(),
