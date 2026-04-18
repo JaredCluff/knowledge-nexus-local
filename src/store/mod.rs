@@ -1649,3 +1649,194 @@ mod graph_edge_tests {
         assert_eq!(related.len(), 1);
     }
 }
+
+#[cfg(test)]
+mod p3_integration_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_full_graph_pipeline() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Create two articles
+        for (id, title, content, hash) in [
+            ("a1", "Rust Async", "Tokio and Rust async programming", "h1"),
+            ("a2", "Systems Rust", "Rust for systems programming with Tokio", "h2"),
+        ] {
+            s.create_article(&Article {
+                id: id.into(), store_id: "s1".into(), title: title.into(),
+                content: content.into(), source_type: "user".into(),
+                source_id: "".into(), content_hash: hash.into(),
+                tags: serde_json::json!([]), embedded_at: None,
+                created_at: ts.clone(), updated_at: ts.clone(),
+            }).await.unwrap();
+        }
+
+        // Create entities
+        let rust_entity = Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: Some("Systems language".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        };
+        s.upsert_entity(&rust_entity).await.unwrap();
+
+        let tokio_entity = Entity {
+            id: "tool:tokio".into(), name: "Tokio".into(), entity_type: "tool".into(),
+            description: Some("Async runtime".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        };
+        s.upsert_entity(&tokio_entity).await.unwrap();
+
+        // Create MENTIONS edges
+        s.create_mentions_edge("a1", "tool:rust", "Rust async", 0.9).await.unwrap();
+        s.create_mentions_edge("a1", "tool:tokio", "Tokio and", 0.9).await.unwrap();
+        s.create_mentions_edge("a2", "tool:rust", "Rust for systems", 0.9).await.unwrap();
+        s.create_mentions_edge("a2", "tool:tokio", "with Tokio", 0.85).await.unwrap();
+
+        // Verify entity lookup
+        let entities_a1 = s.list_entities_for_article("a1").await.unwrap();
+        assert_eq!(entities_a1.len(), 2);
+
+        let articles_rust = s.list_articles_for_entity("tool:rust").await.unwrap();
+        assert_eq!(articles_rust.len(), 2);
+
+        // Create RELATED_TO edge: a1 and a2 share 2 entities out of 2+2-2=2, strength=1.0
+        s.create_or_update_related_to_edge("a1", "a2", 2, 1.0).await.unwrap();
+
+        let related = s.list_related_articles("a1").await.unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].id, "a2");
+    }
+
+    #[tokio::test]
+    async fn test_dedup_and_review_flow() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Create original article
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Original".into(),
+            content: "Original content".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "hash1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Simulate dedup detection
+        let dup_entry = DedupQueueEntry {
+            id: "dq1".into(), store_id: "s1".into(),
+            incoming_title: "Duplicate".into(),
+            incoming_content: "Original content".into(),
+            incoming_source_type: "user".into(),
+            incoming_source_id: None,
+            matched_article_id: "a1".into(),
+            content_hash: "hash1".into(),
+            status: "pending".into(),
+            created_at: ts.clone(), resolved_at: None,
+        };
+        s.create_dedup_entry(&dup_entry).await.unwrap();
+
+        // List pending
+        let pending = s.list_pending_dedup("s1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // Reject
+        s.resolve_dedup_entry("dq1", "rejected").await.unwrap();
+        assert_eq!(s.list_pending_dedup("s1").await.unwrap().len(), 0);
+
+        let resolved = s.get_dedup_entry("dq1").await.unwrap().unwrap();
+        assert_eq!(resolved.status, "rejected");
+        assert!(resolved.resolved_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tag_migration_flow() {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Create tag and tagged edge manually (simulating post-migration state)
+        s.upsert_tag(&Tag {
+            id: "rust".into(), name: "rust".into(),
+            store_id: "s1".into(), created_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Test".into(),
+            content: "Content".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_tagged_edge("a1", "rust").await.unwrap();
+
+        let tags = s.list_tags_for_article("a1").await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].id, "rust");
+
+        let store_tags = s.list_tags_for_store("s1").await.unwrap();
+        assert_eq!(store_tags.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_articles_without_mentions() {
+        let s = fixture().await;
+        let ts = now();
+
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Has mentions".into(),
+            content: "C1".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a2".into(), store_id: "s1".into(), title: "No mentions".into(),
+            content: "C2".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.upsert_entity(&Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: None, store_id: "s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_mentions_edge("a1", "tool:rust", "in Rust", 0.9).await.unwrap();
+
+        let without = s.list_articles_without_mentions("s1").await.unwrap();
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].id, "a2");
+    }
+}
