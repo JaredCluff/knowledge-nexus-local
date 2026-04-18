@@ -166,6 +166,12 @@ enum Commands {
         limit: Option<usize>,
     },
 
+    /// Inspect knowledge graph entities and connections
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
+
     /// Migrate a 0.8 SQLite database into 1.0.0 SurrealDB format.
     Migrate {
         /// Source database format. Only `sqlite` is supported.
@@ -223,6 +229,32 @@ enum DedupReviewAction {
     Merge {
         /// Dedup queue entry ID
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphAction {
+    /// Show entity details, mentioning articles, and co-mentioned entities
+    Entity {
+        /// Entity name to search for
+        name: String,
+
+        /// Store ID (uses default store if omitted)
+        #[arg(long)]
+        store: Option<String>,
+    },
+
+    /// Show entities, related articles, and tags for an article
+    Article {
+        /// Article ID
+        id: String,
+    },
+
+    /// Show aggregate graph statistics
+    Stats {
+        /// Store ID (uses default store if omitted)
+        #[arg(long)]
+        store: Option<String>,
     },
 }
 
@@ -361,6 +393,19 @@ fn main() -> Result<()> {
             }
             Commands::ExtractEntities { store, limit } => {
                 cmd_extract_entities(&store, limit).await?;
+            }
+            Commands::Graph { action } => {
+                match action {
+                    GraphAction::Entity { name, store } => {
+                        cmd_graph_entity(&name, store.as_deref()).await?;
+                    }
+                    GraphAction::Article { id } => {
+                        cmd_graph_article(&id).await?;
+                    }
+                    GraphAction::Stats { store } => {
+                        cmd_graph_stats(store.as_deref()).await?;
+                    }
+                }
             }
             Commands::Migrate { from, to, force } => {
                 if from != "sqlite" {
@@ -1048,6 +1093,148 @@ async fn cmd_search(query: &str, limit: usize, store_filter: Option<&str>, verbo
             }
         }
         println!();
+    }
+
+    Ok(())
+}
+
+async fn cmd_graph_entity(name: &str, store_filter: Option<&str>) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+
+    let store_id = match store_filter {
+        Some(id) => id.to_string(),
+        None => {
+            let owner = db.get_owner_user().await?
+                .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
+            let stores = db.list_stores_for_user(&owner.id).await?;
+            stores.first()
+                .ok_or_else(|| anyhow::anyhow!("No stores found"))?
+                .id.clone()
+        }
+    };
+
+    let entities = db.search_entities_by_name(&store_id, &[name]).await?;
+    if entities.is_empty() {
+        println!("No entities found matching \"{}\"", name);
+        return Ok(());
+    }
+
+    for entity in &entities {
+        println!("Entity: {} ({})", entity.name, entity.entity_type);
+        println!("  Mentions: {} articles", entity.mention_count);
+        if let Some(ref desc) = entity.description {
+            println!("  Description: \"{}\"", desc);
+        }
+
+        // Articles mentioning this entity
+        let articles = db.list_articles_for_entity(&entity.id).await?;
+        if !articles.is_empty() {
+            println!("\n  Top articles:");
+            for (i, article) in articles.iter().take(10).enumerate() {
+                println!("    {}. {}", i + 1, article.title);
+            }
+        }
+
+        // Co-mentioned entities
+        let co = db.list_co_mentioned_entities(&entity.id).await?;
+        if !co.is_empty() {
+            println!("\n  Related entities (co-mentioned):");
+            for (co_entity, count) in co.iter().take(10) {
+                println!("    {}:{} ({} shared articles)", co_entity.entity_type, co_entity.name, count);
+            }
+        }
+
+        println!();
+    }
+
+    Ok(())
+}
+
+async fn cmd_graph_article(article_id: &str) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+
+    let article = db.get_article(article_id).await?
+        .ok_or_else(|| anyhow::anyhow!("Article '{}' not found", article_id))?;
+
+    println!("Article: {}", article.title);
+    println!("  ID: {}", article.id);
+    println!("  Store: {}", article.store_id);
+
+    // Entities
+    let entities = db.list_entities_for_article(article_id).await?;
+    if entities.is_empty() {
+        println!("\n  Entities: (none \u{2014} run extract-entities to populate)");
+    } else {
+        println!("\n  Entities mentioned:");
+        for entity in &entities {
+            println!("    {}:{} (mentions: {})", entity.entity_type, entity.name, entity.mention_count);
+        }
+    }
+
+    // Related articles
+    let related = db.list_related_articles(article_id).await?;
+    if !related.is_empty() {
+        println!("\n  Related articles (via RELATED_TO):");
+        for r in related.iter().take(10) {
+            println!("    {} ({})", r.title, r.id);
+        }
+    }
+
+    // Tags
+    let tags = db.list_tags_for_article(article_id).await?;
+    if !tags.is_empty() {
+        let tag_names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+        println!("\n  Tags: {}", tag_names.join(", "));
+    }
+
+    Ok(())
+}
+
+async fn cmd_graph_stats(store_filter: Option<&str>) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+
+    let store_id = match store_filter {
+        Some(id) => id.to_string(),
+        None => {
+            let owner = db.get_owner_user().await?
+                .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
+            let stores = db.list_stores_for_user(&owner.id).await?;
+            stores.first()
+                .ok_or_else(|| anyhow::anyhow!("No stores found"))?
+                .id.clone()
+        }
+    };
+
+    let store = db.get_store(&store_id).await?
+        .ok_or_else(|| anyhow::anyhow!("Store '{}' not found", store_id))?;
+
+    println!("Store: {} ({})", store.name, store.id);
+
+    // Entity counts by type
+    let counts = db.count_entities_by_type(&store_id).await?;
+    let total_entities: usize = counts.values().sum();
+    if total_entities == 0 {
+        println!("  Entities: 0 (run extract-entities to populate)");
+    } else {
+        let type_breakdown: Vec<String> = counts.iter()
+            .map(|(t, c)| format!("{} {}", c, t))
+            .collect();
+        println!("  Entities: {} ({})", total_entities, type_breakdown.join(", "));
+    }
+
+    // Article counts
+    let all_articles = db.list_articles_for_store(&store_id).await?;
+    let without_mentions = db.list_articles_without_mentions(&store_id).await?;
+    let with_mentions = all_articles.len() - without_mentions.len();
+    println!("  Articles with extractions: {}/{}", with_mentions, all_articles.len());
+
+    // Average entities per article
+    if with_mentions > 0 {
+        let avg = total_entities as f64 / with_mentions as f64;
+        println!("  Avg entities per article: {:.1}", avg);
     }
 
     Ok(())
