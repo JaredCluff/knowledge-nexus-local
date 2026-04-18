@@ -49,10 +49,10 @@ pub fn entity_id(entity_type: &str, name: &str) -> String {
 pub fn slugify(s: &str) -> String {
     // Expand symbolic characters before slugifying
     let expanded = s
-        .replace("++", "-plus-plus")
-        .replace('+', "-plus")
-        .replace('#', "-sharp")
-        .replace('&', "-and");
+        .replace("++", "-plus-plus-")
+        .replace('+', "-plus-")
+        .replace('#', "-sharp-")
+        .replace('&', "-and-");
 
     let mut slug = String::with_capacity(expanded.len());
     let mut last_was_hyphen = true; // prevents leading hyphen

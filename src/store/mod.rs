@@ -94,6 +94,13 @@ pub trait Store: Send + Sync {
     async fn list_entities_for_store(&self, store_id: &str) -> Result<Vec<Entity>>;
     async fn upsert_entity(&self, entity: &Entity) -> Result<()>;
 
+    /// Atomically increment an entity's mention_count by 1. Creates the entity
+    /// if it doesn't exist (upsert semantics).
+    async fn upsert_entity_and_increment(
+        &self,
+        entity: &Entity,
+    ) -> Result<()>;
+
     // Tags (P3)
     async fn create_tag(&self, tag: &Tag) -> Result<()>;
     async fn list_tags_for_store(&self, store_id: &str) -> Result<Vec<Tag>>;
@@ -766,6 +773,37 @@ impl Store for SurrealStore {
                     mention_count: $mention_count,
                     created_at: $created_at, updated_at: $updated_at
                 }",
+            )
+            .bind(("id", e.id.clone()))
+            .bind(("name", e.name.clone()))
+            .bind(("entity_type", e.entity_type.clone()))
+            .bind(("description", e.description.clone()))
+            .bind(("store_id", e.store_id.clone()))
+            .bind(("mention_count", e.mention_count))
+            .bind(("created_at", e.created_at.clone()))
+            .bind(("updated_at", e.updated_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn upsert_entity_and_increment(&self, e: &Entity) -> Result<()> {
+        // Single UPSERT query that atomically creates or updates the entity.
+        // SurrealDB does NOT apply schema defaults before SET in UPSERT, so
+        // fields are NONE on first creation — the IS NONE guards are required.
+        // For new entities: mention_count = $mention_count (caller passes 1).
+        // For existing: mention_count increments by 1.
+        // created_at is preserved on update (only set on creation).
+        self.db()
+            .query(
+                "UPSERT type::thing('entity', $id) SET
+                    name = $name,
+                    entity_type = $entity_type,
+                    description = $description,
+                    store_id = $store_id,
+                    mention_count = IF mention_count IS NONE THEN $mention_count ELSE mention_count + 1 END,
+                    created_at = IF created_at IS NONE THEN $created_at ELSE created_at END,
+                    updated_at = $updated_at",
             )
             .bind(("id", e.id.clone()))
             .bind(("name", e.name.clone()))
@@ -1469,6 +1507,39 @@ mod entity_tests {
         s.upsert_entity(&updated).await.unwrap();
         let got = s.get_entity("tool:rust").await.unwrap().unwrap();
         assert_eq!(got.mention_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_entity_and_increment() {
+        let s = fixture().await;
+        let ts = now();
+        let entity = Entity {
+            id: "tool:rust".into(),
+            name: "Rust".into(),
+            entity_type: "tool".into(),
+            description: Some("Systems language".into()),
+            store_id: "s1".into(),
+            mention_count: 1,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        };
+
+        // First call: creates entity with mention_count = 1 (0 default + 1)
+        s.upsert_entity_and_increment(&entity).await.unwrap();
+        let got = s.get_entity("tool:rust").await.unwrap().expect("exists");
+        assert_eq!(got.mention_count, 1);
+        let original_created = got.created_at.clone();
+
+        // Second call: increments to 2, preserves created_at
+        s.upsert_entity_and_increment(&entity).await.unwrap();
+        let got = s.get_entity("tool:rust").await.unwrap().unwrap();
+        assert_eq!(got.mention_count, 2);
+        assert_eq!(got.created_at, original_created);
+
+        // Third call: increments to 3
+        s.upsert_entity_and_increment(&entity).await.unwrap();
+        let got = s.get_entity("tool:rust").await.unwrap().unwrap();
+        assert_eq!(got.mention_count, 3);
     }
 }
 

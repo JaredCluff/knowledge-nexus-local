@@ -44,6 +44,9 @@ DEFINE FIELD IF NOT EXISTS content ON article TYPE string;
 DEFINE FIELD IF NOT EXISTS source_type ON article TYPE string DEFAULT "user";
 DEFINE FIELD IF NOT EXISTS source_id ON article TYPE string DEFAULT "";
 DEFINE FIELD IF NOT EXISTS content_hash ON article TYPE string DEFAULT "";
+-- The `tags` JSON-array field is preserved for backward compatibility.
+-- P3 migrates tags into `tag` records + `TAGGED` edges, but the field
+-- remains in the schema so legacy data and migration paths still work.
 DEFINE FIELD IF NOT EXISTS tags ON article TYPE array DEFAULT [];
 DEFINE FIELD IF NOT EXISTS tags.* ON article TYPE string;
 DEFINE FIELD IF NOT EXISTS embedded_at ON article TYPE option<string>;

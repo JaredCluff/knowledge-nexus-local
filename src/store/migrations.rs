@@ -134,16 +134,11 @@ async fn migrate_tags_to_edges(db: &Surreal<Any>) -> Result<()> {
         }
     }
 
-    // Remove the tags field from the article schema
-    let remove_result = db
-        .query("REMOVE FIELD IF EXISTS tags ON article; REMOVE FIELD IF EXISTS tags.* ON article;")
-        .await;
-    match remove_result {
-        Ok(mut r) => { let _ = r.check(); }
-        Err(e) => {
-            tracing::warn!("Failed to remove tags field from article schema: {}", e);
-        }
-    }
+    // NOTE: We intentionally do NOT remove the `tags` field from the article
+    // schema. The DDL in schema.rs defines it (for backward compat), and
+    // removing it here would be undone on the next startup when DDL re-runs.
+    // The field stays as dead weight; canonical tag data lives in `tag` records
+    // + `TAGGED` edges.
 
     tracing::info!(
         "P3 tag migration complete: {} tags upserted, {} TAGGED edges created",

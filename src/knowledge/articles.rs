@@ -249,19 +249,19 @@ impl ArticleService {
         for ext in extracted {
             let eid = entity_id(&ext.entity_type, &ext.name);
 
-            // Upsert entity: check if it exists, increment mention_count
-            let existing = self.db.get_entity(&eid).await?;
+            // Atomic upsert: creates entity if new (mention_count=1), or
+            // increments mention_count if it already exists — no read-modify-write race.
             let entity = crate::store::Entity {
                 id: eid.clone(),
                 name: ext.name.clone(),
                 entity_type: ext.entity_type.clone(),
                 description: ext.description.clone(),
                 store_id: article.store_id.clone(),
-                mention_count: existing.as_ref().map_or(1, |e| e.mention_count + 1),
-                created_at: existing.as_ref().map_or_else(|| now.clone(), |e| e.created_at.clone()),
+                mention_count: 1,
+                created_at: now.clone(),
                 updated_at: now.clone(),
             };
-            self.db.upsert_entity(&entity).await?;
+            self.db.upsert_entity_and_increment(&entity).await?;
 
             // Create MENTIONS edge
             let excerpt = ext.excerpt.clone().unwrap_or_default();
