@@ -10,6 +10,62 @@ use crate::k2k::models::{K2KResult, ResultProvenance};
 
 const RRF_K: f32 = 60.0;
 
+/// A ranked list of results from a single retrieval signal (vector, FTS, graph)
+/// with an associated weight for RRF fusion.
+pub struct RankedSignal {
+    pub results: Vec<K2KResult>,
+    pub weight: f32,
+}
+
+/// Merge N ranked result lists using weighted Reciprocal Rank Fusion.
+///
+/// Each signal contributes `weight / (rrf_k + rank + 1)` per result.
+/// Articles appearing in multiple signals accumulate scores.
+pub fn merge_signals(
+    signals: Vec<RankedSignal>,
+    top_k: usize,
+    rrf_k: f32,
+) -> Vec<K2KResult> {
+    use std::collections::HashMap;
+
+    let mut scores: HashMap<String, (f32, K2KResult)> = HashMap::new();
+
+    for signal in signals {
+        for (rank, result) in signal.results.into_iter().enumerate() {
+            let rrf_score = signal.weight / (rrf_k + rank as f32 + 1.0);
+            let key = result.article_id.clone();
+            let entry = scores.entry(key).or_insert_with(|| (0.0, result.clone()));
+            entry.0 += rrf_score;
+            if result.confidence > entry.1.confidence {
+                entry.1 = result;
+            }
+        }
+    }
+
+    let mut results: Vec<(f32, K2KResult)> = scores.into_values().collect();
+    results.sort_by(|a, b| {
+        match b.0.partial_cmp(&a.0) {
+            Some(ord) => ord,
+            None => {
+                if b.0.is_nan() { std::cmp::Ordering::Less }
+                else { std::cmp::Ordering::Greater }
+            }
+        }
+    });
+
+    results
+        .into_iter()
+        .take(top_k)
+        .map(|(score, mut result)| {
+            result.confidence = score;
+            if let Some(ref mut prov) = result.provenance {
+                prov.rrf_score = score;
+            }
+            result
+        })
+        .collect()
+}
+
 pub struct HybridSearcher {
     db: Arc<dyn Store>,
 }
@@ -66,59 +122,97 @@ impl HybridSearcher {
         keyword_results: Vec<K2KResult>,
         top_k: usize,
     ) -> Vec<K2KResult> {
-        use std::collections::HashMap;
+        let signals = vec![
+            RankedSignal { results: vector_results, weight: 1.0 },
+            RankedSignal { results: keyword_results, weight: 1.1 },
+        ];
+        merge_signals(signals, top_k, RRF_K)
+    }
+}
 
-        let mut scores: HashMap<String, (f32, K2KResult)> = HashMap::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::k2k::models::ResultProvenance;
 
-        // Score vector results
-        for (rank, result) in vector_results.into_iter().enumerate() {
-            let rrf_score = 1.0 / (RRF_K + rank as f32 + 1.0);
-            let key = result.article_id.clone();
-            let entry = scores.entry(key).or_insert_with(|| (0.0, result.clone()));
-            entry.0 += rrf_score;
-            if result.confidence > entry.1.confidence {
-                entry.1 = result;
-            }
+    fn make_result(id: &str, store_id: &str) -> K2KResult {
+        K2KResult {
+            article_id: id.into(),
+            store_id: store_id.into(),
+            title: format!("Article {}", id),
+            summary: String::new(),
+            content: String::new(),
+            confidence: 0.0,
+            source_type: "local".into(),
+            tags: vec![],
+            metadata: serde_json::json!({}),
+            provenance: Some(ResultProvenance {
+                store_id: store_id.into(),
+                store_type: "test".into(),
+                original_rank: 0,
+                rrf_score: 0.0,
+            }),
         }
+    }
 
-        // Score keyword results (weighted slightly higher for exact matches)
-        let keyword_weight = 1.1;
-        for (rank, result) in keyword_results.into_iter().enumerate() {
-            let rrf_score = keyword_weight / (RRF_K + rank as f32 + 1.0);
-            let key = result.article_id.clone();
-            let entry = scores.entry(key).or_insert_with(|| (0.0, result.clone()));
-            entry.0 += rrf_score;
-            if result.confidence > entry.1.confidence {
-                entry.1 = result;
-            }
-        }
+    #[test]
+    fn test_merge_signals_two_lists() {
+        let vector = vec![make_result("a1", "s1"), make_result("a2", "s1")];
+        let keyword = vec![make_result("a2", "s1"), make_result("a3", "s1")];
+        let signals = vec![
+            RankedSignal { results: vector, weight: 1.0 },
+            RankedSignal { results: keyword, weight: 1.1 },
+        ];
+        let merged = merge_signals(signals, 10, 60.0);
+        // a2 appears in both, should rank highest
+        assert_eq!(merged[0].article_id, "a2");
+        assert_eq!(merged.len(), 3);
+    }
 
-        // Sort by combined RRF score
-        let mut results: Vec<(f32, K2KResult)> = scores.into_values().collect();
-        results.sort_by(|a, b| {
-            match b.0.partial_cmp(&a.0) {
-                Some(ord) => ord,
-                None => {
-                    // NaN safety: treat NaN as lowest score
-                    if b.0.is_nan() {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    }
-                }
-            }
-        });
+    #[test]
+    fn test_merge_signals_three_lists_with_graph() {
+        let vector = vec![make_result("a1", "s1"), make_result("a2", "s1")];
+        let keyword = vec![make_result("a2", "s1"), make_result("a3", "s1")];
+        let graph = vec![make_result("a3", "s1"), make_result("a4", "s1")];
+        let signals = vec![
+            RankedSignal { results: vector, weight: 1.0 },
+            RankedSignal { results: keyword, weight: 1.1 },
+            RankedSignal { results: graph, weight: 0.8 },
+        ];
+        let merged = merge_signals(signals, 10, 60.0);
+        assert_eq!(merged.len(), 4); // a1, a2, a3, a4
+        // a2 and a3 appear in 2 lists each, should rank above a1 and a4
+        let top_two: Vec<&str> = merged[..2].iter().map(|r| r.article_id.as_str()).collect();
+        assert!(top_two.contains(&"a2"));
+        assert!(top_two.contains(&"a3"));
+    }
 
-        results
-            .into_iter()
-            .take(top_k)
-            .map(|(score, mut result)| {
-                result.confidence = score;
-                if let Some(ref mut prov) = result.provenance {
-                    prov.rrf_score = score;
-                }
-                result
-            })
-            .collect()
+    #[test]
+    fn test_merge_signals_zero_weight_list_ignored() {
+        let vector = vec![make_result("a1", "s1")];
+        let graph = vec![make_result("a2", "s1")];
+        let signals = vec![
+            RankedSignal { results: vector, weight: 1.0 },
+            RankedSignal { results: graph, weight: 0.0 },
+        ];
+        let merged = merge_signals(signals, 10, 60.0);
+        // a2 should still appear but with 0 score from graph
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].article_id, "a1");
+    }
+
+    #[test]
+    fn test_merge_signals_empty_inputs() {
+        let signals: Vec<RankedSignal> = vec![];
+        let merged = merge_signals(signals, 10, 60.0);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_merge_signals_top_k_limit() {
+        let long_list: Vec<K2KResult> = (0..20).map(|i| make_result(&format!("a{}", i), "s1")).collect();
+        let signals = vec![RankedSignal { results: long_list, weight: 1.0 }];
+        let merged = merge_signals(signals, 5, 60.0);
+        assert_eq!(merged.len(), 5);
     }
 }
