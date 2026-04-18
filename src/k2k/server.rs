@@ -84,6 +84,7 @@ impl K2KServer {
             db.clone(),
             vectordb.clone(),
             embedding_model.clone(),
+            Some(config.extraction.clone()),
         ));
 
         let conversation_service = Arc::new(ConversationService::new(db.clone()));
