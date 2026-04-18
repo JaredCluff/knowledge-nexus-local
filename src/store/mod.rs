@@ -87,6 +87,12 @@ pub trait Store: Send + Sync {
         store_id: &str,
         content_hash: &str,
     ) -> Result<Option<Article>>;
+
+    // Entities (P3)
+    async fn create_entity(&self, entity: &Entity) -> Result<()>;
+    async fn get_entity(&self, id: &str) -> Result<Option<Entity>>;
+    async fn list_entities_for_store(&self, store_id: &str) -> Result<Vec<Entity>>;
+    async fn upsert_entity(&self, entity: &Entity) -> Result<()>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -678,6 +684,75 @@ impl Store for SurrealStore {
         let rows: Vec<Article> = resp.take(0)?;
         Ok(rows)
     }
+
+    // Entity CRUD (P3)
+    async fn create_entity(&self, e: &Entity) -> Result<()> {
+        self.db()
+            .query(
+                "CREATE type::thing('entity', $id) CONTENT {
+                    name: $name, entity_type: $entity_type,
+                    description: $description, store_id: $store_id,
+                    mention_count: $mention_count,
+                    created_at: $created_at, updated_at: $updated_at
+                }",
+            )
+            .bind(("id", e.id.clone()))
+            .bind(("name", e.name.clone()))
+            .bind(("entity_type", e.entity_type.clone()))
+            .bind(("description", e.description.clone()))
+            .bind(("store_id", e.store_id.clone()))
+            .bind(("mention_count", e.mention_count))
+            .bind(("created_at", e.created_at.clone()))
+            .bind(("updated_at", e.updated_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn get_entity(&self, id: &str) -> Result<Option<Entity>> {
+        let mut resp = self
+            .db()
+            .query("SELECT *, meta::id(id) AS id FROM type::thing('entity', $id)")
+            .bind(("id", id.to_string()))
+            .await?;
+        let rows: Vec<Entity> = resp.take(0)?;
+        Ok(rows.into_iter().next())
+    }
+
+    async fn list_entities_for_store(&self, store_id: &str) -> Result<Vec<Entity>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM entity
+                 WHERE store_id = $store_id ORDER BY mention_count DESC",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn upsert_entity(&self, e: &Entity) -> Result<()> {
+        self.db()
+            .query(
+                "UPSERT type::thing('entity', $id) CONTENT {
+                    name: $name, entity_type: $entity_type,
+                    description: $description, store_id: $store_id,
+                    mention_count: $mention_count,
+                    created_at: $created_at, updated_at: $updated_at
+                }",
+            )
+            .bind(("id", e.id.clone()))
+            .bind(("name", e.name.clone()))
+            .bind(("entity_type", e.entity_type.clone()))
+            .bind(("description", e.description.clone()))
+            .bind(("store_id", e.store_id.clone()))
+            .bind(("mention_count", e.mention_count))
+            .bind(("created_at", e.created_at.clone()))
+            .bind(("updated_at", e.updated_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -1041,5 +1116,61 @@ mod user_tests {
 
         let users = store.list_users().await.unwrap();
         assert_eq!(users.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod entity_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_entity_crud() {
+        let s = fixture().await;
+        let ts = now();
+        let entity = Entity {
+            id: "tool:rust".into(),
+            name: "Rust".into(),
+            entity_type: "tool".into(),
+            description: Some("Systems programming language".into()),
+            store_id: "s1".into(),
+            mention_count: 0,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        };
+        s.create_entity(&entity).await.unwrap();
+
+        let got = s.get_entity("tool:rust").await.unwrap().expect("exists");
+        assert_eq!(got.name, "Rust");
+        assert_eq!(got.entity_type, "tool");
+
+        let list = s.list_entities_for_store("s1").await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        // Upsert: increment mention_count
+        let mut updated = entity.clone();
+        updated.mention_count = 1;
+        updated.updated_at = now();
+        s.upsert_entity(&updated).await.unwrap();
+        let got = s.get_entity("tool:rust").await.unwrap().unwrap();
+        assert_eq!(got.mention_count, 1);
     }
 }
