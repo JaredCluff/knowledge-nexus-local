@@ -93,6 +93,11 @@ pub trait Store: Send + Sync {
     async fn get_entity(&self, id: &str) -> Result<Option<Entity>>;
     async fn list_entities_for_store(&self, store_id: &str) -> Result<Vec<Entity>>;
     async fn upsert_entity(&self, entity: &Entity) -> Result<()>;
+
+    // Tags (P3)
+    async fn create_tag(&self, tag: &Tag) -> Result<()>;
+    async fn list_tags_for_store(&self, store_id: &str) -> Result<Vec<Tag>>;
+    async fn upsert_tag(&self, tag: &Tag) -> Result<()>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -753,6 +758,53 @@ impl Store for SurrealStore {
             .check()?;
         Ok(())
     }
+
+    // Tag CRUD (P3)
+    async fn create_tag(&self, t: &Tag) -> Result<()> {
+        self.db()
+            .query(
+                "CREATE type::thing('tag', $id) CONTENT {
+                    name: $name, store_id: $store_id,
+                    created_at: $created_at
+                }",
+            )
+            .bind(("id", t.id.clone()))
+            .bind(("name", t.name.clone()))
+            .bind(("store_id", t.store_id.clone()))
+            .bind(("created_at", t.created_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn list_tags_for_store(&self, store_id: &str) -> Result<Vec<Tag>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM tag
+                 WHERE store_id = $store_id ORDER BY name",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn upsert_tag(&self, t: &Tag) -> Result<()> {
+        self.db()
+            .query(
+                "UPSERT type::thing('tag', $id) CONTENT {
+                    name: $name, store_id: $store_id,
+                    created_at: $created_at
+                }",
+            )
+            .bind(("id", t.id.clone()))
+            .bind(("name", t.name.clone()))
+            .bind(("store_id", t.store_id.clone()))
+            .bind(("created_at", t.created_at.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -1172,5 +1224,50 @@ mod entity_tests {
         s.upsert_entity(&updated).await.unwrap();
         let got = s.get_entity("tool:rust").await.unwrap().unwrap();
         assert_eq!(got.mention_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_tag_crud() {
+        let s = fixture().await;
+        let ts = now();
+        let tag = Tag {
+            id: "machine-learning".into(),
+            name: "Machine Learning".into(),
+            store_id: "s1".into(),
+            created_at: ts.clone(),
+        };
+        s.create_tag(&tag).await.unwrap();
+
+        let list = s.list_tags_for_store("s1").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Machine Learning");
+
+        // Upsert same tag should not fail
+        s.upsert_tag(&tag).await.unwrap();
+        assert_eq!(s.list_tags_for_store("s1").await.unwrap().len(), 1);
     }
 }
