@@ -165,25 +165,19 @@ DEFINE INDEX IF NOT EXISTS dedup_queue_store_idx ON dedup_queue FIELDS store_id;
 DEFINE INDEX IF NOT EXISTS dedup_queue_hash_idx ON dedup_queue FIELDS store_id, content_hash;
 
 -- TAGGED edge table (P3): article -> tag
-DEFINE TABLE IF NOT EXISTS tagged SCHEMAFULL;
-DEFINE FIELD IF NOT EXISTS in ON tagged TYPE record<article>;
-DEFINE FIELD IF NOT EXISTS out ON tagged TYPE record<tag>;
+DEFINE TABLE IF NOT EXISTS tagged TYPE RELATION IN article OUT tag SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS created_at ON tagged TYPE string;
 DEFINE INDEX IF NOT EXISTS tagged_unique ON tagged FIELDS in, out UNIQUE;
 
 -- MENTIONS edge table (P3): article -> entity
-DEFINE TABLE IF NOT EXISTS mentions SCHEMAFULL;
-DEFINE FIELD IF NOT EXISTS in ON mentions TYPE record<article>;
-DEFINE FIELD IF NOT EXISTS out ON mentions TYPE record<entity>;
+DEFINE TABLE IF NOT EXISTS mentions TYPE RELATION IN article OUT entity SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS excerpt ON mentions TYPE string;
 DEFINE FIELD IF NOT EXISTS confidence ON mentions TYPE float DEFAULT 0.0;
 DEFINE FIELD IF NOT EXISTS created_at ON mentions TYPE string;
 DEFINE INDEX IF NOT EXISTS mentions_unique ON mentions FIELDS in, out UNIQUE;
 
 -- RELATED_TO edge table (P3): article -> article
-DEFINE TABLE IF NOT EXISTS related_to SCHEMAFULL;
-DEFINE FIELD IF NOT EXISTS in ON related_to TYPE record<article>;
-DEFINE FIELD IF NOT EXISTS out ON related_to TYPE record<article>;
+DEFINE TABLE IF NOT EXISTS related_to TYPE RELATION IN article OUT article SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS shared_entity_count ON related_to TYPE int DEFAULT 0;
 DEFINE FIELD IF NOT EXISTS strength ON related_to TYPE float DEFAULT 0.0;
 DEFINE FIELD IF NOT EXISTS created_at ON related_to TYPE string;

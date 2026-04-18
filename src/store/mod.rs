@@ -104,6 +104,21 @@ pub trait Store: Send + Sync {
     async fn list_pending_dedup(&self, store_id: &str) -> Result<Vec<DedupQueueEntry>>;
     async fn get_dedup_entry(&self, id: &str) -> Result<Option<DedupQueueEntry>>;
     async fn resolve_dedup_entry(&self, id: &str, status: &str) -> Result<()>;
+
+    // Graph edges (P3)
+    async fn create_mentions_edge(
+        &self, article_id: &str, entity_id: &str, excerpt: &str, confidence: f64,
+    ) -> Result<()>;
+    async fn create_tagged_edge(&self, article_id: &str, tag_id: &str) -> Result<()>;
+    async fn create_or_update_related_to_edge(
+        &self, from_article_id: &str, to_article_id: &str,
+        shared_entity_count: i64, strength: f64,
+    ) -> Result<()>;
+    async fn list_entities_for_article(&self, article_id: &str) -> Result<Vec<Entity>>;
+    async fn list_articles_for_entity(&self, entity_id: &str) -> Result<Vec<Article>>;
+    async fn list_tags_for_article(&self, article_id: &str) -> Result<Vec<Tag>>;
+    async fn list_related_articles(&self, article_id: &str) -> Result<Vec<Article>>;
+    async fn list_articles_without_mentions(&self, store_id: &str) -> Result<Vec<Article>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -883,6 +898,151 @@ impl Store for SurrealStore {
             .check()?;
         Ok(())
     }
+
+    // Graph edge methods (P3)
+    async fn create_mentions_edge(
+        &self, article_id: &str, entity_id: &str, excerpt: &str, confidence: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db()
+            .query(
+                "LET $from = type::thing('article', $article_id);
+                 LET $to   = type::thing('entity',  $entity_id);
+                 RELATE $from->mentions->$to CONTENT {
+                    excerpt: $excerpt,
+                    confidence: $confidence,
+                    created_at: $now
+                }",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .bind(("entity_id", entity_id.to_string()))
+            .bind(("excerpt", excerpt.to_string()))
+            .bind(("confidence", confidence))
+            .bind(("now", now))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn create_tagged_edge(&self, article_id: &str, tag_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db()
+            .query(
+                "LET $from = type::thing('article', $article_id);
+                 LET $to   = type::thing('tag',     $tag_id);
+                 RELATE $from->tagged->$to CONTENT {
+                    created_at: $now
+                }",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .bind(("tag_id", tag_id.to_string()))
+            .bind(("now", now))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn create_or_update_related_to_edge(
+        &self, from_article_id: &str, to_article_id: &str,
+        shared_entity_count: i64, strength: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        // Delete existing edge if any, then recreate. This avoids duplicate edge errors.
+        self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to   = type::thing('article', $to_id);
+                 DELETE FROM related_to WHERE in = $from AND out = $to;
+                 RELATE $from->related_to->$to CONTENT {
+                    shared_entity_count: $count,
+                    strength: $strength,
+                    created_at: $now,
+                    updated_at: $now
+                }",
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("count", shared_entity_count))
+            .bind(("strength", strength))
+            .bind(("now", now))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn list_entities_for_article(&self, article_id: &str) -> Result<Vec<Entity>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM entity
+                 WHERE id IN (
+                    SELECT VALUE out FROM mentions
+                    WHERE in = type::thing('article', $article_id)
+                 )",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn list_articles_for_entity(&self, entity_id: &str) -> Result<Vec<Article>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM article
+                 WHERE id IN (
+                    SELECT VALUE in FROM mentions
+                    WHERE out = type::thing('entity', $entity_id)
+                 )",
+            )
+            .bind(("entity_id", entity_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn list_tags_for_article(&self, article_id: &str) -> Result<Vec<Tag>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM tag
+                 WHERE id IN (
+                    SELECT VALUE out FROM tagged
+                    WHERE in = type::thing('article', $article_id)
+                 )",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn list_related_articles(&self, article_id: &str) -> Result<Vec<Article>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM article
+                 WHERE id IN (
+                    SELECT VALUE out FROM related_to
+                    WHERE in = type::thing('article', $article_id)
+                 )",
+            )
+            .bind(("article_id", article_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
+
+    async fn list_articles_without_mentions(&self, store_id: &str) -> Result<Vec<Article>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM article
+                 WHERE store_id = $store_id
+                 AND id NOT IN (SELECT VALUE in FROM mentions)
+                 ORDER BY created_at DESC",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await?;
+        Ok(resp.take(0)?)
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -1400,5 +1560,92 @@ mod dedup_tests {
         s.resolve_dedup_entry("dq1", "rejected").await.unwrap();
         let pending = s.list_pending_dedup("s1").await.unwrap();
         assert_eq!(pending.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod graph_edge_tests {
+    use super::*;
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Rust Guide".into(),
+            content: "Learn Rust".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a2".into(), store_id: "s1".into(), title: "Async Rust".into(),
+            content: "Tokio and async".into(), source_type: "user".into(),
+            source_id: "".into(), content_hash: "h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: None, store_id: "s1".into(), mention_count: 0,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_tag(&Tag {
+            id: "programming".into(), name: "Programming".into(),
+            store_id: "s1".into(), created_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_mentions_edge() {
+        let s = fixture().await;
+        s.create_mentions_edge("a1", "tool:rust", "written in Rust", 0.95).await.unwrap();
+
+        let entities = s.list_entities_for_article("a1").await.unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "Rust");
+
+        let articles = s.list_articles_for_entity("tool:rust").await.unwrap();
+        assert_eq!(articles.len(), 1);
+        assert_eq!(articles[0].id, "a1");
+    }
+
+    #[tokio::test]
+    async fn test_tagged_edge() {
+        let s = fixture().await;
+        s.create_tagged_edge("a1", "programming").await.unwrap();
+
+        let tags = s.list_tags_for_article("a1").await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "Programming");
+    }
+
+    #[tokio::test]
+    async fn test_related_to_edge() {
+        let s = fixture().await;
+        s.create_or_update_related_to_edge("a1", "a2", 1, 0.5).await.unwrap();
+
+        let related = s.list_related_articles("a1").await.unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].id, "a2");
+
+        // Update strength
+        s.create_or_update_related_to_edge("a1", "a2", 2, 0.8).await.unwrap();
+        // Should still be 1 edge, not 2
+        let related = s.list_related_articles("a1").await.unwrap();
+        assert_eq!(related.len(), 1);
     }
 }
