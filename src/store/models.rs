@@ -45,7 +45,9 @@ pub struct Article {
     /// migration.
     pub content_hash: String,
     /// JSON array of tag strings — normalized into a `tag` table + `TAGGED`
-    /// edges in P3. Kept as JSON on the article through P1.
+    /// edges in P3. After P3 migration, this field is removed from the DB schema.
+    /// `#[serde(default)]` ensures deserialization still works when the field is absent.
+    #[serde(default)]
     pub tags: serde_json::Value,
     pub embedded_at: Option<String>,
     pub created_at: String,
