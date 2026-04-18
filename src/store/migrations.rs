@@ -11,6 +11,7 @@ use surrealdb::engine::any::Any;
 use surrealdb::Surreal;
 
 use super::schema;
+use super::slugify::slugify;
 
 /// Row shape for reading articles during tag migration.
 #[derive(serde::Deserialize)]
@@ -92,7 +93,7 @@ async fn migrate_tags_to_edges(db: &Surreal<Any>) -> Result<()> {
                 _ => continue,
             };
 
-            let tag_id = slugify_tag(&tag_name);
+            let tag_id = slugify(&tag_name);
 
             // Upsert tag record
             db.query(
@@ -147,21 +148,3 @@ async fn migrate_tags_to_edges(db: &Surreal<Any>) -> Result<()> {
     Ok(())
 }
 
-/// Slugify a tag name for use as a tag record ID.
-fn slugify_tag(s: &str) -> String {
-    let mut slug = String::with_capacity(s.len());
-    let mut last_was_hyphen = true;
-    for ch in s.chars() {
-        if ch.is_alphanumeric() {
-            slug.extend(ch.to_lowercase());
-            last_was_hyphen = false;
-        } else if !last_was_hyphen {
-            slug.push('-');
-            last_was_hyphen = true;
-        }
-    }
-    while slug.ends_with('-') {
-        slug.pop();
-    }
-    slug
-}
