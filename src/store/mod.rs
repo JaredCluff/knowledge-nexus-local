@@ -908,6 +908,7 @@ impl Store for SurrealStore {
             .query(
                 "LET $from = type::thing('article', $article_id);
                  LET $to   = type::thing('entity',  $entity_id);
+                 DELETE FROM mentions WHERE in = $from AND out = $to;
                  RELATE $from->mentions->$to CONTENT {
                     excerpt: $excerpt,
                     confidence: $confidence,
@@ -1016,6 +1017,8 @@ impl Store for SurrealStore {
     }
 
     async fn list_related_articles(&self, article_id: &str) -> Result<Vec<Article>> {
+        // Query both directions since RELATED_TO edges are created unidirectionally
+        // (from the newly ingested article to existing articles).
         let mut resp = self
             .db()
             .query(
@@ -1023,6 +1026,10 @@ impl Store for SurrealStore {
                  WHERE id IN (
                     SELECT VALUE out FROM related_to
                     WHERE in = type::thing('article', $article_id)
+                 )
+                 OR id IN (
+                    SELECT VALUE in FROM related_to
+                    WHERE out = type::thing('article', $article_id)
                  )",
             )
             .bind(("article_id", article_id.to_string()))

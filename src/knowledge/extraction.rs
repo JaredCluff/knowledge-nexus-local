@@ -54,16 +54,21 @@ impl KnowledgeExtractor {
         };
 
         match self.article_service.create(&article, store_collection).await? {
-            crate::knowledge::articles::CreateResult::Created => {}
+            crate::knowledge::articles::CreateResult::Created => Ok(article),
             crate::knowledge::articles::CreateResult::Duplicate { existing_id } => {
                 tracing::info!(
                     "Conversation extract was a duplicate of article {}",
                     existing_id
                 );
+                // Return the existing article instead of the unsaved incoming one
+                self.db
+                    .get_article(&existing_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "Duplicate matched article '{}' no longer exists", existing_id
+                    ))
             }
         }
-
-        Ok(article)
     }
 
     fn messages_to_content(messages: &[Message]) -> String {

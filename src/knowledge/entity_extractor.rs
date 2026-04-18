@@ -44,10 +44,19 @@ pub fn entity_id(entity_type: &str, name: &str) -> String {
 
 /// Slugify a string: lowercase, replace non-alphanumeric with hyphens,
 /// collapse consecutive hyphens, strip leading/trailing hyphens.
+/// Common symbolic characters (+, #) are preserved as words to avoid
+/// collisions (e.g., "C++" → "c-plus-plus", not "c").
 pub fn slugify(s: &str) -> String {
-    let mut slug = String::with_capacity(s.len());
+    // Expand symbolic characters before slugifying
+    let expanded = s
+        .replace("++", "-plus-plus")
+        .replace('+', "-plus")
+        .replace('#', "-sharp")
+        .replace('&', "-and");
+
+    let mut slug = String::with_capacity(expanded.len());
     let mut last_was_hyphen = true; // prevents leading hyphen
-    for ch in s.chars() {
+    for ch in expanded.chars() {
         if ch.is_alphanumeric() {
             slug.extend(ch.to_lowercase());
             last_was_hyphen = false;
@@ -201,7 +210,10 @@ mod tests {
     fn test_slugify() {
         assert_eq!(slugify("Rust"), "rust");
         assert_eq!(slugify("Machine Learning"), "machine-learning");
-        assert_eq!(slugify("C++"), "c");
+        assert_eq!(slugify("C++"), "c-plus-plus");
+        assert_eq!(slugify("C#"), "c-sharp");
+        assert_eq!(slugify("C"), "c");
+        assert_eq!(slugify("R&D"), "r-and-d");
         assert_eq!(slugify("  Hello   World  "), "hello-world");
         assert_eq!(slugify("knowledge-nexus"), "knowledge-nexus");
     }
