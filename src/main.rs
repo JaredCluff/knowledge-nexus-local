@@ -147,6 +147,17 @@ enum Commands {
         action: DedupReviewAction,
     },
 
+    /// Backfill entity extraction for articles missing MENTIONS edges
+    ExtractEntities {
+        /// Store ID to process
+        #[arg(long)]
+        store: String,
+
+        /// Maximum number of articles to process (default: all)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
     /// Migrate a 0.8 SQLite database into 1.0.0 SurrealDB format.
     Migrate {
         /// Source database format. Only `sqlite` is supported.
@@ -339,6 +350,9 @@ fn main() -> Result<()> {
             }
             Commands::DedupReview { action } => {
                 cmd_dedup_review(action).await?;
+            }
+            Commands::ExtractEntities { store, limit } => {
+                cmd_extract_entities(&store, limit).await?;
             }
             Commands::Migrate { from, to, force } => {
                 if from != "sqlite" {
@@ -1171,6 +1185,88 @@ async fn cmd_dedup_review(action: DedupReviewAction) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn cmd_extract_entities(store_id: &str, limit: Option<usize>) -> Result<()> {
+    let cfg = config::load_config().await?;
+
+    if !cfg.extraction.enabled {
+        anyhow::bail!(
+            "Entity extraction is disabled in configuration (extraction.enabled=false)"
+        );
+    }
+
+    let db = open_store_or_bail(&cfg).await?;
+
+    let store_record = db
+        .get_store(store_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Store '{}' not found", store_id))?;
+
+    // Find articles without MENTIONS edges
+    let mut articles = db.list_articles_without_mentions(store_id).await?;
+    if let Some(max) = limit {
+        articles.truncate(max);
+    }
+
+    if articles.is_empty() {
+        println!("All articles in store '{}' already have entity extractions.", store_id);
+        return Ok(());
+    }
+
+    println!(
+        "Backfilling entity extraction for {} articles in store '{}'...",
+        articles.len(),
+        store_record.name
+    );
+
+    let registry = vectordb::quantizer::QuantizerRegistry::new();
+    let quantizer = registry.resolve(&store_record.quantizer_version)?;
+    let vdb = std::sync::Arc::new(vectordb::VectorDB::open(quantizer).await?);
+    let emb = embeddings::EmbeddingModel::new()?;
+    let emb_arc = std::sync::Arc::new(tokio::sync::Mutex::new(emb));
+
+    let article_svc = knowledge::ArticleService::new(
+        db.clone(), vdb, emb_arc, Some(cfg.extraction.clone()),
+    );
+
+    let extractor = knowledge::EntityExtractor::new(cfg.extraction.clone());
+
+    let mut success_count = 0u64;
+    let mut error_count = 0u64;
+
+    for (i, article) in articles.iter().enumerate() {
+        print!("  [{}/{}] {} ... ", i + 1, articles.len(), article.title);
+
+        match extractor.extract(&article.title, &article.content).await {
+            Ok(entities) => {
+                if entities.is_empty() {
+                    println!("no entities found");
+                } else {
+                    if let Err(e) = article_svc
+                        .backfill_entities(&article, &entities)
+                        .await
+                    {
+                        println!("ERROR: {}", e);
+                        error_count += 1;
+                        continue;
+                    }
+                    println!("{} entities", entities.len());
+                    success_count += 1;
+                }
+            }
+            Err(e) => {
+                println!("ERROR: {}", e);
+                error_count += 1;
+            }
+        }
+    }
+
+    println!(
+        "\nBackfill complete: {} succeeded, {} errors, {} total",
+        success_count, error_count, articles.len()
+    );
     Ok(())
 }
 
