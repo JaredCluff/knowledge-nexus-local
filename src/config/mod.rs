@@ -45,6 +45,10 @@ pub struct Config {
     /// Web search capability settings
     #[serde(default)]
     pub web_search: WebSearchConfig,
+
+    /// Entity extraction settings (P3)
+    #[serde(default)]
+    pub extraction: ExtractionConfig,
 }
 
 // ============================================================================
@@ -235,6 +239,40 @@ impl Default for WebSearchConfig {
             provider: default_search_provider(),
             api_key: None,
             max_results: default_max_search_results(),
+        }
+    }
+}
+
+/// Entity extraction configuration (P3)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionConfig {
+    /// Enable LLM-based entity extraction during article ingest
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Ollama API base URL
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
+
+    /// Ollama model name for entity extraction
+    #[serde(default = "default_extraction_model")]
+    pub model: String,
+}
+
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+fn default_extraction_model() -> String {
+    "gemma4:e4b".to_string()
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ollama_url: default_ollama_url(),
+            model: default_extraction_model(),
         }
     }
 }
@@ -590,6 +628,7 @@ impl Default for Config {
             micro_backend: MicroBackendConfig::default(),
             discovery: DiscoveryConfig::default(),
             web_search: WebSearchConfig::default(),
+            extraction: ExtractionConfig::default(),
         }
     }
 }
@@ -882,6 +921,19 @@ pub async fn load_config() -> Result<Config> {
             config.web_search.api_key = env_key;
             // If an API key is present, enable web search automatically
             config.web_search.enabled = true;
+        }
+    }
+
+    // Extraction config overrides
+    if let Some(url) = first_env(&["KN_OLLAMA_URL"]) {
+        config.extraction.ollama_url = url;
+    }
+    if let Some(model) = first_env(&["KN_EXTRACTION_MODEL"]) {
+        config.extraction.model = model;
+    }
+    if let Some(enabled) = first_env(&["KN_EXTRACTION_ENABLED"]) {
+        if let Ok(v) = enabled.parse::<bool>() {
+            config.extraction.enabled = v;
         }
     }
 
