@@ -300,16 +300,16 @@ pub struct RetrievalConfig {
     #[serde(default = "default_graph_weight_max")]
     pub graph_weight_max: f32,
 
-    /// Max hops for RELATED_TO traversal (1 = direct neighbors only)
-    #[serde(default = "default_graph_hops")]
-    pub graph_hops: usize,
+    /// Enable one-hop RELATED_TO traversal (neighbors of direct matches)
+    #[serde(default = "default_graph_hop_enabled")]
+    pub graph_hop_enabled: bool,
 }
 
 fn default_rrf_k() -> f32 { 60.0 }
 fn default_vector_weight() -> f32 { 1.0 }
 fn default_keyword_weight() -> f32 { 1.1 }
 fn default_graph_weight_max() -> f32 { 1.0 }
-fn default_graph_hops() -> usize { 1 }
+fn default_graph_hop_enabled() -> bool { true }
 
 impl Default for RetrievalConfig {
     fn default() -> Self {
@@ -318,7 +318,7 @@ impl Default for RetrievalConfig {
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
             graph_weight_max: default_graph_weight_max(),
-            graph_hops: default_graph_hops(),
+            graph_hop_enabled: default_graph_hop_enabled(),
         }
     }
 }

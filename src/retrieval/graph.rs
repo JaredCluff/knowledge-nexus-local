@@ -9,7 +9,6 @@ use tracing::debug;
 
 use crate::config::RetrievalConfig;
 use crate::k2k::models::{K2KResult, ResultProvenance};
-use crate::retrieval::expansion::QueryExpander;
 use crate::store::Store;
 
 /// Result of a graph search pass, including entity coverage metadata
@@ -39,7 +38,7 @@ impl GraphSearcher {
         top_k: usize,
     ) -> Result<GraphSearchOutput> {
         // 1. Extract meaningful terms from query
-        let terms = self.extract_terms(query);
+        let terms = extract_terms(query);
         if terms.is_empty() {
             return Ok(GraphSearchOutput { results: vec![], entity_coverage: 0.0 });
         }
@@ -73,8 +72,8 @@ impl GraphSearcher {
             entry.0 += confidence; // Sum confidence across matched entities
         }
 
-        // 5. One-hop RELATED_TO traversal (if configured)
-        if self.config.graph_hops >= 1 {
+        // 5. One-hop RELATED_TO traversal (if enabled)
+        if self.config.graph_hop_enabled {
             let direct_article_ids: Vec<String> = article_scores.keys().cloned().collect();
             for aid in &direct_article_ids {
                 if let Ok(related) = self.db.list_related_articles(aid).await {
@@ -135,24 +134,24 @@ impl GraphSearcher {
 
         Ok(GraphSearchOutput { results, entity_coverage })
     }
+}
 
-    /// Extract meaningful query terms by removing stop words.
-    fn extract_terms(&self, query: &str) -> Vec<String> {
-        let expander = QueryExpander::new();
-        // Use stop-word removal to get meaningful terms
-        let cleaned = expander.expand(query);
-        // The second variant (index 1) is stop-words-removed if it exists
-        let meaningful = if cleaned.len() > 1 {
-            &cleaned[1]
-        } else {
-            &cleaned[0]
-        };
-        meaningful
-            .split_whitespace()
-            .filter(|w| w.len() > 1)
-            .map(|w| w.to_string())
-            .collect()
-    }
+/// Extract meaningful query terms by removing stop words.
+fn extract_terms(query: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has",
+        "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can",
+        "shall", "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into",
+        "about", "like", "through", "after", "over", "between", "out", "against", "during",
+        "without", "before", "under", "around", "among", "it", "its", "this", "that", "these",
+        "those", "my", "your", "his", "her", "how", "what", "when", "where", "who", "which",
+        "why",
+    ];
+    query
+        .split_whitespace()
+        .filter(|w| w.len() > 1 && !STOP_WORDS.contains(&w.to_lowercase().as_str()))
+        .map(|w| w.to_lowercase())
+        .collect()
 }
 
 #[cfg(test)]
@@ -161,15 +160,22 @@ mod tests {
 
     #[test]
     fn test_extract_terms_removes_stop_words() {
-        let config = RetrievalConfig::default();
-        // We can't construct a real GraphSearcher without a Store, so test via QueryExpander
-        let expander = QueryExpander::new();
-        let variants = expander.expand("how to configure the database");
-        // Second variant should be stop-word-free
-        assert!(variants.len() > 1);
-        assert!(!variants[1].contains("how"));
-        assert!(!variants[1].contains("the"));
-        assert!(variants[1].contains("configure"));
-        assert!(variants[1].contains("database"));
+        let terms = extract_terms("how to configure the database");
+        assert_eq!(terms, vec!["configure", "database"]);
+    }
+
+    #[test]
+    fn test_extract_terms_filters_single_char() {
+        let terms = extract_terms("I want a Rust guide");
+        assert!(!terms.contains(&"i".to_string()));
+        assert!(!terms.contains(&"a".to_string()));
+        assert!(terms.contains(&"rust".to_string()));
+        assert!(terms.contains(&"guide".to_string()));
+    }
+
+    #[test]
+    fn test_extract_terms_lowercases() {
+        let terms = extract_terms("Tokio Runtime");
+        assert_eq!(terms, vec!["tokio", "runtime"]);
     }
 }

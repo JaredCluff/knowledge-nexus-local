@@ -1132,9 +1132,10 @@ impl Store for SurrealStore {
         if entity_ids.is_empty() {
             return Ok(vec![]);
         }
-        // Collect unique article IDs with max confidence across all entity lookups.
-        // We query per entity using type::thing() to correctly match SurrealDB record IDs.
-        let mut article_confidences: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        // Collect all mention edges per entity. An article mentioned by multiple
+        // queried entities appears multiple times — the caller (GraphSearcher)
+        // accumulates confidence across entities to reward multi-entity relevance.
+        let mut edges_by_article: Vec<(String, f64)> = Vec::new();
         for &eid in entity_ids {
             let mut resp = self.db()
                 .query(
@@ -1145,24 +1146,29 @@ impl Store for SurrealStore {
                 .bind(("entity_id", eid.to_string()))
                 .await
                 .context("list_articles_for_entities query failed")?;
-            let edges: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            for edge in &edges {
-                let aid = edge.get("article_id").and_then(|v| v.as_str()).unwrap_or_default();
-                let conf = edge.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let entry = article_confidences.entry(aid.to_string()).or_insert(0.0);
-                if conf > *entry {
-                    *entry = conf;
-                }
+            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+            for row in &rows {
+                let aid = row.get("article_id").and_then(|v| v.as_str()).unwrap_or_default();
+                let conf = row.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                edges_by_article.push((aid.to_string(), conf));
             }
         }
 
-        // Fetch articles
-        let mut results = Vec::new();
-        for (aid, confidence) in &article_confidences {
+        // Deduplicate article IDs for fetching, then return one (Article, conf) per edge
+        let unique_ids: std::collections::HashSet<&str> = edges_by_article.iter().map(|(id, _)| id.as_str()).collect();
+        let mut article_cache: std::collections::HashMap<String, Article> = std::collections::HashMap::new();
+        for aid in unique_ids {
             if let Some(article) = self.get_article(aid).await? {
-                results.push((article, *confidence));
+                article_cache.insert(aid.to_string(), article);
             }
         }
+
+        let mut results: Vec<(Article, f64)> = edges_by_article
+            .into_iter()
+            .filter_map(|(aid, conf)| {
+                article_cache.get(&aid).map(|a| (a.clone(), conf))
+            })
+            .collect();
         // Sort by confidence descending
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(results)
@@ -1780,6 +1786,19 @@ mod entity_tests {
         // Should include confidence
         assert!(results.iter().any(|(a, c)| a.id == "a1" && (*c - 0.95).abs() < 0.01));
         assert!(results.iter().any(|(a, c)| a.id == "a2" && (*c - 0.80).abs() < 0.01));
+
+        // Multi-entity: a1 is mentioned by two entities → should appear twice
+        s.create_entity(&Entity {
+            id: "tool:tokio".into(), name: "Tokio".into(), entity_type: "tool".into(),
+            description: None, store_id: "s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_mentions_edge("a1", "tool:tokio", "uses Tokio", 0.85).await.unwrap();
+        let results = s.list_articles_for_entities(&["tool:rust", "tool:tokio"]).await.unwrap();
+        // a1 mentioned by both entities → 2 entries; a2 mentioned by rust only → 1 entry
+        let a1_count = results.iter().filter(|(a, _)| a.id == "a1").count();
+        assert_eq!(a1_count, 2, "a1 should appear twice (once per mentioning entity)");
+        assert_eq!(results.len(), 3); // a1×2 + a2×1
 
         // Empty input
         let results = s.list_articles_for_entities(&[]).await.unwrap();

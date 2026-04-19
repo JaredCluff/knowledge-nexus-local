@@ -518,6 +518,21 @@ async fn open_store_or_bail(cfg: &config::Config) -> Result<std::sync::Arc<dyn s
     Ok(std::sync::Arc::new(surreal_store))
 }
 
+/// Resolve the store ID from an explicit filter or fall back to the owner's default store.
+async fn resolve_store_id(db: &dyn store::Store, filter: Option<&str>) -> Result<String> {
+    match filter {
+        Some(id) => Ok(id.to_string()),
+        None => {
+            let owner = db.get_owner_user().await?
+                .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
+            let stores = db.list_stores_for_user(&owner.id).await?;
+            Ok(stores.first()
+                .ok_or_else(|| anyhow::anyhow!("No stores found"))?
+                .id.clone())
+        }
+    }
+}
+
 async fn cmd_start_services() -> Result<()> {
     info!("Starting Knowledge Nexus Agent...");
 
@@ -1101,18 +1116,7 @@ async fn cmd_search(query: &str, limit: usize, store_filter: Option<&str>, verbo
 async fn cmd_graph_entity(name: &str, store_filter: Option<&str>) -> Result<()> {
     let cfg = config::load_config().await?;
     let db = open_store_or_bail(&cfg).await?;
-
-    let store_id = match store_filter {
-        Some(id) => id.to_string(),
-        None => {
-            let owner = db.get_owner_user().await?
-                .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
-            let stores = db.list_stores_for_user(&owner.id).await?;
-            stores.first()
-                .ok_or_else(|| anyhow::anyhow!("No stores found"))?
-                .id.clone()
-        }
-    };
+    let store_id = resolve_store_id(db.as_ref(), store_filter).await?;
 
     let entities = db.search_entities_by_name(&store_id, &[name]).await?;
     if entities.is_empty() {
@@ -1195,18 +1199,7 @@ async fn cmd_graph_article(article_id: &str) -> Result<()> {
 async fn cmd_graph_stats(store_filter: Option<&str>) -> Result<()> {
     let cfg = config::load_config().await?;
     let db = open_store_or_bail(&cfg).await?;
-
-    let store_id = match store_filter {
-        Some(id) => id.to_string(),
-        None => {
-            let owner = db.get_owner_user().await?
-                .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
-            let stores = db.list_stores_for_user(&owner.id).await?;
-            stores.first()
-                .ok_or_else(|| anyhow::anyhow!("No stores found"))?
-                .id.clone()
-        }
-    };
+    let store_id = resolve_store_id(db.as_ref(), store_filter).await?;
 
     let store = db.get_store(&store_id).await?
         .ok_or_else(|| anyhow::anyhow!("Store '{}' not found", store_id))?;
@@ -1231,10 +1224,10 @@ async fn cmd_graph_stats(store_filter: Option<&str>) -> Result<()> {
     let with_mentions = all_articles.len() - without_mentions.len();
     println!("  Articles with extractions: {}/{}", with_mentions, all_articles.len());
 
-    // Average entities per article
+    // Entity-to-article ratio
     if with_mentions > 0 {
-        let avg = total_entities as f64 / with_mentions as f64;
-        println!("  Avg entities per article: {:.1}", avg);
+        let ratio = total_entities as f64 / with_mentions as f64;
+        println!("  Distinct entities / extracted articles: {:.1}", ratio);
     }
 
     Ok(())
