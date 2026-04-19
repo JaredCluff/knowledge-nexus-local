@@ -186,6 +186,50 @@ impl SurrealStore {
         &self.db
     }
 
+    /// Batch-fetch articles by ID in a single query. Returns a map of id → Article.
+    async fn batch_get_articles(&self, ids: &[&str]) -> Result<std::collections::HashMap<String, Article>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let things: Vec<String> = ids.iter()
+            .enumerate()
+            .map(|(i, _)| format!("type::thing('article', $aid_{})", i))
+            .collect();
+        let query = format!(
+            "SELECT *, meta::id(id) AS id FROM article WHERE id IN [{}]",
+            things.join(", ")
+        );
+        let mut q = self.db().query(&query);
+        for (i, &aid) in ids.iter().enumerate() {
+            q = q.bind((format!("aid_{}", i), aid.to_string()));
+        }
+        let mut resp = q.await.context("batch_get_articles query failed")?;
+        let rows: Vec<Article> = resp.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(|a| (a.id.clone(), a)).collect())
+    }
+
+    /// Batch-fetch entities by ID in a single query. Returns a map of id → Entity.
+    async fn batch_get_entities(&self, ids: &[&str]) -> Result<std::collections::HashMap<String, Entity>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let things: Vec<String> = ids.iter()
+            .enumerate()
+            .map(|(i, _)| format!("type::thing('entity', $eid_{})", i))
+            .collect();
+        let query = format!(
+            "SELECT *, meta::id(id) AS id FROM entity WHERE id IN [{}]",
+            things.join(", ")
+        );
+        let mut q = self.db().query(&query);
+        for (i, &eid) in ids.iter().enumerate() {
+            q = q.bind((format!("eid_{}", i), eid.to_string()));
+        }
+        let mut resp = q.await.context("batch_get_entities query failed")?;
+        let rows: Vec<Entity> = resp.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(|e| (e.id.clone(), e)).collect())
+    }
+
     /// Update only the `quantizer_version` field on a knowledge store.
     ///
     /// Used by the `reindex --quantizer` CLI command. Not on the `Store` trait
@@ -1102,14 +1146,16 @@ impl Store for SurrealStore {
         if terms.is_empty() {
             return Ok(vec![]);
         }
-        // Build OR conditions for exact and prefix matches (case-insensitive)
+        // Build OR conditions: exact match OR prefix match (case-insensitive).
+        // We use string::starts_with instead of CONTAINS to avoid matching
+        // unrelated entities (e.g. "rust" matching "trust" or "antrust").
         let mut conditions = Vec::new();
         let mut binds: Vec<(String, String)> = Vec::new();
         for (i, term) in terms.iter().enumerate() {
             let lower = term.to_lowercase();
             let param = format!("term_{}", i);
             conditions.push(format!(
-                "(string::lowercase(name) = ${p} OR string::lowercase(name) CONTAINS ${p})",
+                "(string::lowercase(name) = ${p} OR string::starts_with(string::lowercase(name), ${p}))",
                 p = param
             ));
             binds.push((param, lower));
@@ -1132,41 +1178,40 @@ impl Store for SurrealStore {
         if entity_ids.is_empty() {
             return Ok(vec![]);
         }
-        // Collect all mention edges per entity. An article mentioned by multiple
-        // queried entities appears multiple times — the caller (GraphSearcher)
-        // accumulates confidence across entities to reward multi-entity relevance.
+        // Batch query: fetch all mention edges for the given entities in one query.
+        // An article mentioned by multiple queried entities appears multiple times —
+        // the caller (GraphSearcher) accumulates confidence across entities to
+        // reward multi-entity relevance.
+        let things: Vec<String> = entity_ids.iter()
+            .enumerate()
+            .map(|(i, _)| format!("type::thing('entity', $eid_{})", i))
+            .collect();
+        let query = format!(
+            "SELECT meta::id(in) AS article_id, meta::id(out) AS entity_id, confidence FROM mentions WHERE out IN [{}]",
+            things.join(", ")
+        );
+        let mut q = self.db().query(&query);
+        for (i, &eid) in entity_ids.iter().enumerate() {
+            q = q.bind((format!("eid_{}", i), eid.to_string()));
+        }
+        let mut resp = q.await.context("list_articles_for_entities query failed")?;
+        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+
         let mut edges_by_article: Vec<(String, f64)> = Vec::new();
-        for &eid in entity_ids {
-            let mut resp = self.db()
-                .query(
-                    "SELECT meta::id(in) AS article_id, confidence
-                     FROM mentions
-                     WHERE out = type::thing('entity', $entity_id)"
-                )
-                .bind(("entity_id", eid.to_string()))
-                .await
-                .context("list_articles_for_entities query failed")?;
-            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            for row in &rows {
-                let aid = row.get("article_id").and_then(|v| v.as_str()).unwrap_or_default();
-                let conf = row.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                edges_by_article.push((aid.to_string(), conf));
-            }
+        for row in &rows {
+            let aid = row.get("article_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let conf = row.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            edges_by_article.push((aid.to_string(), conf));
         }
 
-        // Deduplicate article IDs for fetching, then return one (Article, conf) per edge
+        // Batch fetch all referenced articles in one query
         let unique_ids: std::collections::HashSet<&str> = edges_by_article.iter().map(|(id, _)| id.as_str()).collect();
-        let mut article_cache: std::collections::HashMap<String, Article> = std::collections::HashMap::new();
-        for aid in unique_ids {
-            if let Some(article) = self.get_article(aid).await? {
-                article_cache.insert(aid.to_string(), article);
-            }
-        }
+        let article_cache = self.batch_get_articles(&unique_ids.into_iter().collect::<Vec<_>>()).await?;
 
         let mut results: Vec<(Article, f64)> = edges_by_article
             .into_iter()
             .filter_map(|(aid, conf)| {
-                article_cache.get(&aid).map(|a| (a.clone(), conf))
+                article_cache.get(aid.as_str()).map(|a| (a.clone(), conf))
             })
             .collect();
         // Sort by confidence descending
@@ -1192,10 +1237,10 @@ impl Store for SurrealStore {
     }
 
     async fn list_co_mentioned_entities(&self, entity_id: &str) -> Result<Vec<(Entity, usize)>> {
-        // Find articles mentioning this entity, then find other entities those articles also mention.
-        // We aggregate co-occurrence counts in Rust to avoid GROUP BY syntax differences.
+        // Find articles mentioning this entity, then find other entities those
+        // articles also mention. Aggregates co-occurrence counts in Rust.
 
-        // Step 1: get articles that mention this entity
+        // Step 1: get articles that mention this entity (1 query)
         let mut resp = self.db()
             .query("SELECT VALUE meta::id(in) FROM mentions WHERE out = type::thing('entity', $entity_id)")
             .bind(("entity_id", entity_id.to_string()))
@@ -1211,36 +1256,38 @@ impl Store for SurrealStore {
             return Ok(vec![]);
         }
 
-        // Step 2: for each article, collect co-mentioned entity IDs (excluding target)
+        // Step 2: batch query all co-mentioned entity IDs across those articles.
+        // SurrealDB's `in` field on edges conflicts with the `IN` keyword, so we
+        // use individual OR conditions: `in = type::thing('article', $aid_0) OR ...`
+        let conditions: Vec<String> = article_ids.iter()
+            .enumerate()
+            .map(|(i, _)| format!("in = type::thing('article', $aid_{})", i))
+            .collect();
+        let query = format!(
+            "SELECT meta::id(in) AS article_id, meta::id(out) AS entity_id FROM mentions WHERE ({}) AND out != type::thing('entity', $entity_id)",
+            conditions.join(" OR ")
+        );
+        let mut q = self.db().query(&query);
+        for (i, aid) in article_ids.iter().enumerate() {
+            q = q.bind((format!("aid_{}", i), aid.clone()));
+        }
+        q = q.bind(("entity_id", entity_id.to_string()));
+        let mut resp2 = q.await.context("list_co_mentioned_entities step2 failed")?;
+        let rows: Vec<serde_json::Value> = resp2.take(0).unwrap_or_default();
+
         let mut co_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for article_id in &article_ids {
-            let mut resp2 = self.db()
-                .query(
-                    "SELECT VALUE meta::id(out) FROM mentions
-                     WHERE in = type::thing('article', $article_id)
-                     AND out != type::thing('entity', $entity_id)"
-                )
-                .bind(("article_id", article_id.clone()))
-                .bind(("entity_id", entity_id.to_string()))
-                .await
-                .context("list_co_mentioned_entities step2 failed")?;
-            let co_ids: Vec<String> = resp2.take::<Vec<serde_json::Value>>(0)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-            for co_id in co_ids {
-                *co_counts.entry(co_id).or_insert(0) += 1;
+        for row in &rows {
+            if let Some(eid) = row.get("entity_id").and_then(|v| v.as_str()) {
+                *co_counts.entry(eid.to_string()).or_insert(0) += 1;
             }
         }
 
-        // Step 3: fetch entities and sort by count descending
-        let mut results = Vec::new();
-        for (co_id, count) in &co_counts {
-            if let Some(entity) = self.get_entity(co_id).await? {
-                results.push((entity, *count));
-            }
-        }
+        // Step 3: batch-fetch entities (1 query) and sort by count descending
+        let co_ids: Vec<&str> = co_counts.keys().map(|s| s.as_str()).collect();
+        let entity_map = self.batch_get_entities(&co_ids).await?;
+        let mut results: Vec<(Entity, usize)> = co_counts.into_iter()
+            .filter_map(|(eid, count)| entity_map.get(&eid).map(|e| (e.clone(), count)))
+            .collect();
         results.sort_by(|a, b| b.1.cmp(&a.1));
         Ok(results)
     }
