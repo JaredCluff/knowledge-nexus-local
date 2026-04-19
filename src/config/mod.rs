@@ -49,6 +49,10 @@ pub struct Config {
     /// Entity extraction settings (P3)
     #[serde(default)]
     pub extraction: ExtractionConfig,
+
+    /// Retrieval pipeline settings (P4)
+    #[serde(default)]
+    pub retrieval: RetrievalConfig,
 }
 
 // ============================================================================
@@ -273,6 +277,48 @@ impl Default for ExtractionConfig {
             enabled: true,
             ollama_url: default_ollama_url(),
             model: default_extraction_model(),
+        }
+    }
+}
+
+/// Retrieval pipeline configuration (P4)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalConfig {
+    /// RRF constant (higher = more weight to top ranks)
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f32,
+
+    /// Weight for vector search signal in RRF
+    #[serde(default = "default_vector_weight")]
+    pub vector_weight: f32,
+
+    /// Weight for keyword/FTS search signal in RRF
+    #[serde(default = "default_keyword_weight")]
+    pub keyword_weight: f32,
+
+    /// Maximum weight for graph search signal (scaled by entity coverage)
+    #[serde(default = "default_graph_weight_max")]
+    pub graph_weight_max: f32,
+
+    /// Enable one-hop RELATED_TO traversal (neighbors of direct matches)
+    #[serde(default = "default_graph_hop_enabled")]
+    pub graph_hop_enabled: bool,
+}
+
+fn default_rrf_k() -> f32 { 60.0 }
+fn default_vector_weight() -> f32 { 1.0 }
+fn default_keyword_weight() -> f32 { 1.1 }
+fn default_graph_weight_max() -> f32 { 1.0 }
+fn default_graph_hop_enabled() -> bool { true }
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            rrf_k: default_rrf_k(),
+            vector_weight: default_vector_weight(),
+            keyword_weight: default_keyword_weight(),
+            graph_weight_max: default_graph_weight_max(),
+            graph_hop_enabled: default_graph_hop_enabled(),
         }
     }
 }
@@ -629,6 +675,7 @@ impl Default for Config {
             discovery: DiscoveryConfig::default(),
             web_search: WebSearchConfig::default(),
             extraction: ExtractionConfig::default(),
+            retrieval: RetrievalConfig::default(),
         }
     }
 }

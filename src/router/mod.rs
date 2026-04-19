@@ -9,11 +9,12 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
+use crate::config::RetrievalConfig;
 use crate::store::Store;
 use crate::embeddings::EmbeddingModel;
 use crate::federation::RemoteQueryExecutor;
 use crate::k2k::models::K2KQueryResponse;
-use crate::retrieval::{ConfidenceScorer, HybridSearcher, QueryExpander, Reranker};
+use crate::retrieval::{ConfidenceScorer, GraphSearcher, HybridSearcher, QueryExpander, Reranker};
 use crate::vectordb::VectorDB;
 
 use self::context::ContextClassifier;
@@ -39,11 +40,19 @@ impl LocalRouter {
         embedding_model: Arc<Mutex<EmbeddingModel>>,
         hybrid_searcher: Option<Arc<HybridSearcher>>,
         remote_executor: Option<Arc<RemoteQueryExecutor>>,
+        retrieval_config: RetrievalConfig,
     ) -> Self {
+        let graph_searcher = Some(Arc::new(GraphSearcher::new(db.clone(), retrieval_config.clone())));
         Self {
             classifier: ContextClassifier::new(),
             planner: QueryPlanner::new(db.clone()),
-            executor: QueryExecutor::new(vectordb, embedding_model, hybrid_searcher),
+            executor: QueryExecutor::new(
+                vectordb,
+                embedding_model,
+                hybrid_searcher,
+                graph_searcher,
+                retrieval_config,
+            ),
             merger: ResultMerger::new(),
             reranker: Reranker::new(),
             query_expander: QueryExpander::new(),

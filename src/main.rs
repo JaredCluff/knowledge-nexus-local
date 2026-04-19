@@ -101,7 +101,7 @@ enum Commands {
         action: PathsAction,
     },
 
-    /// Search local files (offline mode)
+    /// Search articles (hybrid: vector + keyword + graph)
     Search {
         /// Search query
         query: String,
@@ -109,6 +109,14 @@ enum Commands {
         /// Maximum results
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Restrict to a specific store ID
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Show detailed provenance info (signal sources, RRF scores)
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Reindex all files
@@ -156,6 +164,12 @@ enum Commands {
         /// Maximum number of articles to process (default: all)
         #[arg(long)]
         limit: Option<usize>,
+    },
+
+    /// Inspect knowledge graph entities and connections
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
     },
 
     /// Migrate a 0.8 SQLite database into 1.0.0 SurrealDB format.
@@ -215,6 +229,32 @@ enum DedupReviewAction {
     Merge {
         /// Dedup queue entry ID
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphAction {
+    /// Show entity details, mentioning articles, and co-mentioned entities
+    Entity {
+        /// Entity name to search for
+        name: String,
+
+        /// Store ID (uses default store if omitted)
+        #[arg(long)]
+        store: Option<String>,
+    },
+
+    /// Show entities, related articles, and tags for an article
+    Article {
+        /// Article ID
+        id: String,
+    },
+
+    /// Show aggregate graph statistics
+    Stats {
+        /// Store ID (uses default store if omitted)
+        #[arg(long)]
+        store: Option<String>,
     },
 }
 
@@ -325,8 +365,8 @@ fn main() -> Result<()> {
             Commands::Paths { action } => {
                 cmd_paths(action).await?;
             }
-            Commands::Search { query, limit } => {
-                cmd_search(&query, limit).await?;
+            Commands::Search { query, limit, store, verbose } => {
+                cmd_search(&query, limit, store.as_deref(), verbose).await?;
             }
             Commands::Reindex {
                 force,
@@ -353,6 +393,19 @@ fn main() -> Result<()> {
             }
             Commands::ExtractEntities { store, limit } => {
                 cmd_extract_entities(&store, limit).await?;
+            }
+            Commands::Graph { action } => {
+                match action {
+                    GraphAction::Entity { name, store } => {
+                        cmd_graph_entity(&name, store.as_deref()).await?;
+                    }
+                    GraphAction::Article { id } => {
+                        cmd_graph_article(&id).await?;
+                    }
+                    GraphAction::Stats { store } => {
+                        cmd_graph_stats(store.as_deref()).await?;
+                    }
+                }
             }
             Commands::Migrate { from, to, force } => {
                 if from != "sqlite" {
@@ -463,6 +516,21 @@ async fn open_store_or_bail(cfg: &config::Config) -> Result<std::sync::Arc<dyn s
     }
 
     Ok(std::sync::Arc::new(surreal_store))
+}
+
+/// Resolve the store ID from an explicit filter or fall back to the owner's default store.
+async fn resolve_store_id(db: &dyn store::Store, filter: Option<&str>) -> Result<String> {
+    match filter {
+        Some(id) => Ok(id.to_string()),
+        None => {
+            let owner = db.get_owner_user().await?
+                .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
+            let stores = db.list_stores_for_user(&owner.id).await?;
+            Ok(stores.first()
+                .ok_or_else(|| anyhow::anyhow!("No stores found"))?
+                .id.clone())
+        }
+    }
 }
 
 async fn cmd_start_services() -> Result<()> {
@@ -983,24 +1051,183 @@ async fn cmd_paths(action: PathsAction) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_search(query: &str, limit: usize) -> Result<()> {
+async fn cmd_search(query: &str, limit: usize, store_filter: Option<&str>, verbose: bool) -> Result<()> {
     info!("Searching for: {}", query);
 
     let cfg = config::load_config().await?;
-    let results = search::search_files(&cfg, query, limit).await?;
+    let db = open_store_or_bail(&cfg).await?;
 
-    if results.is_empty() {
+    // Get owner user for the router
+    let owner = db.get_owner_user().await?
+        .ok_or_else(|| anyhow::anyhow!("No owner user found. Run `init` first."))?;
+
+    // Initialize retrieval stack
+    let registry = vectordb::quantizer::QuantizerRegistry::new();
+    // Find default store to get quantizer version
+    let stores = db.list_stores_for_user(&owner.id).await?;
+    let default_store = stores.first()
+        .ok_or_else(|| anyhow::anyhow!("No knowledge stores found. Create articles first."))?;
+    let quantizer = registry.resolve(&default_store.quantizer_version)?;
+    let vdb = std::sync::Arc::new(vectordb::VectorDB::open(quantizer).await?);
+    let emb = embeddings::EmbeddingModel::new()?;
+    let emb_arc = std::sync::Arc::new(tokio::sync::Mutex::new(emb));
+    let hybrid = Some(std::sync::Arc::new(
+        retrieval::HybridSearcher::new(db.clone()),
+    ));
+
+    let router = router::LocalRouter::new(
+        db.clone(), vdb, emb_arc, hybrid, None, cfg.retrieval.clone(),
+    );
+
+    let response = router.route(query, &owner.id, store_filter, limit).await?;
+
+    if response.results.is_empty() {
         println!("No results found for: {}", query);
         return Ok(());
     }
 
-    println!("Found {} results:\n", results.len());
-    for (i, result) in results.iter().enumerate() {
-        println!("{}. {} (score: {:.2})", i + 1, result.path, result.score);
-        if let Some(snippet) = &result.snippet {
+    println!("Found {} results ({}ms):\n", response.total_results, response.query_time_ms);
+    for (i, result) in response.results.iter().enumerate() {
+        println!("{}. [{:.2}] {}", i + 1, result.confidence, result.title);
+        // Show summary snippet
+        let snippet = if result.summary.len() > 150 {
+            let end = (0..=150)
+                .rev()
+                .find(|&j| result.summary.is_char_boundary(j))
+                .unwrap_or(0);
+            format!("{}...", &result.summary[..end])
+        } else {
+            result.summary.clone()
+        };
+        if !snippet.is_empty() {
             println!("   {}", snippet);
         }
+        if verbose {
+            if let Some(ref prov) = result.provenance {
+                println!("   via: {} (rank: {}, rrf: {:.4})", prov.store_type, prov.original_rank, prov.rrf_score);
+            }
+        }
         println!();
+    }
+
+    Ok(())
+}
+
+async fn cmd_graph_entity(name: &str, store_filter: Option<&str>) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_store_id(db.as_ref(), store_filter).await?;
+
+    let entities = db.search_entities_by_name(&store_id, &[name]).await?;
+    if entities.is_empty() {
+        println!("No entities found matching \"{}\"", name);
+        return Ok(());
+    }
+
+    for entity in &entities {
+        println!("Entity: {} ({})", entity.name, entity.entity_type);
+        println!("  Mentions: {} articles", entity.mention_count);
+        if let Some(ref desc) = entity.description {
+            println!("  Description: \"{}\"", desc);
+        }
+
+        // Articles mentioning this entity
+        let articles = db.list_articles_for_entity(&entity.id).await?;
+        if !articles.is_empty() {
+            println!("\n  Top articles:");
+            for (i, article) in articles.iter().take(10).enumerate() {
+                println!("    {}. {}", i + 1, article.title);
+            }
+        }
+
+        // Co-mentioned entities
+        let co = db.list_co_mentioned_entities(&entity.id).await?;
+        if !co.is_empty() {
+            println!("\n  Related entities (co-mentioned):");
+            for (co_entity, count) in co.iter().take(10) {
+                println!("    {}:{} ({} shared articles)", co_entity.entity_type, co_entity.name, count);
+            }
+        }
+
+        println!();
+    }
+
+    Ok(())
+}
+
+async fn cmd_graph_article(article_id: &str) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+
+    let article = db.get_article(article_id).await?
+        .ok_or_else(|| anyhow::anyhow!("Article '{}' not found", article_id))?;
+
+    println!("Article: {}", article.title);
+    println!("  ID: {}", article.id);
+    println!("  Store: {}", article.store_id);
+
+    // Entities
+    let entities = db.list_entities_for_article(article_id).await?;
+    if entities.is_empty() {
+        println!("\n  Entities: (none \u{2014} run extract-entities to populate)");
+    } else {
+        println!("\n  Entities mentioned:");
+        for entity in &entities {
+            println!("    {}:{} (mentions: {})", entity.entity_type, entity.name, entity.mention_count);
+        }
+    }
+
+    // Related articles
+    let related = db.list_related_articles(article_id).await?;
+    if !related.is_empty() {
+        println!("\n  Related articles (via RELATED_TO):");
+        for r in related.iter().take(10) {
+            println!("    {} ({})", r.title, r.id);
+        }
+    }
+
+    // Tags
+    let tags = db.list_tags_for_article(article_id).await?;
+    if !tags.is_empty() {
+        let tag_names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+        println!("\n  Tags: {}", tag_names.join(", "));
+    }
+
+    Ok(())
+}
+
+async fn cmd_graph_stats(store_filter: Option<&str>) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_store_id(db.as_ref(), store_filter).await?;
+
+    let store = db.get_store(&store_id).await?
+        .ok_or_else(|| anyhow::anyhow!("Store '{}' not found", store_id))?;
+
+    println!("Store: {} ({})", store.name, store.id);
+
+    // Entity counts by type
+    let counts = db.count_entities_by_type(&store_id).await?;
+    let total_entities: usize = counts.values().sum();
+    if total_entities == 0 {
+        println!("  Entities: 0 (run extract-entities to populate)");
+    } else {
+        let type_breakdown: Vec<String> = counts.iter()
+            .map(|(t, c)| format!("{} {}", c, t))
+            .collect();
+        println!("  Entities: {} ({})", total_entities, type_breakdown.join(", "));
+    }
+
+    // Article counts
+    let all_articles = db.list_articles_for_store(&store_id).await?;
+    let without_mentions = db.list_articles_without_mentions(&store_id).await?;
+    let with_mentions = all_articles.len() - without_mentions.len();
+    println!("  Articles with extractions: {}/{}", with_mentions, all_articles.len());
+
+    // Entity-to-article ratio
+    if with_mentions > 0 {
+        let ratio = total_entities as f64 / with_mentions as f64;
+        println!("  Distinct entities / extracted articles: {:.1}", ratio);
     }
 
     Ok(())
@@ -1328,4 +1555,95 @@ async fn cmd_logs(follow: bool, lines: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod graph_search_tests {
+    use super::*;
+    use store::{Article, Entity, Store, SurrealStore, KnowledgeStore, User};
+
+    fn now() -> String { chrono::Utc::now().to_rfc3339() }
+
+    async fn fixture() -> SurrealStore {
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "u1".into(), username: "alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts,
+        }).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_graph_search_integration() {
+        let s = fixture().await;
+        let ts = now();
+
+        s.create_article(&Article {
+            id: "a1".into(), store_id: "s1".into(), title: "Rust Async Programming".into(),
+            content: "Rust provides powerful async capabilities using Tokio runtime".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a2".into(), store_id: "s1".into(), title: "Go Concurrency".into(),
+            content: "Go uses goroutines for concurrent programming".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "a3".into(), store_id: "s1".into(), title: "Tokio Internals".into(),
+            content: "Deep dive into how Tokio scheduler works".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "h3".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_entity(&Entity {
+            id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: Some("Systems programming language".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "tool:tokio".into(), name: "Tokio".into(), entity_type: "tool".into(),
+            description: Some("Async runtime for Rust".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_mentions_edge("a1", "tool:rust", "Rust provides", 0.95).await.unwrap();
+        s.create_mentions_edge("a1", "tool:tokio", "using Tokio", 0.90).await.unwrap();
+        s.create_mentions_edge("a3", "tool:tokio", "Tokio scheduler", 0.92).await.unwrap();
+        s.create_or_update_related_to_edge("a1", "a3", 1, 0.5).await.unwrap();
+
+        let cfg = config::RetrievalConfig::default();
+        let db: std::sync::Arc<dyn Store> = std::sync::Arc::new(s);
+        let searcher = retrieval::GraphSearcher::new(db, cfg);
+
+        // "Rust" → should find a1 (direct mention)
+        let output = searcher.search("Rust", "s1", 10).await.unwrap();
+        assert!(!output.results.is_empty());
+        assert!(output.entity_coverage > 0.0);
+        assert!(output.results.iter().any(|r| r.article_id == "a1"));
+
+        // "Tokio" → should find a1 and a3
+        let output = searcher.search("Tokio", "s1", 10).await.unwrap();
+        assert!(output.results.len() >= 2);
+        let ids: Vec<&str> = output.results.iter().map(|r| r.article_id.as_str()).collect();
+        assert!(ids.contains(&"a1"));
+        assert!(ids.contains(&"a3"));
+
+        // "Go" → no entity match, empty results
+        let output = searcher.search("Go", "s1", 10).await.unwrap();
+        assert!(output.results.is_empty());
+        assert_eq!(output.entity_coverage, 0.0);
+    }
 }
