@@ -3,7 +3,7 @@
 //!
 //! The schema is SCHEMAFULL — unknown fields are rejected.
 
-pub const SCHEMA_VERSION: &str = "1.0.0-p3";
+pub const SCHEMA_VERSION: &str = "1.0.0-p5";
 
 /// Returns the full SurrealQL DDL script. Idempotent: every statement uses
 /// `IF NOT EXISTS` or `OVERWRITE` so re-running on an initialized DB is a
@@ -186,5 +186,58 @@ DEFINE FIELD IF NOT EXISTS strength ON related_to TYPE float DEFAULT 0.0;
 DEFINE FIELD IF NOT EXISTS created_at ON related_to TYPE string;
 DEFINE FIELD IF NOT EXISTS updated_at ON related_to TYPE string;
 DEFINE INDEX IF NOT EXISTS related_to_unique ON related_to FIELDS in, out UNIQUE;
+
+-- P5 multi-graph edge tables. Each edge carries provenance metadata
+-- (confidence, extraction_method, created_at, store_id).
+-- ENTITY_OVERLAP supersedes RELATED_TO; the migration renames data.
+
+DEFINE TABLE IF NOT EXISTS entity_overlap TYPE RELATION IN article OUT article SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS shared_entity_count ON entity_overlap TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS strength ON entity_overlap TYPE float DEFAULT 0.0;
+DEFINE FIELD IF NOT EXISTS confidence ON entity_overlap TYPE float DEFAULT 0.0;
+DEFINE FIELD IF NOT EXISTS extraction_method ON entity_overlap TYPE string DEFAULT "heuristic";
+DEFINE FIELD IF NOT EXISTS store_id ON entity_overlap TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON entity_overlap TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON entity_overlap TYPE string;
+DEFINE INDEX IF NOT EXISTS entity_overlap_unique ON entity_overlap FIELDS in, out UNIQUE;
+DEFINE INDEX IF NOT EXISTS entity_overlap_store_idx ON entity_overlap FIELDS store_id;
+
+DEFINE TABLE IF NOT EXISTS semantically_related TYPE RELATION IN article OUT article SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS similarity ON semantically_related TYPE float;
+DEFINE FIELD IF NOT EXISTS confidence ON semantically_related TYPE float;
+DEFINE FIELD IF NOT EXISTS extraction_method ON semantically_related TYPE string DEFAULT "derived";
+DEFINE FIELD IF NOT EXISTS store_id ON semantically_related TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON semantically_related TYPE string;
+DEFINE INDEX IF NOT EXISTS semantically_related_unique
+    ON semantically_related FIELDS in, out UNIQUE;
+DEFINE INDEX IF NOT EXISTS semantically_related_store_idx
+    ON semantically_related FIELDS store_id;
+
+DEFINE TABLE IF NOT EXISTS precedes TYPE RELATION IN article OUT article SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS confidence ON precedes TYPE float DEFAULT 1.0;
+DEFINE FIELD IF NOT EXISTS extraction_method ON precedes TYPE string DEFAULT "heuristic";
+DEFINE FIELD IF NOT EXISTS store_id ON precedes TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON precedes TYPE string;
+DEFINE INDEX IF NOT EXISTS precedes_unique ON precedes FIELDS in, out UNIQUE;
+DEFINE INDEX IF NOT EXISTS precedes_store_idx ON precedes FIELDS store_id;
+
+DEFINE TABLE IF NOT EXISTS caused_by TYPE RELATION IN article OUT article SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS confidence ON caused_by TYPE float;
+DEFINE FIELD IF NOT EXISTS rationale ON caused_by TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS extraction_method ON caused_by TYPE string DEFAULT "llm";
+DEFINE FIELD IF NOT EXISTS store_id ON caused_by TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON caused_by TYPE string;
+DEFINE INDEX IF NOT EXISTS caused_by_unique ON caused_by FIELDS in, out UNIQUE;
+DEFINE INDEX IF NOT EXISTS caused_by_store_idx ON caused_by FIELDS store_id;
+
+-- Named `references_edge` because `references` is a reserved SurrealQL keyword.
+DEFINE TABLE IF NOT EXISTS references_edge TYPE RELATION IN article OUT article SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS confidence ON references_edge TYPE float DEFAULT 1.0;
+DEFINE FIELD IF NOT EXISTS anchor_text ON references_edge TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS extraction_method ON references_edge TYPE string DEFAULT "user_asserted";
+DEFINE FIELD IF NOT EXISTS store_id ON references_edge TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON references_edge TYPE string;
+DEFINE INDEX IF NOT EXISTS references_edge_unique ON references_edge FIELDS in, out UNIQUE;
+DEFINE INDEX IF NOT EXISTS references_edge_store_idx ON references_edge FIELDS store_id;
 "#
 }

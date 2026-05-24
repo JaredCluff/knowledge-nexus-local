@@ -140,6 +140,73 @@ pub trait Store: Send + Sync {
     /// the co-occurrence article count — NOT the co-entity's global mention_count.
     /// Sorted by shared-article count descending.
     async fn list_co_mentioned_entities(&self, entity_id: &str) -> Result<Vec<(Entity, usize)>>;
+
+    // P5 typed edges (Task 3)
+    async fn create_precedes_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        confidence: f64,
+        method: ExtractionMethod,
+    ) -> Result<()>;
+
+    async fn create_semantically_related_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        similarity: f64,
+    ) -> Result<()>;
+
+    async fn create_caused_by_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        confidence: f64,
+        rationale: Option<String>,
+    ) -> Result<()>;
+
+    async fn create_references_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        anchor_text: Option<String>,
+    ) -> Result<()>;
+
+    async fn list_precedes_for(&self, store_id: &str, article_id: &str) -> Result<Vec<PrecedesEdge>>;
+    async fn list_semantically_related_for(&self, store_id: &str, article_id: &str) -> Result<Vec<SemanticallyRelatedEdge>>;
+    async fn list_caused_by_for(&self, store_id: &str, article_id: &str) -> Result<Vec<CausedByEdge>>;
+    async fn list_references_for(&self, store_id: &str, article_id: &str) -> Result<Vec<ReferencesEdgeRow>>;
+
+    /// Returns all (from_id, to_id) pairs from the entity_overlap table for
+    /// a given store. Used by P5 backfills that operate over the existing
+    /// entity-overlap graph.
+    async fn list_entity_overlap_pairs(&self, store_id: &str) -> Result<Vec<(String, String)>>;
+
+    /// Returns all article ids for the given store. Used by P5 backfills
+    /// that walk the article corpus.
+    async fn list_article_ids(&self, store_id: &str) -> Result<Vec<String>>;
+
+    /// Returns articles connected to `article_id` via any of the enabled
+    /// edge types. UNION across the enabled tables. Used by P6 spreading
+    /// activation; P5 only adds the plumbing.
+    ///
+    /// The returned tuple is `(neighbor_article_id, edge_type_label, score)`.
+    /// `edge_type_label` is the string name of the edge table; `score` is the
+    /// strongest-confidence (or similarity for semantically_related) value.
+    async fn list_graph_neighbors(
+        &self,
+        store_id: &str,
+        article_id: &str,
+        filter: &crate::config::EdgeTypeFilter,
+    ) -> Result<Vec<(String, String, f64)>>;
+
+    /// Returns per-edge-type counts for a store. Used by P5 `graph stats`
+    /// CLI to surface multi-graph coverage.
+    async fn count_edges_by_type(&self, store_id: &str) -> Result<EdgeCounts>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -1071,18 +1138,18 @@ impl Store for SurrealStore {
     }
 
     async fn list_related_articles(&self, article_id: &str) -> Result<Vec<Article>> {
-        // Query both directions since RELATED_TO edges are created unidirectionally
-        // (from the newly ingested article to existing articles).
+        // Query both directions since ENTITY_OVERLAP edges are stored unidirectionally
+        // (P5 renamed RELATED_TO -> ENTITY_OVERLAP; same Jaccard-on-shared-entities semantics).
         let mut resp = self
             .db()
             .query(
                 "SELECT *, meta::id(id) AS id FROM article
                  WHERE id IN (
-                    SELECT VALUE out FROM related_to
+                    SELECT VALUE out FROM entity_overlap
                     WHERE in = type::thing('article', $article_id)
                  )
                  OR id IN (
-                    SELECT VALUE in FROM related_to
+                    SELECT VALUE in FROM entity_overlap
                     WHERE out = type::thing('article', $article_id)
                  )",
             )
@@ -1281,6 +1348,322 @@ impl Store for SurrealStore {
         }
         results.sort_by(|a, b| b.1.cmp(&a.1));
         Ok(results)
+    }
+
+    // P5 typed edge implementations (Task 3)
+
+    async fn create_precedes_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        confidence: f64,
+        method: ExtractionMethod,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let method_str = serde_json::to_value(method)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "heuristic".into());
+
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to = type::thing('article', $to_id);
+                 RELATE $from->precedes->$to CONTENT {
+                    confidence: $conf,
+                    extraction_method: $method,
+                    store_id: $sid,
+                    created_at: $now
+                 }"
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("conf", confidence))
+            .bind(("method", method_str))
+            .bind(("sid", store_id.to_string()))
+            .bind(("now", now))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn create_semantically_related_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        similarity: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to = type::thing('article', $to_id);
+                 RELATE $from->semantically_related->$to CONTENT {
+                    similarity: $sim,
+                    confidence: $sim,
+                    extraction_method: 'derived',
+                    store_id: $sid,
+                    created_at: $now
+                 }"
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("sim", similarity))
+            .bind(("sid", store_id.to_string()))
+            .bind(("now", now))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn create_caused_by_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        confidence: f64,
+        rationale: Option<String>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to = type::thing('article', $to_id);
+                 RELATE $from->caused_by->$to CONTENT {
+                    confidence: $conf,
+                    rationale: $rationale,
+                    extraction_method: 'llm',
+                    store_id: $sid,
+                    created_at: $now
+                 }"
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("conf", confidence))
+            .bind(("rationale", rationale))
+            .bind(("sid", store_id.to_string()))
+            .bind(("now", now))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn create_references_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        anchor_text: Option<String>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to = type::thing('article', $to_id);
+                 RELATE $from->references_edge->$to CONTENT {
+                    confidence: 1.0,
+                    anchor_text: $anchor,
+                    extraction_method: 'user_asserted',
+                    store_id: $sid,
+                    created_at: $now
+                 }"
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("anchor", anchor_text))
+            .bind(("sid", store_id.to_string()))
+            .bind(("now", now))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn list_precedes_for(&self, store_id: &str, article_id: &str) -> Result<Vec<PrecedesEdge>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_article_id, meta::id(out) AS to_article_id,
+                        confidence, extraction_method, created_at
+                 FROM precedes
+                 WHERE store_id = $sid
+                   AND in = type::thing('article', $aid)"
+            )
+            .bind(("sid", store_id.to_string()))
+            .bind(("aid", article_id.to_string()))
+            .await?;
+        let edges: Vec<PrecedesEdge> = resp.take(0).unwrap_or_default();
+        Ok(edges)
+    }
+
+    async fn list_semantically_related_for(&self, store_id: &str, article_id: &str) -> Result<Vec<SemanticallyRelatedEdge>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_article_id, meta::id(out) AS to_article_id,
+                        similarity, confidence, extraction_method, created_at
+                 FROM semantically_related
+                 WHERE store_id = $sid
+                   AND in = type::thing('article', $aid)"
+            )
+            .bind(("sid", store_id.to_string()))
+            .bind(("aid", article_id.to_string()))
+            .await?;
+        let edges: Vec<SemanticallyRelatedEdge> = resp.take(0).unwrap_or_default();
+        Ok(edges)
+    }
+
+    async fn list_caused_by_for(&self, store_id: &str, article_id: &str) -> Result<Vec<CausedByEdge>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_article_id, meta::id(out) AS to_article_id,
+                        confidence, rationale, extraction_method, created_at
+                 FROM caused_by
+                 WHERE store_id = $sid
+                   AND in = type::thing('article', $aid)"
+            )
+            .bind(("sid", store_id.to_string()))
+            .bind(("aid", article_id.to_string()))
+            .await?;
+        let edges: Vec<CausedByEdge> = resp.take(0).unwrap_or_default();
+        Ok(edges)
+    }
+
+    async fn list_references_for(&self, store_id: &str, article_id: &str) -> Result<Vec<ReferencesEdgeRow>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_article_id, meta::id(out) AS to_article_id,
+                        confidence, anchor_text, extraction_method, created_at
+                 FROM references_edge
+                 WHERE store_id = $sid
+                   AND in = type::thing('article', $aid)"
+            )
+            .bind(("sid", store_id.to_string()))
+            .bind(("aid", article_id.to_string()))
+            .await?;
+        let edges: Vec<ReferencesEdgeRow> = resp.take(0).unwrap_or_default();
+        Ok(edges)
+    }
+
+    async fn list_entity_overlap_pairs(&self, store_id: &str) -> Result<Vec<(String, String)>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_id, meta::id(out) AS to_id
+                 FROM entity_overlap
+                 WHERE store_id = $sid"
+            )
+            .bind(("sid", store_id.to_string()))
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct Row { from_id: String, to_id: String }
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(|r| (r.from_id, r.to_id)).collect())
+    }
+
+    async fn list_article_ids(&self, store_id: &str) -> Result<Vec<String>> {
+        let mut resp = self.db()
+            .query("SELECT meta::id(id) AS id FROM article WHERE store_id = $sid")
+            .bind(("sid", store_id.to_string()))
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct Row { id: String }
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(|r| r.id).collect())
+    }
+
+    async fn list_graph_neighbors(
+        &self,
+        store_id: &str,
+        article_id: &str,
+        filter: &crate::config::EdgeTypeFilter,
+    ) -> Result<Vec<(String, String, f64)>> {
+        #[derive(serde::Deserialize)]
+        struct Row { neighbor: String, score: f64 }
+
+        let mut results: Vec<(String, String, f64)> = Vec::new();
+
+        // Run one query per enabled edge type and merge results in Rust.
+        // SurrealDB 2 does not support UNION across tables in a single statement.
+        if filter.entity_overlap {
+            let mut resp = self.db()
+                .query(
+                    "SELECT meta::id(out) AS neighbor, confidence AS score
+                     FROM entity_overlap
+                     WHERE store_id = $sid AND in = type::thing('article', $aid)",
+                )
+                .bind(("sid", store_id.to_string()))
+                .bind(("aid", article_id.to_string()))
+                .await?;
+            let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+            results.extend(rows.into_iter().map(|r| (r.neighbor, "entity_overlap".into(), r.score)));
+        }
+        if filter.semantically_related {
+            let mut resp = self.db()
+                .query(
+                    "SELECT meta::id(out) AS neighbor, similarity AS score
+                     FROM semantically_related
+                     WHERE store_id = $sid AND in = type::thing('article', $aid)",
+                )
+                .bind(("sid", store_id.to_string()))
+                .bind(("aid", article_id.to_string()))
+                .await?;
+            let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+            results.extend(rows.into_iter().map(|r| (r.neighbor, "semantically_related".into(), r.score)));
+        }
+        if filter.precedes {
+            let mut resp = self.db()
+                .query(
+                    "SELECT meta::id(out) AS neighbor, confidence AS score
+                     FROM precedes
+                     WHERE store_id = $sid AND in = type::thing('article', $aid)",
+                )
+                .bind(("sid", store_id.to_string()))
+                .bind(("aid", article_id.to_string()))
+                .await?;
+            let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+            results.extend(rows.into_iter().map(|r| (r.neighbor, "precedes".into(), r.score)));
+        }
+        if filter.caused_by {
+            let mut resp = self.db()
+                .query(
+                    "SELECT meta::id(out) AS neighbor, confidence AS score
+                     FROM caused_by
+                     WHERE store_id = $sid AND in = type::thing('article', $aid)",
+                )
+                .bind(("sid", store_id.to_string()))
+                .bind(("aid", article_id.to_string()))
+                .await?;
+            let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+            results.extend(rows.into_iter().map(|r| (r.neighbor, "caused_by".into(), r.score)));
+        }
+        if filter.references {
+            let mut resp = self.db()
+                .query(
+                    "SELECT meta::id(out) AS neighbor, confidence AS score
+                     FROM references_edge
+                     WHERE store_id = $sid AND in = type::thing('article', $aid)",
+                )
+                .bind(("sid", store_id.to_string()))
+                .bind(("aid", article_id.to_string()))
+                .await?;
+            let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+            results.extend(rows.into_iter().map(|r| (r.neighbor, "references_edge".into(), r.score)));
+        }
+
+        Ok(results)
+    }
+
+    async fn count_edges_by_type(&self, store_id: &str) -> Result<EdgeCounts> {
+        async fn count_one(db: &surrealdb::Surreal<surrealdb::engine::any::Any>, table: &str, sid: &str) -> Result<i64> {
+            let q = format!("SELECT count() AS n FROM {} WHERE store_id = $sid GROUP ALL", table);
+            let mut resp = db.query(&q).bind(("sid", sid.to_string())).await?;
+            #[derive(serde::Deserialize)] struct C { n: i64 }
+            let rows: Vec<C> = resp.take(0).unwrap_or_default();
+            Ok(rows.first().map(|c| c.n).unwrap_or(0))
+        }
+
+        Ok(EdgeCounts {
+            entity_overlap:       count_one(self.db(), "entity_overlap", store_id).await?,
+            semantically_related: count_one(self.db(), "semantically_related", store_id).await?,
+            precedes:             count_one(self.db(), "precedes", store_id).await?,
+            caused_by:            count_one(self.db(), "caused_by", store_id).await?,
+            references_edge:      count_one(self.db(), "references_edge", store_id).await?,
+        })
     }
 }
 
@@ -1920,6 +2303,184 @@ mod entity_tests {
         assert_eq!(co.len(), 2);
         assert!(co.iter().all(|(_, count)| *count == 1));
     }
+
+    #[tokio::test]
+    async fn create_precedes_edge_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+
+        s.create_article(&Article {
+            id: "p5pre-a1".into(), store_id: "p5pre-s1".into(), title: "A".into(), content: "x".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5pre-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "p5pre-a2".into(), store_id: "p5pre-s1".into(), title: "B".into(), content: "y".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5pre-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_precedes_edge(
+            "p5pre-s1", "p5pre-a1", "p5pre-a2",
+            1.0, ExtractionMethod::Heuristic,
+        ).await.expect("create precedes");
+
+        let edges = s.list_precedes_for("p5pre-s1", "p5pre-a1").await.expect("list");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to_article_id, "p5pre-a2");
+        assert_eq!(edges[0].extraction_method, ExtractionMethod::Heuristic);
+    }
+
+    #[tokio::test]
+    async fn create_semantically_related_edge_dedups_on_unique() {
+        let s = fixture().await;
+        let ts = now();
+        s.create_article(&Article {
+            id: "p5sem-a1".into(), store_id: "p5sem-s1".into(), title: "A".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5sem-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "p5sem-a2".into(), store_id: "p5sem-s1".into(), title: "B".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5sem-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_semantically_related_edge("p5sem-s1", "p5sem-a1", "p5sem-a2", 0.91).await.expect("first");
+        // Second insert of same pair should be a no-op (UNIQUE index)
+        let res = s.create_semantically_related_edge("p5sem-s1", "p5sem-a1", "p5sem-a2", 0.95).await;
+        assert!(res.is_ok(), "duplicate insert should not error; got {:?}", res);
+
+        let edges = s.list_semantically_related_for("p5sem-s1", "p5sem-a1").await.expect("list");
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_caused_by_edge_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+        s.create_article(&Article {
+            id: "p5cb-a1".into(), store_id: "p5cb-s1".into(), title: "A".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5cb-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "p5cb-a2".into(), store_id: "p5cb-s1".into(), title: "B".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5cb-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_caused_by_edge(
+            "p5cb-s1", "p5cb-a1", "p5cb-a2",
+            0.82, Some("explicit 'because' clause".into()),
+        ).await.expect("create caused_by");
+
+        let edges = s.list_caused_by_for("p5cb-s1", "p5cb-a1").await.expect("list");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].rationale.as_deref(), Some("explicit 'because' clause"));
+    }
+
+    #[tokio::test]
+    async fn create_references_edge_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+        s.create_article(&Article {
+            id: "p5ref-a1".into(), store_id: "p5ref-s1".into(), title: "A".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5ref-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "p5ref-a2".into(), store_id: "p5ref-s1".into(), title: "B".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5ref-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_references_edge(
+            "p5ref-s1", "p5ref-a1", "p5ref-a2",
+            Some("see [related](p5ref-a2)".into()),
+        ).await.expect("create references");
+
+        let edges = s.list_references_for("p5ref-s1", "p5ref-a1").await.expect("list");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].anchor_text.as_deref(), Some("see [related](p5ref-a2)"));
+    }
+
+    #[tokio::test]
+    async fn list_graph_neighbors_default_filter_traverses_entity_overlap_only() {
+        let s = SurrealStore::open_in_memory().await.expect("open mem");
+        s.db().query(r#"
+            CREATE article:lgn1a CONTENT { store_id: "lgn1-s1", title: "A", content: "",
+                source_type: "user", source_id: "", content_hash: "lgn1-a", tags: [],
+                created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+            CREATE article:lgn1b CONTENT { store_id: "lgn1-s1", title: "B", content: "",
+                source_type: "user", source_id: "", content_hash: "lgn1-b", tags: [],
+                created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+            CREATE article:lgn1c CONTENT { store_id: "lgn1-s1", title: "C", content: "",
+                source_type: "user", source_id: "", content_hash: "lgn1-c", tags: [],
+                created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+            RELATE article:lgn1a->entity_overlap->article:lgn1b CONTENT {
+                shared_entity_count: 2, strength: 0.5, confidence: 0.5,
+                extraction_method: "heuristic", store_id: "lgn1-s1",
+                created_at: "2026-01-01T00:00:01Z", updated_at: "2026-01-01T00:00:01Z"
+            };
+            RELATE article:lgn1a->semantically_related->article:lgn1c CONTENT {
+                similarity: 0.9, confidence: 0.9,
+                extraction_method: "derived", store_id: "lgn1-s1",
+                created_at: "2026-01-01T00:00:02Z"
+            };
+        "#).await.expect("seed").check().expect("seed check");
+
+        // Default filter: only entity_overlap traversed
+        let filter = crate::config::EdgeTypeFilter::default();
+        let neighbors = s.list_graph_neighbors("lgn1-s1", "lgn1a", &filter).await.expect("traverse");
+        assert_eq!(neighbors.len(), 1, "default filter returns only entity_overlap neighbor");
+        assert_eq!(neighbors[0].0, "lgn1b");
+        assert_eq!(neighbors[0].1, "entity_overlap");
+    }
+
+    #[tokio::test]
+    async fn list_graph_neighbors_with_semantic_enabled_returns_both() {
+        let s = SurrealStore::open_in_memory().await.expect("open mem");
+        s.db().query(r#"
+            CREATE article:lgn2a CONTENT { store_id: "lgn2-s1", title: "A", content: "",
+                source_type: "user", source_id: "", content_hash: "lgn2-a", tags: [],
+                created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+            CREATE article:lgn2b CONTENT { store_id: "lgn2-s1", title: "B", content: "",
+                source_type: "user", source_id: "", content_hash: "lgn2-b", tags: [],
+                created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+            CREATE article:lgn2c CONTENT { store_id: "lgn2-s1", title: "C", content: "",
+                source_type: "user", source_id: "", content_hash: "lgn2-c", tags: [],
+                created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+            RELATE article:lgn2a->entity_overlap->article:lgn2b CONTENT {
+                shared_entity_count: 2, strength: 0.5, confidence: 0.5,
+                extraction_method: "heuristic", store_id: "lgn2-s1",
+                created_at: "2026-01-01T00:00:01Z", updated_at: "2026-01-01T00:00:01Z"
+            };
+            RELATE article:lgn2a->semantically_related->article:lgn2c CONTENT {
+                similarity: 0.9, confidence: 0.9,
+                extraction_method: "derived", store_id: "lgn2-s1",
+                created_at: "2026-01-01T00:00:02Z"
+            };
+        "#).await.expect("seed").check().expect("seed check");
+
+        let filter = crate::config::EdgeTypeFilter {
+            semantically_related: true,
+            ..Default::default()
+        };
+        let neighbors = s.list_graph_neighbors("lgn2-s1", "lgn2a", &filter).await.expect("traverse");
+        assert_eq!(neighbors.len(), 2);
+        let types: std::collections::HashSet<&str> = neighbors.iter().map(|n| n.1.as_str()).collect();
+        assert!(types.contains("entity_overlap"));
+        assert!(types.contains("semantically_related"));
+    }
 }
 
 #[cfg(test)]
@@ -2092,16 +2653,34 @@ mod graph_edge_tests {
 
     #[tokio::test]
     async fn test_related_to_edge() {
+        // Seed entity_overlap directly (P5: related_to was renamed to entity_overlap).
         let s = fixture().await;
-        s.create_or_update_related_to_edge("a1", "a2", 1, 0.5).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        s.db().query(
+            "RELATE article:a1->entity_overlap->article:a2 CONTENT {
+                shared_entity_count: 1, strength: 0.5, confidence: 0.5,
+                extraction_method: 'heuristic', store_id: 's1',
+                created_at: $now, updated_at: $now
+            }",
+        )
+        .bind(("now", now.clone()))
+        .await.unwrap().check().unwrap();
 
         let related = s.list_related_articles("a1").await.unwrap();
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].id, "a2");
 
-        // Update strength
-        s.create_or_update_related_to_edge("a1", "a2", 2, 0.8).await.unwrap();
-        // Should still be 1 edge, not 2
+        // Update edge (delete + recreate to change count) — still 1 edge
+        s.db().query(
+            "DELETE FROM entity_overlap WHERE in = type::thing('article', 'a1') AND out = type::thing('article', 'a2');
+             RELATE article:a1->entity_overlap->article:a2 CONTENT {
+                shared_entity_count: 2, strength: 0.8, confidence: 0.8,
+                extraction_method: 'heuristic', store_id: 's1',
+                created_at: $now, updated_at: $now
+            }",
+        )
+        .bind(("now", now))
+        .await.unwrap().check().unwrap();
         let related = s.list_related_articles("a1").await.unwrap();
         assert_eq!(related.len(), 1);
     }
@@ -2177,8 +2756,18 @@ mod p3_integration_tests {
         let articles_rust = s.list_articles_for_entity("tool:rust").await.unwrap();
         assert_eq!(articles_rust.len(), 2);
 
-        // Create RELATED_TO edge: a1 and a2 share 2 entities out of 2+2-2=2, strength=1.0
-        s.create_or_update_related_to_edge("a1", "a2", 2, 1.0).await.unwrap();
+        // Create ENTITY_OVERLAP edge: a1 and a2 share 2 entities out of 2+2-2=2, strength=1.0
+        // (P5: related_to was renamed to entity_overlap)
+        let now_ts = now();
+        s.db().query(
+            "RELATE article:a1->entity_overlap->article:a2 CONTENT {
+                shared_entity_count: 2, strength: 1.0, confidence: 1.0,
+                extraction_method: 'heuristic', store_id: 's1',
+                created_at: $now, updated_at: $now
+            }",
+        )
+        .bind(("now", now_ts))
+        .await.unwrap().check().unwrap();
 
         let related = s.list_related_articles("a1").await.unwrap();
         assert_eq!(related.len(), 1);
@@ -2344,8 +2933,20 @@ mod p3_integration_tests {
         s.create_mentions_edge("tgsi-a1", "tgsi-tool-tokio", "using Tokio", 0.90).await.unwrap();
         s.create_mentions_edge("tgsi-a3", "tgsi-tool-tokio", "Tokio scheduler", 0.92).await.unwrap();
 
-        // Create RELATED_TO edge (a1 and a3 share tokio)
-        s.create_or_update_related_to_edge("tgsi-a1", "tgsi-a3", 1, 0.5).await.unwrap();
+        // Create ENTITY_OVERLAP edge (a1 and a3 share tokio)
+        // (P5: related_to was renamed to entity_overlap)
+        s.db().query(
+            "LET $from = type::thing('article', $from_id);
+             LET $to   = type::thing('article', $to_id);
+             RELATE $from->entity_overlap->$to CONTENT {
+                shared_entity_count: 1, strength: 0.5, confidence: 0.5,
+                extraction_method: 'heuristic', store_id: 's1',
+                created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z'
+             }",
+        )
+        .bind(("from_id", "tgsi-a1".to_string()))
+        .bind(("to_id", "tgsi-a3".to_string()))
+        .await.unwrap().check().unwrap();
 
         // search_entities_by_name: "Rust" should match tgsi-tool-rust
         let rust_matches = s.search_entities_by_name("s1", &["Rust"]).await.unwrap();

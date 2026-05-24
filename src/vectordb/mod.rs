@@ -19,6 +19,8 @@ use crate::embeddings::EMBEDDING_DIM;
 use crate::vectordb::quantizer::{QuantizerFilter, VectorQuantizer};
 
 pub mod quantizer;
+#[cfg(test)]
+pub mod mock;
 
 const TABLE_NAME: &str = "documents";
 const CHUNKS_TABLE: &str = "chunks";
@@ -667,6 +669,123 @@ impl VectorDB {
             Field::new("document_modified_at", DataType::Utf8, false),
             Field::new("quantizer_version", DataType::Utf8, false),
         ]))
+    }
+
+    /// Retrieve the embedding for a specific article (document) from the chunks table.
+    ///
+    /// The `store_id` parameter is accepted for API consistency with the
+    /// `VectorDbBackfillApi` trait but is not used for filtering (the chunks
+    /// table is a single global table; document_id is globally unique).
+    /// Returns `None` if no chunks are stored for the given article_id.
+    pub async fn get_embedding(&self, _store_id: &str, article_id: &str) -> Result<Option<Vec<f32>>> {
+        use arrow_array::FixedSizeListArray;
+        use futures_util::TryStreamExt;
+        use lancedb::query::{ExecutableQuery, QueryBase};
+
+        let table = self.db.open_table(CHUNKS_TABLE).execute().await?;
+
+        // Escape single quotes to prevent filter injection.
+        let safe_id = article_id.replace('\'', "''");
+        let stream = table
+            .query()
+            .only_if(format!("document_id = '{}'", safe_id))
+            .limit(1)
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("get_embedding query failed: {}", e))?;
+
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("get_embedding collect failed: {}", e))?;
+
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if let Some(emb_col) = batch
+                .column_by_name("embedding")
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+            {
+                let list = emb_col.value(0);
+                if let Some(fa) = list.as_any().downcast_ref::<Float32Array>() {
+                    let v: Vec<f32> = (0..fa.len()).map(|i| fa.value(i)).collect();
+                    return Ok(Some(v));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Run a top-K ANN query against the chunks table and return
+    /// `(document_id, cosine_similarity)` pairs, deduplicated by document_id
+    /// (best similarity wins if a document has multiple chunks).
+    ///
+    /// LanceDB returns cosine *distance*; we convert: `similarity = 1.0 - distance`.
+    pub async fn ann_query(
+        &self,
+        _store_id: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        let table = self.db.open_table(CHUNKS_TABLE).execute().await?;
+        let filter = crate::vectordb::quantizer::QuantizerFilter {
+            limit: Some(top_k),
+            ..Default::default()
+        };
+        let batches = self.quantizer.search(&table, query_embedding, &filter).await?;
+
+        // Deduplicate: for each document_id keep the highest similarity.
+        let mut best: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for batch in &batches {
+            let doc_ids = batch
+                .column_by_name("document_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let distances = batch
+                .column_by_name("_distance")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+
+            if let (Some(doc_ids), Some(distances)) = (doc_ids, distances) {
+                for i in 0..batch.num_rows() {
+                    let doc_id = doc_ids.value(i).to_string();
+                    let similarity = 1.0 - distances.value(i) as f64;
+                    let entry = best.entry(doc_id).or_insert(f64::NEG_INFINITY);
+                    if similarity > *entry {
+                        *entry = similarity;
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<(String, f64)> = best.into_iter().collect();
+        // Sort by similarity descending so callers get best matches first.
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VectorDbBackfillApi — thin trait for test isolation
+// ---------------------------------------------------------------------------
+
+/// Thin trait exposing only the two methods used by semantic backfill.
+///
+/// `VectorDB` implements this by delegating to its inherent methods. Tests
+/// use `MockVectorDb` (in `src/vectordb/mock.rs`) to inject pre-seeded data
+/// without touching the file-system LanceDB.
+#[async_trait::async_trait]
+pub trait VectorDbBackfillApi: Send + Sync {
+    async fn get_embedding(&self, store_id: &str, article_id: &str) -> anyhow::Result<Option<Vec<f32>>>;
+    async fn ann_query(&self, store_id: &str, query_embedding: &[f32], top_k: usize) -> anyhow::Result<Vec<(String, f64)>>;
+}
+
+#[async_trait::async_trait]
+impl VectorDbBackfillApi for VectorDB {
+    async fn get_embedding(&self, store_id: &str, article_id: &str) -> anyhow::Result<Option<Vec<f32>>> {
+        VectorDB::get_embedding(self, store_id, article_id).await
+    }
+    async fn ann_query(&self, store_id: &str, query_embedding: &[f32], top_k: usize) -> anyhow::Result<Vec<(String, f64)>> {
+        VectorDB::ann_query(self, store_id, query_embedding, top_k).await
     }
 }
 

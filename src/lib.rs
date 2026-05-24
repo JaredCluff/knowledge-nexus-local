@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod embeddings;
+pub mod knowledge;
 pub mod migrate;
 pub mod store;
 pub mod vectordb;
