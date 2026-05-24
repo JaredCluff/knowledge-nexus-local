@@ -312,6 +312,16 @@ pub struct RetrievalConfig {
     /// uses richer filters; P4/P5 default is entity_overlap only.
     #[serde(default)]
     pub edge_types: EdgeTypeFilter,
+
+    /// Graph signal strategy: "jaccard" preserves P4 behavior (one-hop
+    /// expansion via ENTITY_OVERLAP); "activation" enables P6 spreading
+    /// activation via PPR + SYNAPSE post-processing.
+    #[serde(default = "default_graph_strategy")]
+    pub graph_strategy: String,
+
+    /// Spreading-activation parameters (P6).
+    #[serde(default)]
+    pub activation: ActivationConfig,
 }
 
 fn default_rrf_k() -> f32 {
@@ -329,6 +339,9 @@ fn default_graph_weight_max() -> f32 {
 fn default_graph_hops() -> usize {
     1
 }
+fn default_graph_strategy() -> String {
+    "activation".into()
+}
 
 impl Default for RetrievalConfig {
     fn default() -> Self {
@@ -339,6 +352,8 @@ impl Default for RetrievalConfig {
             graph_weight_max: default_graph_weight_max(),
             graph_hops: default_graph_hops(),
             edge_types: EdgeTypeFilter::default(),
+            graph_strategy: default_graph_strategy(),
+            activation: ActivationConfig::default(),
         }
     }
 }
@@ -418,6 +433,85 @@ impl Default for EdgeTypeFilter {
             precedes: false,
             caused_by: false,
             references: false,
+        }
+    }
+}
+
+/// Spreading-activation configuration (P6).
+///
+/// Defaults are from peer-reviewed sources:
+/// - HippoRAG (arXiv 2405.14831): damping=0.5, tolerance=1e-4
+/// - SYNAPSE (arXiv 2601.02744): β=0.15, M=7, γ=5.0, τ=0.12, |V|≤10k
+/// - MAGMA (arXiv 2601.03236): per-intent edge weight multipliers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationConfig {
+    /// PPR damping factor (HippoRAG default).
+    #[serde(default = "default_ppr_damping")]
+    pub damping: f32,
+
+    /// PPR convergence tolerance.
+    #[serde(default = "default_ppr_tolerance")]
+    pub tolerance: f32,
+
+    /// Maximum PPR iterations before forced termination.
+    #[serde(default = "default_ppr_max_iter")]
+    pub max_iter: usize,
+
+    /// Active subgraph cap (max nodes considered per query, SYNAPSE).
+    #[serde(default = "default_subgraph_cap")]
+    pub subgraph_cap: usize,
+
+    /// SYNAPSE lateral inhibition strength.
+    #[serde(default = "default_inhibition_beta")]
+    pub inhibition_beta: f32,
+
+    /// SYNAPSE lateral inhibition competitor-set size.
+    #[serde(default = "default_inhibition_m")]
+    pub inhibition_m: usize,
+
+    /// SYNAPSE sigmoid steepness.
+    #[serde(default = "default_sigmoid_gamma")]
+    pub sigmoid_gamma: f32,
+
+    /// SYNAPSE confidence gate threshold.
+    #[serde(default = "default_gate_tau")]
+    pub gate_tau: f32,
+
+    /// Final top-K cutoff for activation results.
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+
+    /// If true, fall back to Ollama 3B intent classifier for ambiguous queries.
+    /// Default false: rule-based classifier handles ≥80% of queries; LLM only
+    /// for genuinely ambiguous ones. Deferred to P7+; flag exists for early
+    /// experimentation.
+    #[serde(default)]
+    pub llm_intent_fallback: bool,
+}
+
+fn default_ppr_damping() -> f32 { 0.5 }
+fn default_ppr_tolerance() -> f32 { 1e-4 }
+fn default_ppr_max_iter() -> usize { 50 }
+fn default_subgraph_cap() -> usize { 10_000 }
+fn default_inhibition_beta() -> f32 { 0.15 }
+fn default_inhibition_m() -> usize { 7 }
+fn default_sigmoid_gamma() -> f32 { 5.0 }
+fn default_gate_tau() -> f32 { 0.12 }
+fn default_top_k() -> usize { 30 }
+
+impl Default for ActivationConfig {
+    fn default() -> Self {
+        Self {
+            damping: default_ppr_damping(),
+            tolerance: default_ppr_tolerance(),
+            max_iter: default_ppr_max_iter(),
+            subgraph_cap: default_subgraph_cap(),
+            inhibition_beta: default_inhibition_beta(),
+            inhibition_m: default_inhibition_m(),
+            sigmoid_gamma: default_sigmoid_gamma(),
+            gate_tau: default_gate_tau(),
+            top_k: default_top_k(),
+            llm_intent_fallback: false,
         }
     }
 }
