@@ -133,6 +133,12 @@ pub trait Store: Send + Sync {
     async fn search_entities_by_name(&self, store_id: &str, terms: &[&str]) -> Result<Vec<Entity>>;
     async fn list_articles_for_entities(&self, entity_ids: &[&str]) -> Result<Vec<(Article, f64)>>;
     async fn count_entities_by_type(&self, store_id: &str) -> Result<std::collections::HashMap<String, usize>>;
+    /// Returns entities that co-occur with the given entity in shared articles.
+    ///
+    /// The `usize` in each returned tuple is the number of distinct articles
+    /// where both the given entity and the co-entity are mentioned. This is
+    /// the co-occurrence article count — NOT the co-entity's global mention_count.
+    /// Sorted by shared-article count descending.
     async fn list_co_mentioned_entities(&self, entity_id: &str) -> Result<Vec<(Entity, usize)>>;
 }
 
@@ -1215,6 +1221,12 @@ impl Store for SurrealStore {
         Ok(counts)
     }
 
+    /// Returns entities that co-occur with the given entity in shared articles.
+    ///
+    /// The `usize` in each returned tuple is the number of distinct articles
+    /// where both the given entity and the co-entity are mentioned. This is
+    /// the co-occurrence article count — NOT the co-entity's global mention_count.
+    /// Sorted by shared-article count descending.
     async fn list_co_mentioned_entities(
         &self,
         entity_id: &str,
@@ -1801,8 +1813,11 @@ mod entity_tests {
 
         let results = s.list_articles_for_entities(&["lafe:rust"]).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results.iter().any(|(a, c)| a.id == "lafe-a1" && (*c - 0.95).abs() < 0.01));
-        assert!(results.iter().any(|(a, c)| a.id == "lafe-a2" && (*c - 0.80).abs() < 0.01));
+        // Sorted by confidence desc: a1 (0.95) before a2 (0.80)
+        assert_eq!(results[0].0.id, "lafe-a1");
+        assert!((results[0].1 - 0.95).abs() < 0.01);
+        assert_eq!(results[1].0.id, "lafe-a2");
+        assert!((results[1].1 - 0.80).abs() < 0.01);
 
         let results = s.list_articles_for_entities(&[]).await.unwrap();
         assert!(results.is_empty());
