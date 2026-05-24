@@ -128,6 +128,12 @@ pub trait Store: Send + Sync {
     async fn list_tags_for_article(&self, article_id: &str) -> Result<Vec<Tag>>;
     async fn list_related_articles(&self, article_id: &str) -> Result<Vec<Article>>;
     async fn list_articles_without_mentions(&self, store_id: &str) -> Result<Vec<Article>>;
+
+    // Graph queries (P4)
+    async fn search_entities_by_name(&self, store_id: &str, terms: &[&str]) -> Result<Vec<Entity>>;
+    async fn list_articles_for_entities(&self, entity_ids: &[&str]) -> Result<Vec<(Article, f64)>>;
+    async fn count_entities_by_type(&self, store_id: &str) -> Result<std::collections::HashMap<String, usize>>;
+    async fn list_co_mentioned_entities(&self, entity_id: &str) -> Result<Vec<(Entity, usize)>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -202,6 +208,7 @@ impl SurrealStore {
         Ok(())
     }
 }
+
 
 #[async_trait]
 impl Store for SurrealStore {
@@ -1091,6 +1098,178 @@ impl Store for SurrealStore {
             .await?;
         Ok(resp.take(0)?)
     }
+
+    // Graph queries (P4)
+
+    async fn search_entities_by_name(&self, store_id: &str, terms: &[&str]) -> Result<Vec<Entity>> {
+        if terms.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut conditions = Vec::new();
+        let mut binds: Vec<(String, String)> = Vec::new();
+        for (i, term) in terms.iter().enumerate() {
+            let lower = term.to_lowercase();
+            let param = format!("term_{}", i);
+            conditions.push(format!(
+                "(string::lowercase(name) = ${p} OR string::lowercase(name) CONTAINS ${p})",
+                p = param
+            ));
+            binds.push((param, lower));
+        }
+        let where_clause = conditions.join(" OR ");
+        let query = format!(
+            "SELECT *, meta::id(id) AS id FROM entity WHERE store_id = $store_id AND ({}) ORDER BY mention_count DESC",
+            where_clause
+        );
+        let mut q = self.db().query(&query).bind(("store_id", store_id.to_string()));
+        for (param, value) in binds {
+            q = q.bind((param, value));
+        }
+        let mut resp = q.await.context("search_entities_by_name query failed")?;
+        let rows: Vec<Entity> = resp.take(0).unwrap_or_default();
+        Ok(rows)
+    }
+
+    async fn list_articles_for_entities(&self, entity_ids: &[&str]) -> Result<Vec<(Article, f64)>> {
+        if entity_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Fetch edges for each entity and accumulate max confidence per article.
+        // We iterate per entity (small N in practice) to stay within SurrealQL
+        // type-safe Thing lookups — passing raw strings in an IN clause does not
+        // match SurrealDB Thing values.
+        let mut article_confidences: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+
+        for entity_id in entity_ids {
+            let mut resp = self
+                .db()
+                .query(
+                    "SELECT
+                        meta::id(in) AS article_id,
+                        confidence
+                     FROM mentions
+                     WHERE out = type::thing('entity', $entity_id)",
+                )
+                .bind(("entity_id", entity_id.to_string()))
+                .await
+                .context("list_articles_for_entities per-entity query failed")?;
+            let edges: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+
+            for edge in &edges {
+                let aid = edge
+                    .get("article_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let conf = edge
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let entry = article_confidences.entry(aid.to_string()).or_insert(0.0);
+                if conf > *entry {
+                    *entry = conf;
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        for (aid, confidence) in &article_confidences {
+            if let Some(article) = self.get_article(aid).await? {
+                results.push((article, *confidence));
+            }
+        }
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results)
+    }
+
+    async fn count_entities_by_type(
+        &self,
+        store_id: &str,
+    ) -> Result<std::collections::HashMap<String, usize>> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT entity_type, count() AS count FROM entity
+                 WHERE store_id = $store_id
+                 GROUP BY entity_type",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await
+            .context("count_entities_by_type query failed")?;
+        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+
+        let mut counts = std::collections::HashMap::new();
+        for row in rows {
+            let etype = row
+                .get("entity_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let count = row
+                .get("count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            counts.insert(etype, count);
+        }
+        Ok(counts)
+    }
+
+    async fn list_co_mentioned_entities(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<(Entity, usize)>> {
+        // Step 1: find all articles that mention the target entity.
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT VALUE meta::id(in) AS article_id
+                 FROM mentions
+                 WHERE out = type::thing('entity', $entity_id)",
+            )
+            .bind(("entity_id", entity_id.to_string()))
+            .await
+            .context("list_co_mentioned_entities: step1 failed")?;
+        let article_ids: Vec<String> = resp.take(0).unwrap_or_default();
+
+        if article_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Step 2: for each co-article, find which OTHER entities it mentions.
+        // We accumulate shared-article counts per co-entity in Rust.
+        let mut co_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for article_id in &article_ids {
+            let mut resp2 = self
+                .db()
+                .query(
+                    "SELECT VALUE meta::id(out) AS entity_id
+                     FROM mentions
+                     WHERE in = type::thing('article', $article_id)
+                       AND out != type::thing('entity', $entity_id)",
+                )
+                .bind(("article_id", article_id.clone()))
+                .bind(("entity_id", entity_id.to_string()))
+                .await
+                .context("list_co_mentioned_entities: step2 failed")?;
+            let co_ids: Vec<String> = resp2.take(0).unwrap_or_default();
+            for co_id in co_ids {
+                *co_counts.entry(co_id).or_insert(0) += 1;
+            }
+        }
+
+        // Step 3: fetch entity records and build result.
+        let mut results: Vec<(Entity, usize)> = Vec::new();
+        for (co_id, count) in &co_counts {
+            if let Some(entity) = self.get_entity(co_id).await? {
+                results.push((entity, *count));
+            }
+        }
+        results.sort_by(|a, b| b.1.cmp(&a.1));
+        Ok(results)
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -1543,6 +1722,188 @@ mod entity_tests {
         s.upsert_entity_and_increment(&entity).await.unwrap();
         let got = s.get_entity("tool:rust").await.unwrap().unwrap();
         assert_eq!(got.mention_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_search_entities_by_name() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Use unique IDs with "srch-" prefix to avoid collision with parallel tests
+        // that may also create tool:rust / tool:tokio in the shared in-memory store.
+        s.create_entity(&Entity {
+            id: "srch:rust".into(), name: "srch-Rust".into(), entity_type: "tool".into(),
+            description: Some("Systems language".into()), store_id: "s1".into(),
+            mention_count: 5, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "srch:tokio".into(), name: "srch-Tokio".into(), entity_type: "tool".into(),
+            description: Some("Async runtime".into()), store_id: "s1".into(),
+            mention_count: 3, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "srch:async-rt".into(), name: "srch-async runtime".into(),
+            entity_type: "concept".into(), description: None, store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        let results = s.search_entities_by_name("s1", &["srch-Rust"]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "srch:rust");
+
+        let results = s.search_entities_by_name("s1", &["srch-Tok"]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "srch:tokio");
+
+        let results = s.search_entities_by_name("s1", &["srch-async"]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "srch:async-rt");
+
+        let results = s.search_entities_by_name("s1", &["srch-Python"]).await.unwrap();
+        assert!(results.is_empty());
+
+        let results = s.search_entities_by_name("s1", &["srch-Rust", "srch-Tokio"]).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        let results = s.search_entities_by_name("s2", &["srch-Rust"]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_articles_for_entities() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Use unique IDs with "lafe-" prefix to avoid collision with parallel tests.
+        s.create_article(&Article {
+            id: "lafe-a1".into(), store_id: "s1".into(), title: "Rust Guide".into(),
+            content: "About Rust".into(), source_type: "user".into(),
+            source_id: String::new(), content_hash: "lafe-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "lafe-a2".into(), store_id: "s1".into(), title: "Tokio Deep Dive".into(),
+            content: "About Tokio".into(), source_type: "user".into(),
+            source_id: String::new(), content_hash: "lafe-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_entity(&Entity {
+            id: "lafe:rust".into(), name: "lafe-Rust".into(), entity_type: "tool".into(),
+            description: None, store_id: "s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_mentions_edge("lafe-a1", "lafe:rust", "written in Rust", 0.95).await.unwrap();
+        s.create_mentions_edge("lafe-a2", "lafe:rust", "uses Rust", 0.80).await.unwrap();
+
+        let results = s.list_articles_for_entities(&["lafe:rust"]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|(a, c)| a.id == "lafe-a1" && (*c - 0.95).abs() < 0.01));
+        assert!(results.iter().any(|(a, c)| a.id == "lafe-a2" && (*c - 0.80).abs() < 0.01));
+
+        let results = s.list_articles_for_entities(&[]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_count_entities_by_type() {
+        // Use a unique store id to avoid data from parallel tests affecting counts.
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "cebt-u1".into(), username: "cebt-alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "cebt-s1".into(), owner_id: "cebt-u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store_cebt_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_entity(&Entity {
+            id: "cebt:rust".into(), name: "cebt-Rust".into(), entity_type: "tool".into(),
+            description: None, store_id: "cebt-s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "cebt:tokio".into(), name: "cebt-Tokio".into(), entity_type: "tool".into(),
+            description: None, store_id: "cebt-s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "cebt:linus".into(), name: "cebt-Linus".into(), entity_type: "person".into(),
+            description: None, store_id: "cebt-s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        let counts = s.count_entities_by_type("cebt-s1").await.unwrap();
+        assert_eq!(counts.get("tool"), Some(&2));
+        assert_eq!(counts.get("person"), Some(&1));
+        assert_eq!(counts.get("concept"), None);
+    }
+
+    #[tokio::test]
+    async fn test_list_co_mentioned_entities() {
+        // Fresh independent store to avoid any shared-state pollution.
+        let s = SurrealStore::open_in_memory().await.unwrap();
+        let ts = now();
+        s.create_user(&User {
+            id: "co-u1".into(), username: "co-alice".into(), display_name: "Alice".into(),
+            is_owner: true, settings: serde_json::json!({}),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_store(&KnowledgeStore {
+            id: "co-s1".into(), owner_id: "co-u1".into(), store_type: "personal".into(),
+            name: "Notes".into(), lancedb_collection: "store-co-s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_article(&Article {
+            id: "co-art1".into(), store_id: "co-s1".into(), title: "Rust Async".into(),
+            content: "C".into(), source_type: "user".into(),
+            source_id: String::new(), content_hash: "co-hx1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "co-art2".into(), store_id: "co-s1".into(), title: "More Rust".into(),
+            content: "C".into(), source_type: "user".into(),
+            source_id: String::new(), content_hash: "co-hx2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Entity IDs that don't contain colons, to avoid any SurrealDB ID-parsing ambiguity.
+        s.create_entity(&Entity {
+            id: "co-ent-rust".into(), name: "co-Rust".into(), entity_type: "tool".into(),
+            description: None, store_id: "co-s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "co-ent-tokio".into(), name: "co-Tokio".into(), entity_type: "tool".into(),
+            description: None, store_id: "co-s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "co-ent-async".into(), name: "co-async".into(), entity_type: "concept".into(),
+            description: None, store_id: "co-s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_mentions_edge("co-art1", "co-ent-rust", "e", 0.9).await.unwrap();
+        s.create_mentions_edge("co-art1", "co-ent-tokio", "e", 0.9).await.unwrap();
+        s.create_mentions_edge("co-art2", "co-ent-rust", "e", 0.9).await.unwrap();
+        s.create_mentions_edge("co-art2", "co-ent-async", "e", 0.9).await.unwrap();
+
+        let co = s.list_co_mentioned_entities("co-ent-rust").await.unwrap();
+        assert_eq!(co.len(), 2);
+        assert!(co.iter().all(|(_, count)| *count == 1));
     }
 }
 
