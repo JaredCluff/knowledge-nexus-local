@@ -11,6 +11,7 @@ use crate::store::Tier;
 
 /// Inputs to the salience function. Implementations vary in which fields
 /// they use; the struct collects everything any formula might need.
+#[allow(dead_code)] // consumed by P9+ background runner
 pub struct SalienceInput<'a> {
     pub importance_score: f64,
     pub last_accessed_at: &'a str,
@@ -23,6 +24,7 @@ pub struct SalienceInput<'a> {
 
 /// Compute salience for the given input under the configured formula.
 /// Output is clamped to [0.0, 1.0].
+#[allow(dead_code)] // consumed by P9+ background runner
 pub fn salience(input: &SalienceInput<'_>, config: &DecayConfig, now: DateTime<Utc>) -> f64 {
     let raw = match config.formula {
         SalienceFormula::ActivationDriven => salience_activation(input, config, now),
@@ -34,6 +36,7 @@ pub fn salience(input: &SalienceInput<'_>, config: &DecayConfig, now: DateTime<U
 }
 
 /// Determine tier from a salience value + thresholds.
+#[allow(dead_code)] // consumed by P9+ background runner
 pub fn tier_for_salience(s: f64, config: &DecayConfig) -> Tier {
     if s >= config.hot_threshold {
         Tier::Hot
@@ -135,6 +138,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 /// Result of a nightly tier transition pass.
+#[allow(dead_code)] // consumed by P9+ background runner
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TransitionReport {
     pub articles_scanned: usize,
@@ -149,6 +153,7 @@ pub struct TransitionReport {
 /// Walk all articles + events for a store; compute salience; transition tier
 /// when it changes AND the item is not pinned. Audit-logged via the Store
 /// trait methods. Returns a per-pass report.
+#[allow(dead_code)] // consumed by P9+ background runner
 pub async fn nightly_tier_transition(
     db: Arc<dyn crate::store::Store>,
     store_id: &str,
@@ -330,8 +335,7 @@ mod tests {
 
     #[test]
     fn memory_os_heat_increases_with_visits() {
-        let mut cfg = DecayConfig::default();
-        cfg.formula = SalienceFormula::MemoryOsHeat;
+        let cfg = DecayConfig { formula: SalienceFormula::MemoryOsHeat, ..DecayConfig::default() };
         let now = epoch_2026();
         let low_visits = salience(&input_with("2026-05-24T00:00:00Z", 0.5, 1), &cfg, now);
         let high_visits = salience(&input_with("2026-05-24T00:00:00Z", 0.5, 100), &cfg, now);
@@ -341,17 +345,15 @@ mod tests {
 
     #[test]
     fn memory_os_heat_clamped_to_unit_interval() {
-        let mut cfg = DecayConfig::default();
-        cfg.formula = SalienceFormula::MemoryOsHeat;
+        let cfg = DecayConfig { formula: SalienceFormula::MemoryOsHeat, ..DecayConfig::default() };
         let now = epoch_2026();
         let s = salience(&input_with("2026-05-24T00:00:00Z", 0.5, 1_000_000), &cfg, now);
-        assert!(s >= 0.0 && s <= 1.0, "value out of range: {}", s);
+        assert!((0.0..=1.0).contains(&s), "value out of range: {}", s);
     }
 
     #[test]
     fn generative_agents_weights_recency_relevance_importance() {
-        let mut cfg = DecayConfig::default();
-        cfg.formula = SalienceFormula::GenerativeAgents;
+        let cfg = DecayConfig { formula: SalienceFormula::GenerativeAgents, ..DecayConfig::default() };
         let now = epoch_2026();
         // Fresh access + high importance + zero relevance: ga_w_recency·1 + 0 + ga_w_importance·1
         let s = salience(&input_with("2026-05-24T00:00:00Z", 1.0, 1), &cfg, now);
@@ -362,8 +364,7 @@ mod tests {
 
     #[test]
     fn ebbinghaus_decays_with_time_and_strengthens_with_access() {
-        let mut cfg = DecayConfig::default();
-        cfg.formula = SalienceFormula::Ebbinghaus;
+        let cfg = DecayConfig { formula: SalienceFormula::Ebbinghaus, ..DecayConfig::default() };
         let now = epoch_2026();
 
         // 7 days ago, accessed once
@@ -383,10 +384,9 @@ mod tests {
             SalienceFormula::GenerativeAgents,
             SalienceFormula::Ebbinghaus,
         ] {
-            let mut cfg = DecayConfig::default();
-            cfg.formula = formula;
+            let cfg = DecayConfig { formula, ..DecayConfig::default() };
             let s = salience(&input_with("2026-05-24T00:00:00Z", 0.5, 10), &cfg, now);
-            assert!(s >= 0.0 && s <= 1.0,
+            assert!((0.0..=1.0).contains(&s),
                 "{:?} produced out-of-range salience: {}", formula, s);
         }
     }

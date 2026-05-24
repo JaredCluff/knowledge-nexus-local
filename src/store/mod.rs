@@ -284,6 +284,7 @@ pub trait Store: Send + Sync {
 
     // P8 access tracking + tier + pin/unpin + audit log
     async fn record_article_access(&self, article_id: &str) -> Result<()>;
+    #[allow(dead_code)] // P9+ will call this when event access tracking is wired
     async fn record_event_access(&self, event_id: &str) -> Result<()>;
     async fn set_article_tier(&self, article_id: &str, new_tier: Tier, reason: &str) -> Result<()>;
     async fn set_event_tier(&self, event_id: &str, new_tier: Tier, reason: &str) -> Result<()>;
@@ -2623,13 +2624,16 @@ impl Store for SurrealStore {
 }
 
 /// Convenience alias used across the codebase.
+#[allow(dead_code)] // consumed by P9+ services
 pub type DynStore = dyn Store;
 
 /// Boxed, arc'd instance. Handed into every service that used to hold
 /// `Arc<Database>`.
+#[allow(dead_code)] // consumed by P9+ services
 pub type SharedStore = Arc<DynStore>;
 
 /// Wrap a concrete `SurrealStore` into the shared trait object.
+#[allow(dead_code)] // consumed by P9+ services
 pub fn shared(store: SurrealStore) -> SharedStore {
     Arc::new(store)
 }
@@ -4755,8 +4759,7 @@ mod p3_integration_tests {
         s.create_mentions_edge("gj-a1", "gj-tool-rust", "Rust provides", 0.95).await.unwrap();
 
         // Explicit jaccard strategy
-        let mut config = RetrievalConfig::default();
-        config.graph_strategy = "jaccard".into();
+        let config = RetrievalConfig { graph_strategy: "jaccard".into(), ..RetrievalConfig::default() };
         let db: Arc<dyn Store> = Arc::new(s);
         let searcher = GraphSearcher::new(db, config);
 

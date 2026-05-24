@@ -11,9 +11,11 @@ use crate::store::Store;
 
 /// Idempotency-key generator: produces a stable key for a (job, time-window) pair.
 /// Returning the same key for two invocations means they're considered duplicate.
+#[allow(dead_code)] // P9+ background runner
 pub type IdempotencyKeyFn = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// Async job handler. Returns Ok(()) on success; Err for permanent failure.
+#[allow(dead_code)] // P9+ background runner
 pub type JobHandler = Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         + Send
@@ -21,6 +23,7 @@ pub type JobHandler = Arc<
 >;
 
 /// Specification for a registered job.
+#[allow(dead_code)] // P9+ background runner
 pub struct JobSpec {
     pub name: String,
     /// Minimum interval between runs (idempotency window).
@@ -35,11 +38,13 @@ pub struct JobSpec {
 /// execution. NOT a separate background task (yet) — for P7 this is a
 /// foreground-only API used by the CLI and ingest paths. P8 may add a
 /// long-lived tokio task; for P7 we keep it minimal.
+#[allow(dead_code)] // P9+ background runner
 pub struct MaintenanceScheduler {
     db: Arc<dyn Store>,
     jobs: HashMap<String, JobSpec>,
 }
 
+#[allow(dead_code)] // P9+ background runner
 impl MaintenanceScheduler {
     pub fn new(db: Arc<dyn Store>) -> Self {
         Self {
