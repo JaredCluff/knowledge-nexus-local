@@ -53,6 +53,10 @@ pub struct Config {
     /// Retrieval pipeline settings (P4)
     #[serde(default)]
     pub retrieval: RetrievalConfig,
+
+    /// Graph / multi-graph settings (P5)
+    #[serde(default)]
+    pub graph: GraphConfig,
 }
 
 // ============================================================================
@@ -329,6 +333,52 @@ impl Default for RetrievalConfig {
             keyword_weight: default_keyword_weight(),
             graph_weight_max: default_graph_weight_max(),
             graph_hops: default_graph_hops(),
+        }
+    }
+}
+
+/// Graph / multi-graph configuration (P5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphConfig {
+    /// Cosine similarity threshold for SEMANTICALLY_RELATED edges
+    /// (HippoRAG uses 0.8, SYNAPSE 0.92; KNL midpoint default).
+    #[serde(default = "default_semantic_threshold")]
+    pub semantic_threshold: f64,
+
+    /// Top-K nearest neighbors to scan per article during semantic backfill.
+    #[serde(default = "default_semantic_top_k")]
+    pub semantic_top_k: usize,
+
+    /// If true, attempt causal extraction during ingestion (LLM-bound).
+    /// Default false: opt-in because expensive and there is no honest heuristic.
+    #[serde(default)]
+    pub causal_enabled: bool,
+
+    /// Ollama model for causal extraction. Independent of `extraction.model`
+    /// because causal extraction is sensitive to instruction-following
+    /// (typically wants a larger model than entity extraction).
+    #[serde(default = "default_causal_model")]
+    pub causal_model: String,
+
+    /// Confidence threshold below which causal edges are stored for audit
+    /// only and excluded from retrieval traversal.
+    #[serde(default = "default_causal_confidence_threshold")]
+    pub causal_confidence_threshold: f64,
+}
+
+fn default_semantic_threshold() -> f64 { 0.85 }
+fn default_semantic_top_k() -> usize { 20 }
+fn default_causal_model() -> String { "llama3.2:3b".into() }
+fn default_causal_confidence_threshold() -> f64 { 0.6 }
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self {
+            semantic_threshold: default_semantic_threshold(),
+            semantic_top_k: default_semantic_top_k(),
+            causal_enabled: false,
+            causal_model: default_causal_model(),
+            causal_confidence_threshold: default_causal_confidence_threshold(),
         }
     }
 }
@@ -686,6 +736,7 @@ impl Default for Config {
             web_search: WebSearchConfig::default(),
             extraction: ExtractionConfig::default(),
             retrieval: RetrievalConfig::default(),
+            graph: GraphConfig::default(),
         }
     }
 }

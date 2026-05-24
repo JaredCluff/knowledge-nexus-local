@@ -1,4 +1,5 @@
 pub mod articles;
+pub mod causal_extractor;
 pub mod citation_backfill;
 pub mod conversations;
 pub mod entity_extractor;
