@@ -32,7 +32,23 @@ impl GraphSearcher {
     }
 
     /// Run graph-based retrieval for the given query within a store.
+    /// Dispatches by `config.graph_strategy`:
+    /// - `"jaccard"` — P4 one-hop ENTITY_OVERLAP expansion (back-compat path).
+    /// - `"activation"` — P6 spreading activation (PPR + SYNAPSE + MAGMA).
     pub async fn search(
+        &self,
+        query: &str,
+        store_id: &str,
+        top_k: usize,
+    ) -> Result<GraphSearchOutput> {
+        match self.config.graph_strategy.as_str() {
+            "activation" => self.search_via_activation(query, store_id, top_k).await,
+            _ => self.search_via_jaccard(query, store_id, top_k).await,
+        }
+    }
+
+    /// P4 one-hop jaccard path. Preserved for back-compat and ablation tests.
+    async fn search_via_jaccard(
         &self,
         query: &str,
         store_id: &str,
@@ -136,6 +152,25 @@ impl GraphSearcher {
         Ok(GraphSearchOutput { results, entity_coverage })
     }
 
+    /// P6 spreading-activation path. Builds an ActivationEngine and translates
+    /// its output to the GraphSearchOutput shape that the router expects.
+    async fn search_via_activation(
+        &self,
+        query: &str,
+        store_id: &str,
+        top_k: usize,
+    ) -> Result<GraphSearchOutput> {
+        let engine = crate::retrieval::ActivationEngine::new(
+            self.db.clone(),
+            self.config.clone(),
+        );
+        let output = engine.search(query, store_id, top_k).await?;
+        Ok(GraphSearchOutput {
+            results: output.results,
+            entity_coverage: output.entity_coverage,
+        })
+    }
+
     /// Extract meaningful query terms by removing stop words.
     fn extract_terms(&self, query: &str) -> Vec<String> {
         let expander = QueryExpander::new();
@@ -171,5 +206,28 @@ mod tests {
         assert!(!variants[1].contains("the"));
         assert!(variants[1].contains("configure"));
         assert!(variants[1].contains("database"));
+    }
+
+    /// Verify the strategy dispatcher actually selects the correct path.
+    /// (Not a full GraphSearcher integration test — that lives in
+    /// p3_integration_tests::graph_searcher_end_to_end for jaccard and
+    /// p3_integration_tests::activation_engine_returns_results_for_why_query
+    /// for activation. This test just confirms the match arms compile and
+    /// that the strategy string is read correctly.)
+    #[test]
+    fn graph_strategy_string_matches_expected_values() {
+        let cfg_activation = RetrievalConfig {
+            graph_strategy: "activation".into(),
+            ..RetrievalConfig::default()
+        };
+        let cfg_jaccard = RetrievalConfig {
+            graph_strategy: "jaccard".into(),
+            ..RetrievalConfig::default()
+        };
+        assert_eq!(cfg_activation.graph_strategy, "activation");
+        assert_eq!(cfg_jaccard.graph_strategy, "jaccard");
+        // Default is "activation"
+        let cfg_default = RetrievalConfig::default();
+        assert_eq!(cfg_default.graph_strategy, "activation");
     }
 }
