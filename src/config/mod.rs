@@ -330,6 +330,12 @@ pub struct RetrievalConfig {
     /// Spreading-activation parameters (P6).
     #[serde(default)]
     pub activation: ActivationConfig,
+
+    /// If true, include Archive-tier items in retrieval (default false: P8
+    /// archived items are excluded from default queries to honor the
+    /// quarantine semantics — surface only via explicit query parameter).
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 fn default_rrf_k() -> f32 {
@@ -362,6 +368,7 @@ impl Default for RetrievalConfig {
             edge_types: EdgeTypeFilter::default(),
             graph_strategy: default_graph_strategy(),
             activation: ActivationConfig::default(),
+            include_archive: false,
         }
     }
 }

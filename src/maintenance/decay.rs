@@ -244,12 +244,30 @@ pub async fn nightly_tier_transition(
     Ok(report)
 }
 
-fn tier_label(t: crate::store::Tier) -> &'static str {
+pub fn tier_label(t: crate::store::Tier) -> &'static str {
     match t {
         crate::store::Tier::Hot => "hot",
         crate::store::Tier::Warm => "warm",
         crate::store::Tier::Cold => "cold",
         crate::store::Tier::Archive => "archive",
+    }
+}
+
+/// Retrieval-time tier weighting factor. Applied as a multiplicative
+/// scalar on result confidence and PPR personalization weights.
+///
+/// Defaults are chosen so that:
+/// - Hot items retain full weight
+/// - Warm items are dampened to half (still surfaceable)
+/// - Cold items are nearly invisible in default queries (0.1×)
+/// - Archive items are excluded entirely unless include_archive=true.
+pub fn tier_factor(tier: crate::store::Tier, include_archive: bool) -> f32 {
+    use crate::store::Tier::*;
+    match tier {
+        Hot => 1.0,
+        Warm => 0.5,
+        Cold => 0.1,
+        Archive => if include_archive { 0.05 } else { 0.0 },
     }
 }
 
