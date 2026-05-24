@@ -1,6 +1,7 @@
 //! Query Expander - generates query variants for low-confidence results.
 //! Uses synonym expansion, term splitting, and common transformations.
 
+#[derive(Default)]
 pub struct QueryExpander;
 
 impl QueryExpander {

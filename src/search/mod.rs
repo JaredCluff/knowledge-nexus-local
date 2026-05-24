@@ -1,7 +1,7 @@
 //! File search and indexing module.
 //!
-//! Provides semantic search over local files using embedded vector database
-//! and ONNX embeddings.
+//! Provides semantic search over local files and knowledge-store articles using
+//! the tri-signal retrieval stack (vector + keyword + graph) via LocalRouter.
 
 mod indexer;
 mod walker;
@@ -37,7 +37,11 @@ pub struct FileMetadata {
     pub permissions: Option<String>,
 }
 
-/// Search files using semantic search
+/// Search files and articles using tri-signal retrieval (vector + keyword + graph).
+///
+/// Delegates to `LocalRouter::route` and translates `K2KResult` into the
+/// existing `SearchResult` shape so all callers (UI, chat handler, K2K query
+/// handler) receive the same type without modification.
 pub async fn search_files(config: &Config, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
     const MAX_QUERY_LENGTH: usize = 10_000;
     if query.len() > MAX_QUERY_LENGTH {
@@ -46,121 +50,116 @@ pub async fn search_files(config: &Config, query: &str, limit: usize) -> Result<
 
     info!("Searching for: {} (limit: {})", query, limit);
 
-    // Initialize components
-    let mut embedding_model = EmbeddingModel::new()?;
-    // TODO(P2): VectorDB::new() defaults to IvfPqQuantizer. Should resolve
-    // from the store's quantizer_version once search_files() has access to store config.
-    let vectordb = VectorDB::new().await?;
+    // Build the tri-signal retrieval stack (mirrors cmd_search from P4 Task 6).
+    let db = crate::store::open_from_config(config).await?;
+    let owner = db
+        .get_owner_user()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("No owner user found. Run `init` first."))?;
+    let stores = db.list_stores_for_user(&owner.id).await?;
+    let default_store = stores
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No knowledge stores configured"))?;
 
-    // Generate query embedding
-    let query_embedding = embedding_model.embed_text(query)?;
+    let registry = crate::vectordb::quantizer::QuantizerRegistry::new();
+    let quantizer = registry.resolve(&default_store.quantizer_version)?;
+    let vdb = std::sync::Arc::new(VectorDB::open(quantizer).await?);
+    let emb = EmbeddingModel::new()?;
+    let emb_arc = std::sync::Arc::new(tokio::sync::Mutex::new(emb));
+    let hybrid = Some(std::sync::Arc::new(
+        crate::retrieval::HybridSearcher::new(db.clone()),
+    ));
 
-    // Search vector database
-    let results = vectordb.search(&query_embedding, limit).await?;
+    let router = crate::router::LocalRouter::new(
+        db.clone(),
+        vdb,
+        emb_arc,
+        hybrid,
+        None,
+        config.retrieval.clone(),
+    );
 
-    // Load whitelist to filter results
+    let response = router.route(query, &owner.id, None, limit).await?;
+
+    // Optional path whitelist for "file"-source articles. Non-file articles
+    // pass through (they have no path to validate).
     let whitelist = PathWhitelist::new(
         config.security.allowed_paths.clone(),
         config.security.blocked_patterns.clone(),
         config.security.max_file_size,
     )?;
 
-    // Filter and enhance results
-    let mut search_results = Vec::new();
-    for result in results {
-        let path = PathBuf::from(&result.path);
-
-        // Security check: ensure result is still in whitelist
-        if !whitelist.is_allowed(&path) {
-            warn!("Filtered out result not in whitelist: {}", result.path);
-            continue;
-        }
-
-        // Load file content for snippet
-        let snippet = if config.indexing.include_content {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => extract_snippet(&content, query, 150),
-                Err(_) => None,
+    let mut out = Vec::with_capacity(response.results.len());
+    for r in response.results {
+        // Translate K2KResult → SearchResult. For "file" source_type articles,
+        // the source_id is the file path; verify it's still in the whitelist and
+        // fill file metadata where possible.
+        let (path_str, filename, content_type, metadata) = if r.source_type == "file" {
+            // Re-fetch the article to get source_id (the file path). This is an
+            // extra round-trip but only for results that survive ranking.
+            match db.get_article(&r.article_id).await? {
+                Some(article) if !article.source_id.is_empty() => {
+                    let p = PathBuf::from(&article.source_id);
+                    if !whitelist.is_allowed(&p) {
+                        warn!(
+                            "Filtered out result not in whitelist: {}",
+                            article.source_id
+                        );
+                        continue;
+                    }
+                    let fname = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let ct = mime_guess::from_path(&p)
+                        .first_or_octet_stream()
+                        .to_string();
+                    let meta = std::fs::metadata(&p).ok().map(|m| FileMetadata {
+                        size_bytes: m.len(),
+                        modified_at: m
+                            .modified()
+                            .ok()
+                            .map(|t| {
+                                chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+                            })
+                            .unwrap_or_default(),
+                        created_at: None,
+                        permissions: None,
+                    });
+                    (article.source_id, fname, ct, meta)
+                }
+                _ => (String::new(), String::new(), "text/plain".to_string(), None),
             }
         } else {
-            None
+            // Non-file articles: title doubles as filename, no file metadata.
+            (
+                r.article_id.clone(),
+                r.title.clone(),
+                "text/plain".to_string(),
+                None,
+            )
         };
 
-        search_results.push(SearchResult {
-            id: result.id,
-            path: result.path,
-            filename: path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
+        let snippet = if r.summary.is_empty() {
+            None
+        } else {
+            Some(r.summary.clone())
+        };
+
+        out.push(SearchResult {
+            id: r.article_id.clone(),
+            path: path_str,
+            filename,
             content: None,
-            content_type: mime_guess::from_path(&path)
-                .first_or_octet_stream()
-                .to_string(),
-            score: result.score,
+            content_type,
+            score: r.confidence,
             snippet,
-            metadata: Some(FileMetadata {
-                size_bytes: result.size_bytes,
-                modified_at: result.modified_at,
-                created_at: None,
-                permissions: None,
-            }),
+            metadata,
         });
     }
 
-    debug!("Found {} results", search_results.len());
-    Ok(search_results)
-}
-
-/// Extract a snippet from content around matching terms
-fn extract_snippet(content: &str, query: &str, max_len: usize) -> Option<String> {
-    if content.is_empty() || max_len == 0 {
-        return None;
-    }
-
-    let query_lower = query.to_lowercase();
-    let content_lower = content.to_lowercase();
-
-    // Find first occurrence of any query term
-    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
-    let mut best_pos = 0;
-
-    for term in &query_terms {
-        if let Some(pos) = content_lower.find(term) {
-            best_pos = pos;
-            break;
-        }
-    }
-
-    // Extract snippet around match
-    let start_guess = best_pos.saturating_sub(max_len / 2);
-    let start = nearest_char_boundary(content, start_guess);
-    let end = nearest_char_boundary(content, (start + max_len).min(content.len()));
-    if start >= end {
-        return None;
-    }
-
-    let snippet = &content[start..end];
-
-    // Clean up snippet
-    let snippet = snippet.trim();
-    let snippet = snippet.replace('\n', " ").replace("  ", " ");
-
-    if start > 0 {
-        Some(format!("...{}", snippet))
-    } else if end < content.len() {
-        Some(format!("{}...", snippet))
-    } else {
-        Some(snippet.to_string())
-    }
-}
-
-fn nearest_char_boundary(s: &str, mut idx: usize) -> usize {
-    idx = idx.min(s.len());
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
+    debug!("Found {} results", out.len());
+    Ok(out)
 }
 
 /// Start the file watcher for incremental indexing

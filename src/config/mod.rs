@@ -360,6 +360,10 @@ pub struct GraphConfig {
     #[serde(default)]
     pub causal_enabled: bool,
 
+    /// Ollama API base URL for causal extraction.
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
+
     /// Ollama model for causal extraction. Independent of `extraction.model`
     /// because causal extraction is sensitive to instruction-following
     /// (typically wants a larger model than entity extraction).
@@ -383,6 +387,7 @@ impl Default for GraphConfig {
             semantic_threshold: default_semantic_threshold(),
             semantic_top_k: default_semantic_top_k(),
             causal_enabled: false,
+            ollama_url: default_ollama_url(),
             causal_model: default_causal_model(),
             causal_confidence_threshold: default_causal_confidence_threshold(),
         }

@@ -153,6 +153,7 @@ impl ArticleService {
                 .context("Failed to generate embedding for chunk")?;
 
             let chunk_meta = ChunkMetadata {
+                store_id: article.store_id.clone(),
                 chunk_id: format!("{}-{}", article.id, i),
                 document_id: article.id.clone(),
                 chunk_index: i as u32,
@@ -179,6 +180,7 @@ impl ArticleService {
         }
 
         let doc_meta = DocumentMetadata {
+            store_id: article.store_id.clone(),
             id: article.id.clone(),
             title: article.title.clone(),
             path: format!("article://{}", article.id),

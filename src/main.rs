@@ -480,72 +480,11 @@ async fn cmd_init(hub_url: Option<String>, force: bool) -> Result<()> {
 
 /// Open the SurrealDB store, creating the owner user on first run.
 /// Refuses to start if a legacy SQLite DB exists but no migration has run.
+///
+/// Delegates to `store::open_from_config` which is lib-visible so that
+/// non-bin modules (e.g. `search::search_files`) can also open the store.
 async fn open_store_or_bail(cfg: &config::Config) -> Result<std::sync::Arc<dyn store::Store>> {
-    let surreal_dir = config::data_dir().join("surreal");
-    let sqlite_path = config::sqlite_path();
-    let surreal_exists = surreal_dir.exists()
-        && surreal_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false);
-    let migration_complete = migrate::is_migrated(&surreal_dir);
-    let legacy_sqlite_exists = sqlite_path.exists();
-
-    match (surreal_exists, migration_complete, legacy_sqlite_exists) {
-        (true, true, _) => {
-            info!("Opening SurrealDB at {:?}", surreal_dir);
-        }
-        (true, false, _) => {
-            anyhow::bail!(
-                "SurrealDB directory {:?} exists but has no `migration_completed` marker. \
-                 A previous migration was interrupted. Run: \
-                 `knowledge-nexus-agent migrate --force` to retry.",
-                surreal_dir
-            );
-        }
-        (false, _, true) => {
-            anyhow::bail!(
-                "Legacy SQLite DB at {:?} detected, but no SurrealDB yet. Run: \
-                 `knowledge-nexus-agent migrate --from sqlite --to surrealdb` to upgrade.",
-                sqlite_path
-            );
-        }
-        (false, _, false) => {
-            info!("No existing database — creating fresh SurrealDB at {:?}", surreal_dir);
-        }
-    }
-
-    let surreal_store = store::SurrealStore::open(&surreal_dir).await?;
-
-    if surreal_store.get_owner_user().await?.is_none() {
-        let now = chrono::Utc::now().to_rfc3339();
-        let user_id = uuid::Uuid::new_v4().to_string();
-        let store_id = uuid::Uuid::new_v4().to_string();
-
-        let user = store::User {
-            id: user_id.clone(),
-            username: cfg.device.name.clone(),
-            display_name: cfg.device.name.clone(),
-            is_owner: true,
-            settings: serde_json::json!({}),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        };
-        surreal_store.create_user(&user).await?;
-        info!("Created default owner user: {}", user.username);
-
-        let ks = store::KnowledgeStore {
-            id: store_id.clone(),
-            owner_id: user_id,
-            store_type: "personal".into(),
-            name: format!("{}'s Knowledge", cfg.device.name),
-            lancedb_collection: format!("store_{}", store_id),
-            quantizer_version: "ivf_pq_v1".into(),
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        surreal_store.create_store(&ks).await?;
-        info!("Created default personal store: {}", ks.name);
-    }
-
-    Ok(std::sync::Arc::new(surreal_store))
+    store::open_from_config(cfg).await
 }
 
 async fn cmd_start_services() -> Result<()> {

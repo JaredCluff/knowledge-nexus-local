@@ -282,6 +282,84 @@ impl SurrealStore {
     }
 }
 
+/// Open the SurrealDB store from config, creating the owner user and default
+/// knowledge store on first run. Refuses to start if a legacy SQLite DB exists
+/// but no migration has been run.
+///
+/// This is the lib-visible equivalent of `open_store_or_bail` from `main.rs`.
+/// Non-bin modules (e.g. `search::search_files`) call this instead of
+/// duplicating the store-opening logic.
+pub async fn open_from_config(cfg: &crate::config::Config) -> Result<std::sync::Arc<dyn Store>> {
+    let surreal_dir = crate::config::data_dir().join("surreal");
+    let sqlite_path = crate::config::sqlite_path();
+    let surreal_exists = surreal_dir.exists()
+        && surreal_dir
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+    let migration_complete = crate::migrate::is_migrated(&surreal_dir);
+    let legacy_sqlite_exists = sqlite_path.exists();
+
+    match (surreal_exists, migration_complete, legacy_sqlite_exists) {
+        (true, true, _) => {
+            tracing::info!("Opening SurrealDB at {:?}", surreal_dir);
+        }
+        (true, false, _) => {
+            anyhow::bail!(
+                "SurrealDB directory {:?} exists but has no `migration_completed` marker. \
+                 A previous migration was interrupted. Run: \
+                 `knowledge-nexus-agent migrate --force` to retry.",
+                surreal_dir
+            );
+        }
+        (false, _, true) => {
+            anyhow::bail!(
+                "Legacy SQLite DB at {:?} detected, but no SurrealDB yet. Run: \
+                 `knowledge-nexus-agent migrate --from sqlite --to surrealdb` to upgrade.",
+                sqlite_path
+            );
+        }
+        (false, _, false) => {
+            tracing::info!("No existing database — creating fresh SurrealDB at {:?}", surreal_dir);
+        }
+    }
+
+    let surreal_store = SurrealStore::open(&surreal_dir).await?;
+
+    if surreal_store.get_owner_user().await?.is_none() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let store_id = uuid::Uuid::new_v4().to_string();
+
+        let user = User {
+            id: user_id.clone(),
+            username: cfg.device.name.clone(),
+            display_name: cfg.device.name.clone(),
+            is_owner: true,
+            settings: serde_json::json!({}),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        surreal_store.create_user(&user).await?;
+        tracing::info!("Created default owner user: {}", user.username);
+
+        let ks = KnowledgeStore {
+            id: store_id.clone(),
+            owner_id: user_id,
+            store_type: "personal".into(),
+            name: format!("{}'s Knowledge", cfg.device.name),
+            lancedb_collection: format!("store_{}", store_id),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        surreal_store.create_store(&ks).await?;
+        tracing::info!("Created default personal store: {}", ks.name);
+    }
+
+    Ok(std::sync::Arc::new(surreal_store))
+}
+
 
 #[async_trait]
 impl Store for SurrealStore {
@@ -2978,5 +3056,101 @@ mod p3_integration_tests {
         // (both are mentioned in a1, so they co-occur)
         let co = s.list_co_mentioned_entities("tgsi-tool-tokio").await.unwrap();
         assert!(!co.is_empty());
+    }
+
+    /// End-to-end test of P4 GraphSearcher driving real entity matching,
+    /// MENTIONS traversal, and ENTITY_OVERLAP one-hop expansion.
+    #[tokio::test]
+    async fn graph_searcher_end_to_end() {
+        use crate::retrieval::GraphSearcher;
+        use crate::config::RetrievalConfig;
+
+        let s = fixture().await;
+        let ts = now();
+
+        // Create three articles
+        s.create_article(&Article {
+            id: "gse-a1".into(), store_id: "s1".into(),
+            title: "Rust Async Programming".into(),
+            content: "Rust provides powerful async capabilities using Tokio runtime".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "gse-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "gse-a2".into(), store_id: "s1".into(),
+            title: "Go Concurrency".into(),
+            content: "Go uses goroutines for concurrent programming".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "gse-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "gse-a3".into(), store_id: "s1".into(),
+            title: "Tokio Internals".into(),
+            content: "Deep dive into how Tokio scheduler works".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "gse-h3".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // Create entities
+        s.create_entity(&Entity {
+            id: "gse-tool-rust".into(), name: "Rust".into(), entity_type: "tool".into(),
+            description: Some("Systems programming language".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "gse-tool-tokio".into(), name: "Tokio".into(), entity_type: "tool".into(),
+            description: Some("Async runtime for Rust".into()), store_id: "s1".into(),
+            mention_count: 2, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // MENTIONS edges
+        s.create_mentions_edge("gse-a1", "gse-tool-rust", "Rust provides", 0.95).await.unwrap();
+        s.create_mentions_edge("gse-a1", "gse-tool-tokio", "using Tokio", 0.90).await.unwrap();
+        s.create_mentions_edge("gse-a3", "gse-tool-tokio", "Tokio scheduler", 0.92).await.unwrap();
+
+        // ENTITY_OVERLAP (P5-renamed from RELATED_TO) — seeded directly into the new table.
+        // Uses LET-binding for hyphenated IDs (SurrealDB 2 parses bare table:id-with-hyphen
+        // as subtraction).
+        s.db().query(r#"
+            LET $from = type::thing('article', 'gse-a1');
+            LET $to = type::thing('article', 'gse-a3');
+            RELATE $from->entity_overlap->$to CONTENT {
+                shared_entity_count: 1, strength: 0.5, confidence: 0.5,
+                extraction_method: "heuristic", store_id: "s1",
+                created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z"
+            };
+        "#).await.expect("seed overlap").check().expect("seed check");
+
+        // Drive GraphSearcher end-to-end
+        let config = RetrievalConfig::default();
+        let db: std::sync::Arc<dyn Store> = std::sync::Arc::new(s);
+        let searcher = GraphSearcher::new(db, config);
+
+        // Query "Rust" → finds gse-a1 (direct mention) + gse-a3 (one-hop via overlap)
+        let output = searcher.search("Rust", "s1", 10).await.expect("search Rust");
+        assert!(!output.results.is_empty(), "Rust query must return results");
+        assert!(output.entity_coverage > 0.0);
+        let ids: Vec<&str> = output.results.iter().map(|r| r.article_id.as_str()).collect();
+        assert!(ids.contains(&"gse-a1"), "direct Rust mention missing");
+        // gse-a3 may appear via one-hop ENTITY_OVERLAP expansion if graph_hops >= 1
+        // (default is 1). This verifies the P5 list_related_articles fix from Task 9
+        // actually works end-to-end.
+        assert!(ids.contains(&"gse-a3"), "one-hop expansion via entity_overlap failed — \
+            P5 Task 9's list_related_articles retarget may be broken in production path");
+
+        // Query "Tokio" → both gse-a1 and gse-a3 mention Tokio
+        let output = searcher.search("Tokio", "s1", 10).await.expect("search Tokio");
+        assert!(output.results.len() >= 2);
+        let ids: Vec<&str> = output.results.iter().map(|r| r.article_id.as_str()).collect();
+        assert!(ids.contains(&"gse-a1"));
+        assert!(ids.contains(&"gse-a3"));
+
+        // Query "Go" → no Go entity, no results, zero coverage
+        let output = searcher.search("Go", "s1", 10).await.expect("search Go");
+        assert!(output.results.is_empty());
+        assert_eq!(output.entity_coverage, 0.0);
     }
 }

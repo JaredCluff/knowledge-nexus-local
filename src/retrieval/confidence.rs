@@ -19,6 +19,12 @@ pub struct ConfidenceScorer {
     keyword_boost_threshold: f32,
 }
 
+impl Default for ConfidenceScorer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfidenceScorer {
     pub fn new() -> Self {
         Self {
