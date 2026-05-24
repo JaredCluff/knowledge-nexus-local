@@ -81,11 +81,12 @@ impl K2KServer {
             config.retrieval.clone(),
         ));
 
-        let article_service = Arc::new(ArticleService::new(
+        let article_service = Arc::new(ArticleService::with_reflection(
             db.clone(),
             vectordb.clone(),
             embedding_model.clone(),
             Some(config.extraction.clone()),
+            config.reflection.clone(),
         ));
 
         let conversation_service = Arc::new(ConversationService::new(db.clone()));

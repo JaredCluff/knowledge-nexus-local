@@ -312,13 +312,13 @@ mod tests {
         let n = cnts.first().map(|c| c.n).unwrap_or(0);
         assert_eq!(n, 0, "related_to should be empty after migration");
 
-        // Schema version is now 1.0.0-p5
+        // Schema version is now 1.0.0-p7
         let mut resp3 = db.query(
             "SELECT version FROM _schema_version WHERE id = type::thing('_schema_version', 'current')"
         ).await.expect("version").check().expect("check3");
         #[derive(serde::Deserialize)] struct V { version: String }
         let vs: Vec<V> = resp3.take(0).unwrap_or_default();
-        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p5"));
+        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p7"));
     }
 
     #[tokio::test]
@@ -333,6 +333,80 @@ mod tests {
         #[derive(serde::Deserialize)] struct Cnt { n: i64 }
         let cnts: Vec<Cnt> = resp.take(0).unwrap_or_default();
         assert_eq!(cnts.first().map(|c| c.n).unwrap_or(0), 1);
+    }
+
+    /// Helper: connect to an in-memory SurrealDB and seed it as a P5-state corpus.
+    /// Used to verify that the P5 → P7 transition is a clean DDL-only upgrade
+    /// (no data migration, just new tables created empty).
+    async fn setup_p5_corpus() -> Surreal<Any> {
+        let db = connect("memory").await.expect("connect mem");
+        db.use_ns("test").use_db("test").await.expect("use ns/db");
+        db.query(schema::ddl()).await.expect("ddl").check().expect("ddl check");
+
+        // Pretend schema version is P5
+        db.query(
+            "UPSERT type::thing('_schema_version', 'current') CONTENT { version: $v, applied_at: $t }"
+        )
+        .bind(("v", "1.0.0-p5"))
+        .bind(("t", "2026-05-23T00:00:00Z"))
+        .await.expect("seed p5 version").check().expect("seed p5 check");
+
+        // Seed one article so we can verify it's untouched by the upgrade
+        db.query(r#"
+            CREATE article:p7m_a1 CONTENT { store_id: "p7m-s1", title: "T", content: "C",
+                source_type: "user", source_id: "", content_hash: "p7m-h", tags: [],
+                created_at: "2026-05-23T00:00:00Z", updated_at: "2026-05-23T00:00:00Z" };
+        "#).await.expect("seed article").check().expect("seed article check");
+
+        db
+    }
+
+    #[tokio::test]
+    async fn migration_p5_to_p7_is_ddl_only() {
+        let db = setup_p5_corpus().await;
+
+        // Run migrations: should transition P5 → P7 via DDL-only (no data touch)
+        run_migrations(&db).await.expect("run migrations");
+
+        // Verify: event table exists and is empty
+        let mut resp = db.query("SELECT count() AS n FROM event GROUP ALL")
+            .await.expect("count event").check().expect("check");
+        #[derive(serde::Deserialize)] struct Cnt { n: i64 }
+        let cnts: Vec<Cnt> = resp.take(0).unwrap_or_default();
+        assert_eq!(cnts.first().map(|c| c.n).unwrap_or(0), 0,
+            "event table should exist and be empty");
+
+        // Verify: existing article is untouched
+        let mut resp = db.query("SELECT count() AS n FROM article GROUP ALL")
+            .await.expect("count article").check().expect("check");
+        let cnts: Vec<Cnt> = resp.take(0).unwrap_or_default();
+        assert_eq!(cnts.first().map(|c| c.n).unwrap_or(0), 1,
+            "existing article should be preserved");
+
+        // Verify: schema version is now P7
+        let mut resp = db.query(
+            "SELECT version FROM _schema_version WHERE id = type::thing('_schema_version', 'current')"
+        ).await.expect("version").check().expect("check");
+        #[derive(serde::Deserialize)] struct V { version: String }
+        let vs: Vec<V> = resp.take(0).unwrap_or_default();
+        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p7"),
+            "schema version should be 1.0.0-p7");
+    }
+
+    #[tokio::test]
+    async fn migration_p7_to_p7_is_noop() {
+        let db = setup_p5_corpus().await;
+        run_migrations(&db).await.expect("first run (p5 → p7)");
+        // Second run should be a no-op (event table stays empty, no errors)
+        run_migrations(&db).await.expect("second run (p7 → p7 idempotent)");
+
+        // Verify: event table still empty (no spontaneous creation)
+        let mut resp = db.query("SELECT count() AS n FROM event GROUP ALL")
+            .await.expect("count event").check().expect("check");
+        #[derive(serde::Deserialize)] struct Cnt { n: i64 }
+        let cnts: Vec<Cnt> = resp.take(0).unwrap_or_default();
+        assert_eq!(cnts.first().map(|c| c.n).unwrap_or(0), 0,
+            "event table should remain empty on second run");
     }
 }
 

@@ -597,6 +597,7 @@ pub async fn handle_create_article(
         embedded_at: None,
         created_at: now.clone(),
         updated_at: now,
+        reflects: vec![],
     };
 
     state
