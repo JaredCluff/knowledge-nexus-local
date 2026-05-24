@@ -261,6 +261,22 @@ enum GraphAction {
         #[arg(long)]
         store: Option<String>,
     },
+
+    /// Drive the P6 spreading-activation engine for a query, printing
+    /// intent classification, subgraph size, and ranked results with scores.
+    /// Useful for debugging activation behavior on a real corpus.
+    Activation {
+        /// Query to run
+        query: String,
+
+        /// Store ID (uses default store if omitted)
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Max results to display
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -434,6 +450,9 @@ fn main() -> Result<()> {
                     }
                     GraphAction::Stats { store } => {
                         cmd_graph_stats(store.as_deref()).await?;
+                    }
+                    GraphAction::Activation { query, store, limit } => {
+                        cmd_graph_activation(&query, store.as_deref(), limit).await?;
                     }
                 }
             }
@@ -1580,6 +1599,48 @@ async fn cmd_graph_stats(store_filter: Option<&str>) -> Result<()> {
     println!("  precedes:             {}", edge_counts.precedes);
     println!("  caused_by:            {}", edge_counts.caused_by);
     println!("  references_edge:      {}", edge_counts.references_edge);
+
+    Ok(())
+}
+
+async fn cmd_graph_activation(query: &str, store_filter: Option<&str>, limit: usize) -> Result<()> {
+    use retrieval::ActivationEngine;
+
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
+
+    info!("Running activation on store {} for query: {:?}", store_id, query);
+
+    // Use the same config as the production retrieval path; user can
+    // override per-knob via config file.
+    let retrieval_cfg = cfg.retrieval.clone();
+    let engine = ActivationEngine::new(db.clone(), retrieval_cfg);
+
+    let output = engine.search(query, &store_id, limit).await?;
+
+    println!("Activation trace:");
+    println!("  Query:          {:?}", query);
+    println!("  Intent:         {:?}", output.intent);
+    println!("  Subgraph size:  {} nodes", output.node_count);
+    println!("  Entity coverage: {:.2}", output.entity_coverage);
+    println!("  Results:        {} ranked", output.results.len());
+    println!();
+
+    if output.results.is_empty() {
+        println!("No results. Possible causes:");
+        println!("  - No query tokens matched any entity names in store {}.", store_id);
+        println!("  - All candidates scored below the confidence gate (τ).");
+        return Ok(());
+    }
+
+    println!("Ranked results:");
+    for (i, r) in output.results.iter().enumerate() {
+        println!("  {}. [{:.4}] {} ({})", i + 1, r.confidence, r.title, r.article_id);
+        if let Some(score) = r.metadata.get("activation_score").and_then(|v| v.as_f64()) {
+            println!("       activation_score: {:.4}", score);
+        }
+    }
 
     Ok(())
 }
