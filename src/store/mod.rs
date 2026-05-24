@@ -207,6 +207,13 @@ pub trait Store: Send + Sync {
     /// Returns per-edge-type counts for a store. Used by P5 `graph stats`
     /// CLI to surface multi-graph coverage.
     async fn count_edges_by_type(&self, store_id: &str) -> Result<EdgeCounts>;
+
+    // P6 specificity weighting
+
+    /// Returns a map of entity_id → mention count (number of articles
+    /// mentioning the entity) for a given store. Used by P6 HippoRAG-style
+    /// specificity weighting: rare entities get higher weight.
+    async fn count_mentions_per_entity(&self, store_id: &str) -> Result<std::collections::HashMap<String, usize>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -1742,6 +1749,32 @@ impl Store for SurrealStore {
             caused_by:            count_one(self.db(), "caused_by", store_id).await?,
             references_edge:      count_one(self.db(), "references_edge", store_id).await?,
         })
+    }
+    async fn count_mentions_per_entity(&self, store_id: &str) -> Result<std::collections::HashMap<String, usize>> {
+        // Get all entities in this store; for each, count incoming MENTIONS edges.
+        // Two-step approach (SurrealDB 2 doesn't reliably do GROUP BY across relations).
+        let mut resp = self.db()
+            .query("SELECT meta::id(id) AS id FROM entity WHERE store_id = $sid")
+            .bind(("sid", store_id.to_string()))
+            .await
+            .context("count_mentions_per_entity: list entities")?;
+        #[derive(serde::Deserialize)] struct EntId { id: String }
+        let entity_ids: Vec<EntId> = resp.take(0).unwrap_or_default();
+
+        let mut out = std::collections::HashMap::new();
+        for ent in entity_ids {
+            let ent_id = ent.id.clone();
+            let mut cresp = self.db()
+                .query("SELECT count() AS cnt FROM mentions WHERE out = type::thing('entity', $eid) GROUP ALL")
+                .bind(("eid", ent.id.clone()))
+                .await
+                .context("count_mentions_per_entity: count per entity")?;
+            #[derive(serde::Deserialize)] struct Cnt { cnt: i64 }
+            let rows: Vec<Cnt> = cresp.take(0).unwrap_or_default();
+            let n = rows.first().map(|r| r.cnt as usize).unwrap_or(0);
+            out.insert(ent_id, n);
+        }
+        Ok(out)
     }
 }
 
