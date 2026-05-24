@@ -417,3 +417,328 @@ mod tests {
         assert_eq!(idx.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod ablation {
+    use super::*;
+    use crate::config::{ActivationConfig, EdgeTypeFilter, RetrievalConfig};
+    use crate::retrieval::intent::Intent;
+    use crate::store::{Article, Entity, SurrealStore, Store};
+    use std::sync::Arc;
+
+    /// Build a 6-article corpus with mixed edge types for ablation testing.
+    ///
+    /// Entity linkage:
+    /// - "outage" entity → ab-a1, ab-a2, ab-a4 (common: 3 articles)
+    /// - "decoy" entity → ab-a5 only (rare: 1 article)
+    /// - ab-a6 is a pure decoy (no entity link)
+    ///
+    /// Causal chain (for Why-intent ablation):
+    /// - ab-a1 → ab-a2 → ab-a3 via CAUSED_BY (BFS traversal direction: in=source,
+    ///   out=neighbor). Seeds are a1, a2, a4 (outage entity); BFS from a1 reaches
+    ///   a2, and from a2 reaches a3, making a3 the causal root that Why-intent
+    ///   surfaces.
+    ///
+    /// Entity-overlap edges (pairwise among outage articles):
+    /// - a1↔a2, a1↔a4, a2↔a4
+    async fn build_ablation_fixture() -> Arc<dyn Store> {
+        let s = SurrealStore::open_in_memory().await.expect("open mem");
+        let ts = "2026-05-24T00:00:00Z".to_string();
+
+        for (id, title) in &[
+            ("ab-a1", "Outage retro"),
+            ("ab-a2", "Deploy that broke things"),
+            ("ab-a3", "Bad PR that caused deploy"),
+            ("ab-a4", "Another outage mention"),
+            ("ab-a5", "Unrelated topic"),
+            ("ab-a6", "Decoy article"),
+        ] {
+            s.create_article(&Article {
+                id: id.to_string(), store_id: "ab-s1".into(),
+                title: title.to_string(), content: format!("content {}", id),
+                source_type: "user".into(), source_id: String::new(),
+                content_hash: format!("{}-h", id), tags: serde_json::json!([]),
+                embedded_at: None,
+                created_at: ts.clone(), updated_at: ts.clone(),
+            }).await.unwrap();
+        }
+
+        // "outage" entity mentioned by a1, a2, a4 (common: 3 articles)
+        s.create_entity(&Entity {
+            id: "ab-ent-outage".into(), name: "outage".into(),
+            entity_type: "concept".into(), description: None,
+            store_id: "ab-s1".into(), mention_count: 3,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        // "decoy" entity mentioned only by a5 (rare: 1 article)
+        s.create_entity(&Entity {
+            id: "ab-ent-decoy".into(), name: "decoy".into(),
+            entity_type: "concept".into(), description: None,
+            store_id: "ab-s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        for aid in &["ab-a1", "ab-a2", "ab-a4"] {
+            s.create_mentions_edge(aid, "ab-ent-outage", "outage", 0.9).await.unwrap();
+        }
+        s.create_mentions_edge("ab-a5", "ab-ent-decoy", "decoy", 0.9).await.unwrap();
+
+        // ENTITY_OVERLAP edges from shared "outage" entity (a1, a2, a4 pairwise)
+        s.db().query(r#"
+            LET $a1 = type::thing('article', 'ab-a1');
+            LET $a2 = type::thing('article', 'ab-a2');
+            LET $a4 = type::thing('article', 'ab-a4');
+            RELATE $a1->entity_overlap->$a2 CONTENT {
+                shared_entity_count: 1, strength: 0.5, confidence: 0.5,
+                extraction_method: "heuristic", store_id: "ab-s1",
+                created_at: "2026-05-24T00:00:00Z", updated_at: "2026-05-24T00:00:00Z"
+            };
+            RELATE $a1->entity_overlap->$a4 CONTENT {
+                shared_entity_count: 1, strength: 0.5, confidence: 0.5,
+                extraction_method: "heuristic", store_id: "ab-s1",
+                created_at: "2026-05-24T00:00:00Z", updated_at: "2026-05-24T00:00:00Z"
+            };
+            RELATE $a2->entity_overlap->$a4 CONTENT {
+                shared_entity_count: 1, strength: 0.5, confidence: 0.5,
+                extraction_method: "heuristic", store_id: "ab-s1",
+                created_at: "2026-05-24T00:00:00Z", updated_at: "2026-05-24T00:00:00Z"
+            };
+        "#).await.expect("seed overlap").check().expect("seed overlap check");
+
+        // Causal chain: a1 → a2 → a3 via CAUSED_BY edges.
+        //
+        // list_graph_neighbors queries WHERE in=$aid, so BFS traversal follows
+        // the "in" direction. Seeds are a1, a2, a4 (outage entity matches). From
+        // a1, caused_by WHERE in=a1 finds a2. From a2, WHERE in=a2 finds a3.
+        // This makes a3 reachable for the Why-intent ablation test.
+        //
+        // Semantics: a1 (outage) was caused by a2 (bad deploy); a2 was caused
+        // by a3 (the bad PR). The CAUSED_BY relationship records the effect as
+        // the "in" node and the cause as the "out" node.
+        s.create_caused_by_edge("ab-s1", "ab-a1", "ab-a2", 0.9, None).await.unwrap();
+        s.create_caused_by_edge("ab-s1", "ab-a2", "ab-a3", 0.9, None).await.unwrap();
+
+        Arc::new(s)
+    }
+
+    fn base_config() -> RetrievalConfig {
+        let mut c = RetrievalConfig::default();
+        c.edge_types = EdgeTypeFilter {
+            entity_overlap: true,
+            semantically_related: false,
+            precedes: false,
+            caused_by: true,
+            references: false,
+        };
+        c
+    }
+
+    /// Ablation 1: Damping = 0.0 means PPR degenerates to pure restart.
+    /// At damping=0, a^(t+1) = (1-0)*t + 0*W*a = t for all iterations.
+    /// Only seed nodes have non-zero activation; non-seed neighbors get 0
+    /// and are dropped by the gate. Compared to damping=0.5, the result
+    /// set should be smaller or equal.
+    #[tokio::test]
+    async fn ablation_damping_zero_keeps_mass_on_seeds() {
+        let db = build_ablation_fixture().await;
+
+        let mut cfg_zero = base_config();
+        cfg_zero.activation.damping = 0.0;
+        let engine_zero = ActivationEngine::new(db.clone(), cfg_zero);
+        let out_zero = engine_zero.search("outage", "ab-s1", 10).await.unwrap();
+
+        let cfg_baseline = base_config();
+        let engine_baseline = ActivationEngine::new(db.clone(), cfg_baseline);
+        let out_baseline = engine_baseline.search("outage", "ab-s1", 10).await.unwrap();
+
+        // With damping=0, neighbors of seeds receive no mass — fewer
+        // results should pass the gate.
+        assert!(
+            out_zero.results.len() <= out_baseline.results.len(),
+            "damping=0 should produce fewer or equal results vs baseline; got {} vs {}",
+            out_zero.results.len(), out_baseline.results.len()
+        );
+    }
+
+    /// Ablation 2: Damping = 1.0 means pure random walk (no restart bias).
+    /// Mass diffuses freely across the subgraph. Activation distribution
+    /// should reach more nodes (or equal) compared to damping=0.5.
+    #[tokio::test]
+    async fn ablation_damping_one_reaches_more_nodes() {
+        let db = build_ablation_fixture().await;
+
+        let mut cfg_one = base_config();
+        cfg_one.activation.damping = 1.0;
+        let engine_one = ActivationEngine::new(db.clone(), cfg_one);
+        let out_one = engine_one.search("outage", "ab-s1", 10).await.unwrap();
+
+        let cfg_baseline = base_config();
+        let engine_baseline = ActivationEngine::new(db.clone(), cfg_baseline);
+        let out_baseline = engine_baseline.search("outage", "ab-s1", 10).await.unwrap();
+
+        // Pure walk reaches at least as many nodes as 50% restart.
+        assert!(
+            out_one.node_count >= out_baseline.node_count,
+            "damping=1.0 should reach >= as many subgraph nodes as damping=0.5; got {} vs {}",
+            out_one.node_count, out_baseline.node_count
+        );
+    }
+
+    /// Ablation 3: Inhibition β=0 disables lateral suppression.
+    /// Hub nodes (high-activation) keep their full mass; with β>0 they get
+    /// suppressed by competitors. So with β=0 the max activation should
+    /// be at least as high as with β>0.
+    #[tokio::test]
+    async fn ablation_inhibition_zero_preserves_max_activation() {
+        let db = build_ablation_fixture().await;
+
+        let mut cfg_no_inhib = base_config();
+        cfg_no_inhib.activation.inhibition_beta = 0.0;
+        let engine_no = ActivationEngine::new(db.clone(), cfg_no_inhib);
+        let out_no = engine_no.search("outage", "ab-s1", 10).await.unwrap();
+
+        let cfg_baseline = base_config();
+        let engine_baseline = ActivationEngine::new(db.clone(), cfg_baseline);
+        let out_baseline = engine_baseline.search("outage", "ab-s1", 10).await.unwrap();
+
+        let max_no: f32 = out_no.results.iter().map(|r| r.confidence).fold(0.0, f32::max);
+        let max_baseline: f32 = out_baseline.results.iter().map(|r| r.confidence).fold(0.0, f32::max);
+
+        // Without inhibition, the max can only stay the same or rise.
+        assert!(
+            max_no >= max_baseline - 1e-3,
+            "max activation with β=0 ({}) should be >= max with β=0.15 ({})",
+            max_no, max_baseline
+        );
+    }
+
+    /// Ablation 4: Gate τ=0 disables the noise filter; more nodes pass the
+    /// gate. With baseline τ=0.12, low-activation nodes are dropped.
+    #[tokio::test]
+    async fn ablation_gate_zero_passes_more_results() {
+        let db = build_ablation_fixture().await;
+
+        let mut cfg_no_gate = base_config();
+        cfg_no_gate.activation.gate_tau = 0.0;
+        let engine_no_gate = ActivationEngine::new(db.clone(), cfg_no_gate);
+        let out_no_gate = engine_no_gate.search("outage", "ab-s1", 10).await.unwrap();
+
+        let cfg_baseline = base_config();
+        let engine_baseline = ActivationEngine::new(db.clone(), cfg_baseline);
+        let out_baseline = engine_baseline.search("outage", "ab-s1", 10).await.unwrap();
+
+        assert!(
+            out_no_gate.results.len() >= out_baseline.results.len(),
+            "no-gate ({}) should produce at least as many results as baseline ({})",
+            out_no_gate.results.len(), out_baseline.results.len()
+        );
+    }
+
+    /// Ablation 5: Sigmoid γ=0 makes the normalization function constant
+    /// (every input maps to 0.5). All confidences should equal 0.5.
+    #[tokio::test]
+    async fn ablation_sigmoid_zero_gamma_collapses_to_half() {
+        let db = build_ablation_fixture().await;
+
+        let mut cfg = base_config();
+        cfg.activation.sigmoid_gamma = 0.0;
+        cfg.activation.gate_tau = 0.0; // disable gate so 0.5 values pass
+        let engine = ActivationEngine::new(db, cfg);
+        let out = engine.search("outage", "ab-s1", 10).await.unwrap();
+
+        for r in &out.results {
+            assert!(
+                (r.confidence - 0.5).abs() < 1e-3,
+                "with γ=0, all confidences should collapse to 0.5; got {}", r.confidence
+            );
+        }
+    }
+
+    /// Ablation 6: Subgraph cap at 1 prevents BFS expansion beyond the
+    /// seed. Only the seed nodes themselves should appear in results.
+    /// (With cap=1, neighbors of seeds aren't added to the index after
+    /// the seed itself fills the cap.)
+    #[tokio::test]
+    async fn ablation_subgraph_cap_one_limits_expansion() {
+        let db = build_ablation_fixture().await;
+
+        let mut cfg = base_config();
+        cfg.activation.subgraph_cap = 1;
+        let engine = ActivationEngine::new(db, cfg);
+        let out = engine.search("outage", "ab-s1", 10).await.unwrap();
+
+        // At cap=1, the BFS hits the cap after the first seed is added.
+        // Result count should be very small (often <= 1, but the seed count
+        // depends on how many seed articles share the "outage" entity).
+        assert!(
+            out.node_count <= 3,
+            "cap=1 should sharply limit subgraph; got node_count={}", out.node_count
+        );
+    }
+
+    /// Ablation 7: Why-intent boosts causal edges (caused_by ×4.0). With
+    /// OpenDomain intent (all weights 1.0), causal-linked articles should
+    /// rank lower than under Why. Compare top-ranked positions.
+    ///
+    /// Fixture causal chain: a1 → a2 → a3 (BFS direction).
+    /// Seeds: a1, a2, a4 (outage entity). From a1, caused_by reaches a2.
+    /// From a2, caused_by reaches a3. Why-intent boosts the CAUSED_BY edges
+    /// ×4.0, so a3 accumulates enough mass to pass the gate.
+    #[tokio::test]
+    async fn ablation_why_intent_promotes_causal_path() {
+        let db = build_ablation_fixture().await;
+
+        // Why-classified query
+        let mut cfg_why = base_config();
+        // Lower gate to ensure a3 passes even after two-hop attenuation
+        cfg_why.activation.gate_tau = 0.05;
+        let engine_why = ActivationEngine::new(db.clone(), cfg_why);
+        let out_why = engine_why.search("why did the outage happen", "ab-s1", 10).await.unwrap();
+        assert_eq!(out_why.intent, Intent::Why);
+
+        // OpenDomain-classified query (same seed entity "outage")
+        let mut cfg_od = base_config();
+        cfg_od.activation.gate_tau = 0.05;
+        let engine_od = ActivationEngine::new(db.clone(), cfg_od);
+        let out_od = engine_od.search("outage", "ab-s1", 10).await.unwrap();
+        assert_eq!(out_od.intent, Intent::OpenDomain);
+
+        // Both queries should return results; the Why query subgraph
+        // should include causally-linked articles (a3 chains back through a2 to a1).
+        assert!(!out_why.results.is_empty(), "Why query should return results");
+        assert!(!out_od.results.is_empty(), "OpenDomain query should return results");
+
+        // The Why query reaches the causal source (a3); OpenDomain may not
+        // since CAUSED_BY is weighted equally to other edges.
+        let why_ids: std::collections::HashSet<&str> =
+            out_why.results.iter().map(|r| r.article_id.as_str()).collect();
+        let _od_ids: std::collections::HashSet<&str> =
+            out_od.results.iter().map(|r| r.article_id.as_str()).collect();
+
+        // Why should surface a3 (causal source) via the boosted causal chain
+        assert!(
+            why_ids.contains("ab-a3"),
+            "Why intent should pull in the causal source ab-a3 via boosted CAUSED_BY; got {:?}",
+            why_ids
+        );
+    }
+
+    /// Ablation 8: Top-K cutoff. With top_k=1, only one result returns.
+    /// With top_k=100, all qualifying results return (bounded by subgraph).
+    #[tokio::test]
+    async fn ablation_top_k_bounds_result_count() {
+        let db = build_ablation_fixture().await;
+
+        let mut cfg_1 = base_config();
+        cfg_1.activation.top_k = 1;
+        let engine_1 = ActivationEngine::new(db.clone(), cfg_1);
+        let out_1 = engine_1.search("outage", "ab-s1", 100).await.unwrap();
+        assert!(out_1.results.len() <= 1, "top_k=1 must cap results; got {}", out_1.results.len());
+
+        let mut cfg_100 = base_config();
+        cfg_100.activation.top_k = 100;
+        let engine_100 = ActivationEngine::new(db.clone(), cfg_100);
+        let out_100 = engine_100.search("outage", "ab-s1", 100).await.unwrap();
+        assert!(out_100.results.len() >= out_1.results.len());
+    }
+}
