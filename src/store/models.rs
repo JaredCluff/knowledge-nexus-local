@@ -253,6 +253,58 @@ pub struct ReferencesEdgeRow {
     pub created_at: String,
 }
 
+/// Event: a first-class memory node representing a coherent time-bounded
+/// experience (a conversation, a trip, an incident). P7.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub id: String,
+    pub store_id: String,
+    pub title: String,
+    pub summary: String,
+    pub started_at: String,
+    pub ended_at: String,
+    /// JSON array of participant names/ids.
+    pub participants: serde_json::Value,
+    /// "conversation" | "manual" | "derived"
+    pub source_type: String,
+    pub confidence: f64,
+    pub extraction_method: ExtractionMethod,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// CONTAINS_EVIDENCE edge: event → article (evidence the event happened).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainsEvidenceEdge {
+    pub from_event_id: String,
+    pub to_article_id: String,
+    pub confidence: f64,
+    pub created_at: String,
+}
+
+/// MOTIVATES edge: event → event (one event motivated another).
+/// CompassMem relation taxonomy. LLM-extracted only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotivatesEdge {
+    pub from_event_id: String,
+    pub to_event_id: String,
+    pub confidence: f64,
+    pub rationale: Option<String>,
+    pub extraction_method: ExtractionMethod,
+    pub created_at: String,
+}
+
+/// PART_OF edge: child event → parent event (hierarchical composition).
+/// CompassMem relation taxonomy. LLM-extracted only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartOfEdge {
+    pub from_event_id: String,
+    pub to_parent_event_id: String,
+    pub confidence: f64,
+    pub extraction_method: ExtractionMethod,
+    pub created_at: String,
+}
+
 /// Per-edge-type row counts for a store. Returned by `Store::count_edges_by_type`.
 /// Used by `graph stats` to surface multi-graph coverage at a glance.
 #[derive(Debug, Clone, Default)]
@@ -445,5 +497,70 @@ mod tests {
         let j = serde_json::to_string(&e).unwrap();
         let d: ReferencesEdgeRow = serde_json::from_str(&j).unwrap();
         assert_eq!(d.anchor_text.as_deref(), Some("see [the deploy retro](a2)"));
+    }
+
+    #[test]
+    fn test_event_serde_round_trip() {
+        let e = Event {
+            id: "e1".into(),
+            store_id: "s1".into(),
+            title: "AZ trip March 2026".into(),
+            summary: "Family trip to Arizona mountains".into(),
+            started_at: "2026-03-15T00:00:00Z".into(),
+            ended_at: "2026-03-20T00:00:00Z".into(),
+            participants: serde_json::json!(["alice", "bob"]),
+            source_type: "conversation".into(),
+            confidence: 0.85,
+            extraction_method: ExtractionMethod::Llm,
+            created_at: "2026-05-24T00:00:00Z".into(),
+            updated_at: "2026-05-24T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let d: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(d.title, "AZ trip March 2026");
+        assert_eq!(d.extraction_method, ExtractionMethod::Llm);
+    }
+
+    #[test]
+    fn test_contains_evidence_edge_serde_round_trip() {
+        let edge = ContainsEvidenceEdge {
+            from_event_id: "e1".into(),
+            to_article_id: "a1".into(),
+            confidence: 0.9,
+            created_at: "2026-05-24T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&edge).unwrap();
+        let d: ContainsEvidenceEdge = serde_json::from_str(&json).unwrap();
+        assert_eq!(d.from_event_id, "e1");
+    }
+
+    #[test]
+    fn test_motivates_edge_serde_round_trip() {
+        let edge = MotivatesEdge {
+            from_event_id: "e1".into(),
+            to_event_id: "e2".into(),
+            confidence: 0.75,
+            rationale: Some("user pursued e2 because of e1 outcome".into()),
+            extraction_method: ExtractionMethod::Llm,
+            created_at: "2026-05-24T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&edge).unwrap();
+        let d: MotivatesEdge = serde_json::from_str(&json).unwrap();
+        assert_eq!(d.confidence, 0.75);
+        assert_eq!(d.rationale.as_deref(), Some("user pursued e2 because of e1 outcome"));
+    }
+
+    #[test]
+    fn test_part_of_edge_serde_round_trip() {
+        let edge = PartOfEdge {
+            from_event_id: "sub_e1".into(),
+            to_parent_event_id: "parent_e1".into(),
+            confidence: 0.95,
+            extraction_method: ExtractionMethod::Llm,
+            created_at: "2026-05-24T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&edge).unwrap();
+        let d: PartOfEdge = serde_json::from_str(&json).unwrap();
+        assert_eq!(d.from_event_id, "sub_e1");
     }
 }

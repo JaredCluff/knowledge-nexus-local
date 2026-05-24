@@ -312,13 +312,13 @@ mod tests {
         let n = cnts.first().map(|c| c.n).unwrap_or(0);
         assert_eq!(n, 0, "related_to should be empty after migration");
 
-        // Schema version is now 1.0.0-p5
+        // Schema version is now 1.0.0-p7
         let mut resp3 = db.query(
             "SELECT version FROM _schema_version WHERE id = type::thing('_schema_version', 'current')"
         ).await.expect("version").check().expect("check3");
         #[derive(serde::Deserialize)] struct V { version: String }
         let vs: Vec<V> = resp3.take(0).unwrap_or_default();
-        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p5"));
+        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p7"));
     }
 
     #[tokio::test]

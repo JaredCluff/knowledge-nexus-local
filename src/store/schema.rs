@@ -3,7 +3,7 @@
 //!
 //! The schema is SCHEMAFULL — unknown fields are rejected.
 
-pub const SCHEMA_VERSION: &str = "1.0.0-p5";
+pub const SCHEMA_VERSION: &str = "1.0.0-p7";
 
 /// Returns the full SurrealQL DDL script. Idempotent: every statement uses
 /// `IF NOT EXISTS` or `OVERWRITE` so re-running on an initialized DB is a
@@ -239,5 +239,41 @@ DEFINE FIELD IF NOT EXISTS store_id ON references_edge TYPE string;
 DEFINE FIELD IF NOT EXISTS created_at ON references_edge TYPE string;
 DEFINE INDEX IF NOT EXISTS references_edge_unique ON references_edge FIELDS in, out UNIQUE;
 DEFINE INDEX IF NOT EXISTS references_edge_store_idx ON references_edge FIELDS store_id;
+
+-- P7 event nodes and event-specific edges.
+
+DEFINE TABLE IF NOT EXISTS event SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS store_id ON event TYPE string;
+DEFINE FIELD IF NOT EXISTS title ON event TYPE string;
+DEFINE FIELD IF NOT EXISTS summary ON event TYPE string;
+DEFINE FIELD IF NOT EXISTS started_at ON event TYPE string;
+DEFINE FIELD IF NOT EXISTS ended_at ON event TYPE string;
+DEFINE FIELD IF NOT EXISTS participants ON event TYPE array DEFAULT [];
+DEFINE FIELD IF NOT EXISTS participants.* ON event TYPE string;
+DEFINE FIELD IF NOT EXISTS source_type ON event TYPE string DEFAULT "manual";
+DEFINE FIELD IF NOT EXISTS confidence ON event TYPE float DEFAULT 1.0;
+DEFINE FIELD IF NOT EXISTS extraction_method ON event TYPE string DEFAULT "user_asserted";
+DEFINE FIELD IF NOT EXISTS created_at ON event TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON event TYPE string;
+DEFINE INDEX IF NOT EXISTS event_store_idx ON event FIELDS store_id;
+DEFINE INDEX IF NOT EXISTS event_time_idx ON event FIELDS started_at;
+
+DEFINE TABLE IF NOT EXISTS contains_evidence TYPE RELATION IN event OUT article SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS confidence ON contains_evidence TYPE float DEFAULT 1.0;
+DEFINE FIELD IF NOT EXISTS created_at ON contains_evidence TYPE string;
+DEFINE INDEX IF NOT EXISTS contains_evidence_unique ON contains_evidence FIELDS in, out UNIQUE;
+
+DEFINE TABLE IF NOT EXISTS motivates TYPE RELATION IN event OUT event SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS confidence ON motivates TYPE float;
+DEFINE FIELD IF NOT EXISTS rationale ON motivates TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS extraction_method ON motivates TYPE string DEFAULT "llm";
+DEFINE FIELD IF NOT EXISTS created_at ON motivates TYPE string;
+DEFINE INDEX IF NOT EXISTS motivates_unique ON motivates FIELDS in, out UNIQUE;
+
+DEFINE TABLE IF NOT EXISTS part_of TYPE RELATION IN event OUT event SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS confidence ON part_of TYPE float;
+DEFINE FIELD IF NOT EXISTS extraction_method ON part_of TYPE string DEFAULT "llm";
+DEFINE FIELD IF NOT EXISTS created_at ON part_of TYPE string;
+DEFINE INDEX IF NOT EXISTS part_of_unique ON part_of FIELDS in, out UNIQUE;
 "#
 }
