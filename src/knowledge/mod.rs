@@ -5,6 +5,7 @@ pub mod conversations;
 pub mod entity_extractor;
 pub mod events;
 pub mod extraction;
+pub mod reflection;
 pub mod relation_extractor;
 pub mod semantic_backfill;
 pub mod temporal_backfill;
