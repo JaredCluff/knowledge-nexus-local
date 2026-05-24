@@ -3186,4 +3186,141 @@ mod p3_integration_tests {
         assert!(output.results.is_empty());
         assert_eq!(output.entity_coverage, 0.0);
     }
+
+    /// End-to-end test of P6 ActivationEngine driving intent classification,
+    /// seed extraction, PPR diffusion over a typed multi-graph, and SYNAPSE
+    /// post-processing.
+    ///
+    /// Fixture: 4 articles in store ae-s1. Two share the "outage" entity
+    /// (a1, a2); a2 is causally linked to a1 via CAUSED_BY. A Why query
+    /// should classify as Intent::Why, boost the CAUSED_BY edge (×4.0 per
+    /// MAGMA Table 6), and produce non-empty results.
+    #[tokio::test]
+    async fn activation_engine_returns_results_for_why_query() {
+        use crate::retrieval::{ActivationEngine, intent::Intent};
+        use crate::config::RetrievalConfig;
+        use std::sync::Arc;
+
+        let s = fixture().await;
+        let ts = now();
+
+        // 4 articles
+        for (id, title, content) in &[
+            ("ae-a1", "Outage retrospective", "an outage occurred yesterday"),
+            ("ae-a2", "Deploy that caused outage", "the deploy pushed a bad release"),
+            ("ae-a3", "Unrelated article", "talking about gardening"),
+            ("ae-a4", "Another unrelated", "completely different topic"),
+        ] {
+            s.create_article(&Article {
+                id: id.to_string(), store_id: "ae-s1".into(),
+                title: title.to_string(), content: content.to_string(),
+                source_type: "user".into(), source_id: String::new(),
+                content_hash: format!("{}-h", id), tags: serde_json::json!([]),
+                embedded_at: None,
+                created_at: ts.clone(), updated_at: ts.clone(),
+            }).await.unwrap();
+        }
+
+        // Entities: "outage" mentioned in a1 and a2; "deploy" only in a2
+        s.create_entity(&Entity {
+            id: "ae-ent-outage".into(), name: "outage".into(),
+            entity_type: "concept".into(), description: None,
+            store_id: "ae-s1".into(), mention_count: 2,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_entity(&Entity {
+            id: "ae-ent-deploy".into(), name: "deploy".into(),
+            entity_type: "concept".into(), description: None,
+            store_id: "ae-s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        // MENTIONS edges
+        s.create_mentions_edge("ae-a1", "ae-ent-outage", "outage retro", 0.95).await.unwrap();
+        s.create_mentions_edge("ae-a2", "ae-ent-outage", "the outage", 0.92).await.unwrap();
+        s.create_mentions_edge("ae-a2", "ae-ent-deploy", "deploy pushed", 0.95).await.unwrap();
+
+        // ENTITY_OVERLAP: a1 and a2 share the "outage" entity
+        s.db().query(r#"
+            LET $from = type::thing('article', 'ae-a1');
+            LET $to = type::thing('article', 'ae-a2');
+            RELATE $from->entity_overlap->$to CONTENT {
+                shared_entity_count: 1, strength: 0.5, confidence: 0.5,
+                extraction_method: "heuristic", store_id: "ae-s1",
+                created_at: "2026-05-24T00:00:00Z", updated_at: "2026-05-24T00:00:00Z"
+            };
+        "#).await.expect("seed overlap").check().expect("seed check");
+
+        // CAUSED_BY: a2 (deploy article) caused a1 (outage)
+        s.create_caused_by_edge(
+            "ae-s1", "ae-a2", "ae-a1",
+            0.9, Some("explicit causal chain".into())
+        ).await.unwrap();
+
+        // Build the engine with caused_by + entity_overlap enabled
+        let mut config = RetrievalConfig::default();
+        config.edge_types.caused_by = true;
+        config.edge_types.entity_overlap = true;
+
+        let db: Arc<dyn Store> = Arc::new(s);
+        let engine = ActivationEngine::new(db, config);
+
+        // Query mentioning "outage" — entity match → seeds = a1, a2
+        // Should classify as Intent::Why due to "why" cue
+        let output = engine.search("why did the outage happen?", "ae-s1", 10).await.unwrap();
+
+        assert_eq!(output.intent, Intent::Why,
+            "query with 'why' should classify as Why intent");
+        assert!(!output.results.is_empty(),
+            "engine should return at least one result; got 0");
+
+        // At least one result must be from the outage-linked subgraph (a1 or a2)
+        let ids: Vec<&str> = output.results.iter().map(|r| r.article_id.as_str()).collect();
+        let has_outage_article = ids.iter().any(|id| *id == "ae-a1" || *id == "ae-a2");
+        assert!(has_outage_article,
+            "expected at least one outage-linked article in results; got {:?}", ids);
+
+        // node_count should be >= 2 (a1 + a2 from seed expansion)
+        assert!(output.node_count >= 2,
+            "subgraph should include at least the two seed articles; got {}", output.node_count);
+
+        // Verify K2KResult metadata is populated
+        if let Some(first) = output.results.first() {
+            let meta = &first.metadata;
+            assert_eq!(meta.get("search_type").and_then(|v| v.as_str()), Some("activation"));
+            assert!(meta.get("intent").is_some(), "intent should be in metadata");
+            assert!(meta.get("activation_score").is_some(), "activation_score should be in metadata");
+        }
+    }
+
+    /// Verify the engine handles queries with no entity matches gracefully —
+    /// returns empty results with zero coverage, not an error.
+    #[tokio::test]
+    async fn activation_engine_empty_for_no_entity_matches() {
+        use crate::retrieval::ActivationEngine;
+        use crate::config::RetrievalConfig;
+        use std::sync::Arc;
+
+        let s = fixture().await;
+        let ts = now();
+
+        s.create_article(&Article {
+            id: "ae2-a1".into(), store_id: "ae2-s1".into(),
+            title: "Some article".into(), content: "content".into(),
+            source_type: "user".into(), source_id: String::new(),
+            content_hash: "ae2-h1".into(), tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        let db: Arc<dyn Store> = Arc::new(s);
+        let engine = ActivationEngine::new(db, RetrievalConfig::default());
+
+        // No entities seeded; any query produces empty seeds → empty results
+        let output = engine.search("nonsense query xyzzy", "ae2-s1", 10).await.unwrap();
+
+        assert!(output.results.is_empty(), "no matched entities should yield empty results");
+        assert_eq!(output.entity_coverage, 0.0);
+        assert_eq!(output.node_count, 0);
+    }
 }
