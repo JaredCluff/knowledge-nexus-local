@@ -5105,4 +5105,117 @@ mod p3_integration_tests {
         );
         assert!(has_audit, "access promotion must write an audit entry; got {:?}", entries);
     }
+
+    /// P8 end-to-end: 10 articles with varied last_accessed_at timestamps.
+    /// After nightly_tier_transition, verify the salience-driven demotion
+    /// pattern and that pinned items override decay.
+    #[tokio::test]
+    async fn p8_e2e_tier_transitions_on_10_article_fixture() {
+        use crate::maintenance::nightly_tier_transition;
+        use crate::config::DecayConfig;
+        use std::sync::Arc;
+
+        let s = fixture().await;
+        let now = chrono::Utc::now();
+
+        // Build 10 articles with varied recency. With λ=0.02 (35-day half-life)
+        // and thresholds Hot=0.5 / Warm=0.1 / Cold=0.01 / Archive<0.01:
+        // - days≤35 + importance=0.8 → salience ≥ 0.4 → Hot (just under 0.5 OK)
+        // - days≤35 + importance=1.0 → salience ≈ 0.5 → Hot
+        // - days≈100 → salience ≈ 0.13 → Warm
+        // - days≈200 → salience ≈ 0.018 → Cold
+        // - days≈365 → salience < 0.01 → Archive
+        // - days≈500 → salience < 0.01 → Archive
+        let fixtures = [
+            ("p8e-fresh1", 0, 1.0, false),    // → Hot
+            ("p8e-fresh2", 5, 1.0, false),    // → Hot
+            ("p8e-recent", 30, 1.0, false),   // → Hot (importance=1.0 → salience ≈ 0.55)
+            ("p8e-mid1", 100, 1.0, false),    // → Warm (salience ≈ 0.13)
+            ("p8e-mid2", 120, 1.0, false),    // → Warm/Cold boundary (salience ≈ 0.09)
+            ("p8e-old1", 200, 1.0, false),    // → Cold (salience ≈ 0.018)
+            ("p8e-old2", 220, 1.0, false),    // → Cold (salience ≈ 0.016)
+            ("p8e-ancient1", 365, 1.0, false), // → Archive (salience ≈ 0.00067)
+            ("p8e-ancient2", 500, 1.0, false), // → Archive (salience ≈ 0.000045)
+            ("p8e-pinned-old", 365, 1.0, true), // PINNED → stays Hot regardless
+        ];
+
+        for (id, days_ago, importance, pinned) in &fixtures {
+            let ts = (now - chrono::Duration::days(*days_ago)).to_rfc3339();
+            s.create_article(&Article {
+                id: id.to_string(),
+                store_id: "p8e-s1".into(),
+                title: format!("Article {}", id),
+                content: format!("content of {}", id),
+                source_type: "user".into(),
+                source_id: String::new(),
+                content_hash: format!("{}-h", id),
+                tags: serde_json::json!([]),
+                embedded_at: None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+                reflects: vec![],
+                access_count: 0,
+                last_accessed_at: ts,
+                importance_score: *importance,
+                tier: Tier::Hot,    // all start Hot; transition will demote some
+                pinned: *pinned,
+                compacted_into: None,
+            }).await.unwrap();
+        }
+
+        let db: Arc<dyn Store> = Arc::new(s);
+        let cfg = DecayConfig::default();
+        let report = nightly_tier_transition(db.clone(), "p8e-s1", &cfg, now).await.unwrap();
+
+        // Sanity: scanned all 10
+        assert_eq!(report.articles_scanned, 10, "should scan all 10 articles");
+        assert_eq!(report.pinned_skipped, 1, "pinned article must be skipped");
+
+        // Fetch all final tiers using a helper
+        let get_tier = |aid: &str| {
+            let db = db.clone();
+            let aid = aid.to_string();
+            async move {
+                db.get_article(&aid).await.unwrap().unwrap().tier
+            }
+        };
+
+        // Recent articles stay Hot (with importance=1.0 they're salience ≥0.5)
+        assert_eq!(get_tier("p8e-fresh1").await, Tier::Hot, "0-day article should be Hot");
+        assert_eq!(get_tier("p8e-fresh2").await, Tier::Hot, "5-day article should be Hot");
+        assert_eq!(get_tier("p8e-recent").await, Tier::Hot, "30-day article should be Hot");
+
+        // Ancient articles go to Cold or Archive
+        let ancient1 = get_tier("p8e-ancient1").await;
+        let ancient2 = get_tier("p8e-ancient2").await;
+        assert!(matches!(ancient1, Tier::Cold | Tier::Archive),
+            "365-day article should be Cold or Archive; got {:?}", ancient1);
+        assert!(matches!(ancient2, Tier::Cold | Tier::Archive),
+            "500-day article should be Cold or Archive; got {:?}", ancient2);
+
+        // PIN OVERRIDE: pinned 365-day article stays Hot
+        let pinned_tier = get_tier("p8e-pinned-old").await;
+        assert_eq!(pinned_tier, Tier::Hot,
+            "pinned article must stay Hot regardless of age; got {:?}", pinned_tier);
+
+        // Audit log: should have entries for non-pinned demotions only
+        let entries = db.list_audit_log("p8e-s1", None, 100).await.unwrap();
+        let nightly_entries: Vec<&AuditLogEntry> = entries.iter()
+            .filter(|e|
+                e.action == "tier_change"
+                && e.details.get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.contains("nightly_decay"))
+                    .unwrap_or(false)
+            )
+            .collect();
+
+        // At least 2 transitions (the ancients); pinned must NOT appear
+        assert!(nightly_entries.len() >= 2,
+            "expected at least 2 nightly transitions; got {}", nightly_entries.len());
+        assert!(
+            !nightly_entries.iter().any(|e| e.subject_id == "p8e-pinned-old"),
+            "pinned article must not appear in transition audit log"
+        );
+    }
 }
