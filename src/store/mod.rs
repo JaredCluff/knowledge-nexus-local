@@ -214,6 +214,31 @@ pub trait Store: Send + Sync {
     /// mentioning the entity) for a given store. Used by P6 HippoRAG-style
     /// specificity weighting: rare entities get higher weight.
     async fn count_mentions_per_entity(&self, store_id: &str) -> Result<std::collections::HashMap<String, usize>>;
+
+    // P7 event CRUD + event-edge helpers
+    async fn create_event(&self, event: &Event) -> Result<()>;
+    async fn get_event(&self, event_id: &str) -> Result<Option<Event>>;
+    async fn list_events_for_store(&self, store_id: &str) -> Result<Vec<Event>>;
+    async fn create_contains_evidence_edge(
+        &self,
+        event_id: &str,
+        article_id: &str,
+        confidence: f64,
+    ) -> Result<()>;
+    async fn create_motivates_edge(
+        &self,
+        from_event_id: &str,
+        to_event_id: &str,
+        confidence: f64,
+        rationale: Option<String>,
+    ) -> Result<()>;
+    async fn create_part_of_edge(
+        &self,
+        child_event_id: &str,
+        parent_event_id: &str,
+        confidence: f64,
+    ) -> Result<()>;
+    async fn list_events_for_article(&self, article_id: &str) -> Result<Vec<Event>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -1776,6 +1801,179 @@ impl Store for SurrealStore {
         }
         Ok(out)
     }
+
+    // P7 event CRUD + event-edge helpers
+
+    async fn create_event(&self, event: &Event) -> Result<()> {
+        let method_str = serde_json::to_value(event.extraction_method)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "user_asserted".into());
+
+        let res = self.db()
+            .query(
+                "CREATE type::thing('event', $id) CONTENT {
+                    store_id: $store_id,
+                    title: $title,
+                    summary: $summary,
+                    started_at: $started_at,
+                    ended_at: $ended_at,
+                    participants: $participants,
+                    source_type: $source_type,
+                    confidence: $confidence,
+                    extraction_method: $method,
+                    created_at: $created_at,
+                    updated_at: $updated_at
+                 }"
+            )
+            .bind(("id", event.id.clone()))
+            .bind(("store_id", event.store_id.clone()))
+            .bind(("title", event.title.clone()))
+            .bind(("summary", event.summary.clone()))
+            .bind(("started_at", event.started_at.clone()))
+            .bind(("ended_at", event.ended_at.clone()))
+            .bind(("participants", event.participants.clone()))
+            .bind(("source_type", event.source_type.clone()))
+            .bind(("confidence", event.confidence))
+            .bind(("method", method_str))
+            .bind(("created_at", event.created_at.clone()))
+            .bind(("updated_at", event.updated_at.clone()))
+            .await
+            .context("create_event")?;
+        let _ = res;
+        Ok(())
+    }
+
+    async fn get_event(&self, event_id: &str) -> Result<Option<Event>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(id) AS id, store_id, title, summary, started_at, ended_at,
+                        participants, source_type, confidence, extraction_method,
+                        created_at, updated_at
+                 FROM event
+                 WHERE id = type::thing('event', $id)"
+            )
+            .bind(("id", event_id.to_string()))
+            .await
+            .context("get_event")?;
+        let events: Vec<Event> = resp.take(0).unwrap_or_default();
+        Ok(events.into_iter().next())
+    }
+
+    async fn list_events_for_store(&self, store_id: &str) -> Result<Vec<Event>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(id) AS id, store_id, title, summary, started_at, ended_at,
+                        participants, source_type, confidence, extraction_method,
+                        created_at, updated_at
+                 FROM event
+                 WHERE store_id = $sid
+                 ORDER BY started_at"
+            )
+            .bind(("sid", store_id.to_string()))
+            .await
+            .context("list_events_for_store")?;
+        let events: Vec<Event> = resp.take(0).unwrap_or_default();
+        Ok(events)
+    }
+
+    async fn create_contains_evidence_edge(
+        &self,
+        event_id: &str,
+        article_id: &str,
+        confidence: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('event', $eid);
+                 LET $to = type::thing('article', $aid);
+                 RELATE $from->contains_evidence->$to CONTENT {
+                    confidence: $conf,
+                    created_at: $now
+                 }"
+            )
+            .bind(("eid", event_id.to_string()))
+            .bind(("aid", article_id.to_string()))
+            .bind(("conf", confidence))
+            .bind(("now", now))
+            .await;
+        match res { Ok(mut r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn create_motivates_edge(
+        &self,
+        from_event_id: &str,
+        to_event_id: &str,
+        confidence: f64,
+        rationale: Option<String>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('event', $from_id);
+                 LET $to = type::thing('event', $to_id);
+                 RELATE $from->motivates->$to CONTENT {
+                    confidence: $conf,
+                    rationale: $rationale,
+                    extraction_method: 'llm',
+                    created_at: $now
+                 }"
+            )
+            .bind(("from_id", from_event_id.to_string()))
+            .bind(("to_id", to_event_id.to_string()))
+            .bind(("conf", confidence))
+            .bind(("rationale", rationale))
+            .bind(("now", now))
+            .await;
+        match res { Ok(mut r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn create_part_of_edge(
+        &self,
+        child_event_id: &str,
+        parent_event_id: &str,
+        confidence: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('event', $child_id);
+                 LET $to = type::thing('event', $parent_id);
+                 RELATE $from->part_of->$to CONTENT {
+                    confidence: $conf,
+                    extraction_method: 'llm',
+                    created_at: $now
+                 }"
+            )
+            .bind(("child_id", child_event_id.to_string()))
+            .bind(("parent_id", parent_event_id.to_string()))
+            .bind(("conf", confidence))
+            .bind(("now", now))
+            .await;
+        match res { Ok(mut r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn list_events_for_article(&self, article_id: &str) -> Result<Vec<Event>> {
+        // Reverse traversal: find events whose CONTAINS_EVIDENCE edge points to this article
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(id) AS id, store_id, title, summary, started_at, ended_at,
+                        participants, source_type, confidence, extraction_method,
+                        created_at, updated_at
+                 FROM event
+                 WHERE id IN (
+                    SELECT VALUE in FROM contains_evidence
+                    WHERE out = type::thing('article', $aid)
+                 )
+                 ORDER BY started_at"
+            )
+            .bind(("aid", article_id.to_string()))
+            .await
+            .context("list_events_for_article")?;
+        let events: Vec<Event> = resp.take(0).unwrap_or_default();
+        Ok(events)
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -2591,6 +2789,157 @@ mod entity_tests {
         let types: std::collections::HashSet<&str> = neighbors.iter().map(|n| n.1.as_str()).collect();
         assert!(types.contains("entity_overlap"));
         assert!(types.contains("semantically_related"));
+    }
+
+    #[tokio::test]
+    async fn create_event_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+        let event = Event {
+            id: "ev1".into(), store_id: "ev-s1".into(),
+            title: "Trip".into(), summary: "AZ vacation".into(),
+            started_at: "2026-03-15T00:00:00Z".into(),
+            ended_at: "2026-03-20T00:00:00Z".into(),
+            participants: serde_json::json!(["alice", "bob"]),
+            source_type: "manual".into(),
+            confidence: 0.9,
+            extraction_method: ExtractionMethod::UserAsserted,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        };
+        s.create_event(&event).await.unwrap();
+
+        let got = s.get_event("ev1").await.unwrap().expect("event exists");
+        assert_eq!(got.title, "Trip");
+        assert_eq!(got.summary, "AZ vacation");
+        assert_eq!(got.extraction_method, ExtractionMethod::UserAsserted);
+    }
+
+    #[tokio::test]
+    async fn get_event_missing_returns_none() {
+        let s = fixture().await;
+        let got = s.get_event("nonexistent").await.unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_events_for_store_orders_by_started_at() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Insert in reverse temporal order to verify SQL ORDER BY works
+        for (id, started_at) in &[
+            ("ev_later", "2026-03-20T00:00:00Z"),
+            ("ev_earlier", "2026-03-15T00:00:00Z"),
+        ] {
+            s.create_event(&Event {
+                id: id.to_string(), store_id: "le-s1".into(),
+                title: id.to_string(), summary: "".into(),
+                started_at: started_at.to_string(),
+                ended_at: started_at.to_string(),
+                participants: serde_json::json!([]),
+                source_type: "manual".into(),
+                confidence: 1.0,
+                extraction_method: ExtractionMethod::UserAsserted,
+                created_at: ts.clone(), updated_at: ts.clone(),
+            }).await.unwrap();
+        }
+
+        let events = s.list_events_for_store("le-s1").await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, "ev_earlier", "earlier event should come first");
+        assert_eq!(events[1].id, "ev_later");
+    }
+
+    #[tokio::test]
+    async fn create_contains_evidence_edge_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Seed an event and an article
+        s.create_event(&Event {
+            id: "ce_ev1".into(), store_id: "ce-s1".into(),
+            title: "Event".into(), summary: "".into(),
+            started_at: ts.clone(), ended_at: ts.clone(),
+            participants: serde_json::json!([]),
+            source_type: "manual".into(),
+            confidence: 1.0,
+            extraction_method: ExtractionMethod::UserAsserted,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_article(&Article {
+            id: "ce_a1".into(), store_id: "ce-s1".into(),
+            title: "Article".into(), content: "content".into(),
+            source_type: "user".into(), source_id: String::new(),
+            content_hash: "ce-h".into(), tags: serde_json::json!([]),
+            embedded_at: None, created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_contains_evidence_edge("ce_ev1", "ce_a1", 0.85).await.unwrap();
+
+        // Reverse lookup: article → events should return our event
+        let events = s.list_events_for_article("ce_a1").await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "ce_ev1");
+    }
+
+    #[tokio::test]
+    async fn create_motivates_edge_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+
+        for id in &["m_ev1", "m_ev2"] {
+            s.create_event(&Event {
+                id: id.to_string(), store_id: "m-s1".into(),
+                title: id.to_string(), summary: "".into(),
+                started_at: ts.clone(), ended_at: ts.clone(),
+                participants: serde_json::json!([]),
+                source_type: "manual".into(),
+                confidence: 1.0,
+                extraction_method: ExtractionMethod::UserAsserted,
+                created_at: ts.clone(), updated_at: ts.clone(),
+            }).await.unwrap();
+        }
+
+        s.create_motivates_edge("m_ev1", "m_ev2", 0.75, Some("rationale".into())).await.unwrap();
+
+        // Verify via direct SQL (no Store helper for reading motivates yet)
+        let mut resp = s.db().query(
+            "SELECT meta::id(in) AS from_id FROM motivates WHERE out = type::thing('event', 'm_ev2')"
+        ).await.unwrap().check().unwrap();
+        #[derive(serde::Deserialize)] struct Row { from_id: String }
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].from_id, "m_ev1");
+    }
+
+    #[tokio::test]
+    async fn create_part_of_edge_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+
+        for id in &["po_child", "po_parent"] {
+            s.create_event(&Event {
+                id: id.to_string(), store_id: "po-s1".into(),
+                title: id.to_string(), summary: "".into(),
+                started_at: ts.clone(), ended_at: ts.clone(),
+                participants: serde_json::json!([]),
+                source_type: "manual".into(),
+                confidence: 1.0,
+                extraction_method: ExtractionMethod::UserAsserted,
+                created_at: ts.clone(), updated_at: ts.clone(),
+            }).await.unwrap();
+        }
+
+        s.create_part_of_edge("po_child", "po_parent", 0.95).await.unwrap();
+
+        let mut resp = s.db().query(
+            "SELECT meta::id(in) AS child_id FROM part_of WHERE out = type::thing('event', 'po_parent')"
+        ).await.unwrap().check().unwrap();
+        #[derive(serde::Deserialize)] struct Row { child_id: String }
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].child_id, "po_child");
     }
 }
 
