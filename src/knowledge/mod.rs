@@ -4,6 +4,7 @@ pub mod citation_backfill;
 pub mod conversations;
 pub mod entity_extractor;
 pub mod extraction;
+pub mod relation_extractor;
 pub mod semantic_backfill;
 pub mod temporal_backfill;
 
