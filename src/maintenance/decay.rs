@@ -131,6 +131,128 @@ fn salience_ebbinghaus(input: &SalienceInput<'_>, config: &DecayConfig, now: Dat
     (-days / reinforced_strength).exp()
 }
 
+use std::sync::Arc;
+use anyhow::Result;
+
+/// Result of a nightly tier transition pass.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TransitionReport {
+    pub articles_scanned: usize,
+    pub articles_transitioned: usize,
+    pub events_scanned: usize,
+    pub events_transitioned: usize,
+    /// Per-transition counts (e.g. "hot->warm": 5)
+    pub transitions_by_type: std::collections::HashMap<String, usize>,
+    pub pinned_skipped: usize,
+}
+
+/// Walk all articles + events for a store; compute salience; transition tier
+/// when it changes AND the item is not pinned. Audit-logged via the Store
+/// trait methods. Returns a per-pass report.
+pub async fn nightly_tier_transition(
+    db: Arc<dyn crate::store::Store>,
+    store_id: &str,
+    config: &DecayConfig,
+    now: DateTime<Utc>,
+) -> Result<TransitionReport> {
+    let mut report = TransitionReport::default();
+
+    // Articles
+    let articles = db.list_articles_for_store(store_id).await?;
+    report.articles_scanned = articles.len();
+
+    for article in &articles {
+        if article.pinned {
+            report.pinned_skipped += 1;
+            continue;
+        }
+        let s = salience(
+            &SalienceInput {
+                importance_score: article.importance_score,
+                last_accessed_at: &article.last_accessed_at,
+                created_at: &article.created_at,
+                access_count: article.access_count,
+                relevance: 0.0,
+            },
+            config,
+            now,
+        );
+        let new_tier = tier_for_salience(s, config);
+        if new_tier != article.tier {
+            let from = tier_label(article.tier);
+            let to = tier_label(new_tier);
+            db.set_article_tier(
+                &article.id,
+                new_tier,
+                &format!("nightly_decay: salience={:.4}", s),
+            )
+            .await?;
+            *report
+                .transitions_by_type
+                .entry(format!("{}->{}", from, to))
+                .or_insert(0) += 1;
+            report.articles_transitioned += 1;
+        }
+    }
+
+    // Events: parallel logic
+    let events = db.list_events_for_store(store_id).await?;
+    report.events_scanned = events.len();
+
+    for event in &events {
+        if event.pinned {
+            report.pinned_skipped += 1;
+            continue;
+        }
+        let s = salience(
+            &SalienceInput {
+                importance_score: event.importance_score,
+                last_accessed_at: &event.last_accessed_at,
+                created_at: &event.created_at,
+                access_count: event.access_count,
+                relevance: 0.0,
+            },
+            config,
+            now,
+        );
+        let new_tier = tier_for_salience(s, config);
+        if new_tier != event.tier {
+            let from = tier_label(event.tier);
+            let to = tier_label(new_tier);
+            db.set_event_tier(
+                &event.id,
+                new_tier,
+                &format!("nightly_decay: salience={:.4}", s),
+            )
+            .await?;
+            *report
+                .transitions_by_type
+                .entry(format!("{}->{}", from, to))
+                .or_insert(0) += 1;
+            report.events_transitioned += 1;
+        }
+    }
+
+    tracing::info!(
+        "Nightly tier transition for store {}: articles {}/{} transitioned, events {}/{} transitioned, {} pinned skipped",
+        store_id,
+        report.articles_transitioned, report.articles_scanned,
+        report.events_transitioned, report.events_scanned,
+        report.pinned_skipped
+    );
+
+    Ok(report)
+}
+
+fn tier_label(t: crate::store::Tier) -> &'static str {
+    match t {
+        crate::store::Tier::Hot => "hot",
+        crate::store::Tier::Warm => "warm",
+        crate::store::Tier::Cold => "cold",
+        crate::store::Tier::Archive => "archive",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +371,117 @@ mod tests {
             assert!(s >= 0.0 && s <= 1.0,
                 "{:?} produced out-of-range salience: {}", formula, s);
         }
+    }
+
+    use super::nightly_tier_transition;
+    use crate::store::Store as _;
+
+    fn build_aged_article(id: &str, days_ago: i64, importance: f64, pinned: bool) -> crate::store::Article {
+        let now = chrono::Utc::now();
+        let ts_old = (now - chrono::Duration::days(days_ago)).to_rfc3339();
+        crate::store::Article {
+            id: id.into(),
+            store_id: "p8t5-s1".into(),
+            title: format!("Article {}", id),
+            content: String::new(),
+            source_type: "user".into(),
+            source_id: String::new(),
+            content_hash: format!("{}-h", id),
+            tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts_old.clone(),
+            updated_at: ts_old.clone(),
+            reflects: vec![],
+            access_count: 0,
+            last_accessed_at: ts_old,
+            importance_score: importance,
+            tier: Tier::Hot,
+            pinned,
+            compacted_into: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn nightly_transition_demotes_old_articles() {
+        let store = crate::store::SurrealStore::open_in_memory().await.unwrap();
+        // Seed: fresh, mid-aged, old, ancient
+        store.create_article(&build_aged_article("p8t5-fresh", 0, 0.8, false)).await.unwrap();
+        store.create_article(&build_aged_article("p8t5-mid", 35, 0.8, false)).await.unwrap();
+        store.create_article(&build_aged_article("p8t5-old", 150, 0.8, false)).await.unwrap();
+        store.create_article(&build_aged_article("p8t5-ancient", 365, 0.8, false)).await.unwrap();
+
+        let db: Arc<dyn crate::store::Store> = Arc::new(store);
+        let cfg = DecayConfig::default();
+        let now = chrono::Utc::now();
+
+        let report = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now).await.unwrap();
+
+        assert_eq!(report.articles_scanned, 4);
+        assert!(report.articles_transitioned >= 2,
+            "expected mid/old/ancient to demote; got {} transitions", report.articles_transitioned);
+
+        let fresh = db.get_article("p8t5-fresh").await.unwrap().unwrap();
+        assert_eq!(fresh.tier, Tier::Hot, "fresh article should stay Hot");
+
+        let ancient = db.get_article("p8t5-ancient").await.unwrap().unwrap();
+        assert!(matches!(ancient.tier, Tier::Cold | Tier::Archive),
+            "year-old article should be Cold or Archive; got {:?}", ancient.tier);
+    }
+
+    #[tokio::test]
+    async fn nightly_transition_respects_pin() {
+        let store = crate::store::SurrealStore::open_in_memory().await.unwrap();
+        // Same fixture but the old article is pinned
+        store.create_article(&build_aged_article("p8t5p-old", 365, 0.8, true)).await.unwrap();
+
+        let db: Arc<dyn crate::store::Store> = Arc::new(store);
+        let cfg = DecayConfig::default();
+        let now = chrono::Utc::now();
+
+        let report = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now).await.unwrap();
+
+        assert_eq!(report.pinned_skipped, 1);
+        let pinned = db.get_article("p8t5p-old").await.unwrap().unwrap();
+        assert_eq!(pinned.tier, Tier::Hot,
+            "pinned article should never transition; got {:?}", pinned.tier);
+    }
+
+    #[tokio::test]
+    async fn nightly_transition_no_op_on_empty_store() {
+        let store = crate::store::SurrealStore::open_in_memory().await.unwrap();
+        let db: Arc<dyn crate::store::Store> = Arc::new(store);
+        let cfg = DecayConfig::default();
+        let now = chrono::Utc::now();
+
+        let report = nightly_tier_transition(db, "empty-store", &cfg, now).await.unwrap();
+        assert_eq!(report.articles_scanned, 0);
+        assert_eq!(report.events_scanned, 0);
+        assert_eq!(report.articles_transitioned, 0);
+    }
+
+    #[tokio::test]
+    async fn nightly_transition_writes_audit_log() {
+        let store = crate::store::SurrealStore::open_in_memory().await.unwrap();
+        store.create_article(&build_aged_article("p8t5a-ancient", 365, 0.8, false)).await.unwrap();
+
+        let db: Arc<dyn crate::store::Store> = Arc::new(store);
+        let cfg = DecayConfig::default();
+        let now = chrono::Utc::now();
+
+        let _ = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now).await.unwrap();
+
+        // Verify audit log has a tier_change entry
+        let entries = db.list_audit_log("p8t5-s1", None, 100).await.unwrap();
+        let has_transition = entries.iter().any(|e|
+            e.action == "tier_change"
+            && e.subject_id == "p8t5a-ancient"
+            && e.details.get("reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("nightly_decay"))
+                .unwrap_or(false)
+        );
+        assert!(has_transition,
+            "nightly_tier_transition should write audit entries; got entries: {:?}",
+            entries);
     }
 }

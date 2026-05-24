@@ -8,5 +8,8 @@
 pub mod decay;
 pub mod scheduler;
 
-pub use decay::{salience, tier_for_salience, SalienceInput};
+pub use decay::{
+    nightly_tier_transition, salience, tier_for_salience,
+    SalienceInput, TransitionReport,
+};
 pub use scheduler::{JobSpec, MaintenanceScheduler};
