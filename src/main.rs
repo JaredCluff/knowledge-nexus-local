@@ -213,6 +213,39 @@ enum Commands {
         #[command(subcommand)]
         action: GraphAction,
     },
+
+    /// Run on-demand reflection over the article corpus.
+    Reflect {
+        /// Store id (uses default store if omitted)
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Print what would be reflected without writing to the store.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Minimum cluster size (number of source articles) for reflection.
+        /// Smaller clusters are skipped as not warranting consolidation.
+        #[arg(long, default_value = "3")]
+        min_cluster_size: usize,
+    },
+
+    /// Run on-demand event segmentation.
+    SegmentEvents {
+        /// Store id (uses default store if omitted)
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Only segment articles created at or after this RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// List or browse events.
+    Event {
+        #[command(subcommand)]
+        action: EventAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -275,6 +308,26 @@ enum GraphAction {
 
         /// Max results to display
         #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventAction {
+    /// List events for a store.
+    List {
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Filter: only events starting at or after this timestamp.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter: only events ending at or before this timestamp.
+        #[arg(long)]
+        until: Option<String>,
+
+        #[arg(short, long, default_value = "20")]
         limit: usize,
     },
 }
@@ -487,6 +540,17 @@ fn main() -> Result<()> {
                     report.connector_configs,
                 );
             }
+            Commands::Reflect { store, dry_run, min_cluster_size } => {
+                cmd_reflect(store.as_deref(), dry_run, min_cluster_size).await?;
+            }
+            Commands::SegmentEvents { store, since } => {
+                cmd_segment_events(store.as_deref(), since.as_deref()).await?;
+            }
+            Commands::Event { action } => match action {
+                EventAction::List { store, since, until, limit } => {
+                    cmd_event_list(store.as_deref(), since.as_deref(), until.as_deref(), limit).await?;
+                }
+            },
         }
         Ok(())
     })
@@ -1642,6 +1706,224 @@ async fn cmd_graph_activation(query: &str, store_filter: Option<&str>, limit: us
         if let Some(score) = r.metadata.get("activation_score").and_then(|v| v.as_f64()) {
             println!("       activation_score: {:.4}", score);
         }
+    }
+
+    Ok(())
+}
+
+async fn cmd_reflect(
+    store_filter: Option<&str>,
+    dry_run: bool,
+    min_cluster_size: usize,
+) -> Result<()> {
+    use anyhow::Context as _;
+    use knowledge::reflection::{Reflector, ReflectionCluster};
+
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
+
+    info!("Reflecting on store: {} (dry_run={}, min_cluster_size={})", store_id, dry_run, min_cluster_size);
+
+    // For P7 cluster detection: use the existing entity graph as the cluster
+    // signal. For each entity in the store, the set of articles mentioning
+    // it forms a candidate cluster.
+    let entities = db.list_entities_for_store(&store_id).await
+        .unwrap_or_default();
+
+    let reflector = Reflector::new(cfg.extraction.clone());
+    let mut reflections_generated = 0;
+    let mut clusters_skipped = 0;
+
+    for entity in &entities {
+        // Get articles mentioning this entity
+        let articles_for_entity = db.list_articles_for_entity(&entity.id).await
+            .unwrap_or_default();
+
+        if articles_for_entity.len() < min_cluster_size {
+            clusters_skipped += 1;
+            continue;
+        }
+
+        let cluster = ReflectionCluster {
+            sources: articles_for_entity.clone(),
+            intent: format!("shared entity: {} ({})", entity.name, entity.entity_type),
+        };
+
+        match reflector.reflect(&cluster).await {
+            Ok(Some(result)) => {
+                if dry_run {
+                    println!(
+                        "[dry-run] Would create reflection on entity {} ({} sources, confidence={:.2}):",
+                        entity.name, result.source_ids.len(), result.raw_confidence
+                    );
+                    println!("  delta: {}", &result.delta_summary[..result.delta_summary.len().min(200)]);
+                    println!();
+                } else {
+                    // Store the reflection as an Article with source_type='reflection'
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let reflection_id = format!("reflection-{}-{}",
+                        entity.id,
+                        now.replace([':', '-', '.', 'T', 'Z'], ""));
+
+                    let reflection_article = store::Article {
+                        id: reflection_id.clone(),
+                        store_id: store_id.clone(),
+                        title: format!("Reflection: {}", entity.name),
+                        content: result.delta_summary.clone(),
+                        source_type: "reflection".into(),
+                        source_id: String::new(),
+                        content_hash: format!("refl-{}", reflection_id),
+                        tags: serde_json::json!([]),
+                        embedded_at: None,
+                        created_at: now.clone(),
+                        updated_at: now,
+                        reflects: result.source_ids.clone(),
+                    };
+
+                    db.create_article(&reflection_article).await
+                        .with_context(|| format!("Failed to store reflection {}", reflection_id))?;
+
+                    reflections_generated += 1;
+                    println!(
+                        "Reflection stored: {} ({} sources, confidence={:.2})",
+                        reflection_id, result.source_ids.len(), result.raw_confidence
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("Reflector returned None for entity {} (empty delta or LLM disabled)", entity.name);
+            }
+            Err(e) => {
+                tracing::warn!("Reflection failed for entity {}: {}", entity.name, e);
+            }
+        }
+    }
+
+    if dry_run {
+        println!("Dry run complete: examined {} entities, skipped {} below threshold",
+            entities.len(), clusters_skipped);
+    } else {
+        println!("Reflection complete: {} reflections generated, {} clusters skipped",
+            reflections_generated, clusters_skipped);
+
+        // Reset the ingest counter since we just ran a reflection
+        let _ = db.reset_ingest_counter(&store_id).await;
+    }
+
+    Ok(())
+}
+
+async fn cmd_segment_events(
+    store_filter: Option<&str>,
+    since: Option<&str>,
+) -> Result<()> {
+    use anyhow::Context as _;
+    use knowledge::events::EventSegmenter;
+
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
+
+    info!("Segmenting events for store: {} (since: {:?})", store_id, since);
+
+    // Pull articles for the store, optionally filtered by since
+    let articles = db.list_articles_for_store(&store_id).await?;
+    let filtered: Vec<_> = articles.into_iter()
+        .filter(|a| since.map_or(true, |s| a.created_at.as_str() >= s))
+        .collect();
+
+    if filtered.is_empty() {
+        println!("No articles to segment (store has 0 articles since {:?})", since);
+        return Ok(());
+    }
+
+    let segmenter = EventSegmenter::new(cfg.extraction.clone());
+    let events = segmenter.segment(&filtered).await?;
+
+    if events.is_empty() {
+        println!("Segmentation produced no events (likely LLM disabled and heuristic produced nothing).");
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    for (i, evt) in events.iter().enumerate() {
+        let event_id = format!("event-{}-{}",
+            now.replace([':', '-', '.', 'T', 'Z'], ""), i);
+
+        let event = store::Event {
+            id: event_id.clone(),
+            store_id: store_id.clone(),
+            title: evt.title.clone(),
+            summary: evt.summary.clone(),
+            started_at: evt.started_at.clone(),
+            ended_at: evt.ended_at.clone(),
+            participants: serde_json::Value::Array(
+                evt.participants.iter().map(|p| serde_json::Value::String(p.clone())).collect()
+            ),
+            source_type: "derived".into(),
+            confidence: evt.confidence,
+            extraction_method: store::ExtractionMethod::Llm,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+
+        db.create_event(&event).await
+            .with_context(|| format!("Failed to store event {}", event_id))?;
+
+        // Link evidence articles via CONTAINS_EVIDENCE
+        for article_id in &evt.evidence_article_ids {
+            let _ = db.create_contains_evidence_edge(&event_id, article_id, 1.0).await;
+        }
+
+        println!(
+            "Event stored: {} ({} -> {}, {} evidence articles, confidence={:.2})",
+            event_id, evt.started_at, evt.ended_at, evt.evidence_article_ids.len(), evt.confidence
+        );
+    }
+
+    println!("Segmentation complete: {} events stored from {} articles", events.len(), filtered.len());
+
+    Ok(())
+}
+
+async fn cmd_event_list(
+    store_filter: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
+
+    let events = db.list_events_for_store(&store_id).await?;
+    let filtered: Vec<_> = events.into_iter()
+        .filter(|e| since.map_or(true, |s| e.started_at.as_str() >= s))
+        .filter(|e| until.map_or(true, |u| e.ended_at.as_str() <= u))
+        .take(limit)
+        .collect();
+
+    if filtered.is_empty() {
+        println!("No events found in store {}", store_id);
+        return Ok(());
+    }
+
+    println!("Events for store {} ({} shown):", store_id, filtered.len());
+    for e in &filtered {
+        println!();
+        println!("  {} — {}", e.title, e.id);
+        println!("    {} → {}", e.started_at, e.ended_at);
+        if !e.summary.is_empty() {
+            let snip = if e.summary.len() > 200 {
+                format!("{}...", &e.summary[..200])
+            } else {
+                e.summary.clone()
+            };
+            println!("    {}", snip);
+        }
+        println!("    confidence={:.2} method={:?} source={}",
+            e.confidence, e.extraction_method, e.source_type);
     }
 
     Ok(())
