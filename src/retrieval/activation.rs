@@ -116,10 +116,20 @@ impl ActivationEngine {
         // 4. Assemble column-stochastic edge matrix with intent multipliers
         let w = build_edge_matrix(nodes.len(), &edges, &weights);
 
-        // 5. Personalization vector: 1.0 at seed indices (no node-level
-        //    specificity since seeds here are articles, not entities; the
-        //    specificity map is keyed by entity_id, not article_id).
-        let t = build_personalization_vector(nodes.len(), &nodes, &seed_articles, &specificity);
+        // 5. Personalization vector: seeds scaled by salience (P8).
+        // Look up tier for each seed article. Articles not found get weight 1.0.
+        let mut seed_weights: HashMap<String, f32> = HashMap::new();
+        for seed_id in &seed_articles {
+            let weight = match self.db.get_article(seed_id).await {
+                Ok(Some(article)) => crate::maintenance::decay::tier_factor(
+                    article.tier,
+                    true, // for PPR personalization, always include archive
+                ),
+                _ => 1.0,
+            };
+            seed_weights.insert(seed_id.clone(), weight);
+        }
+        let t = build_personalization_vector(nodes.len(), &nodes, &seed_articles, &seed_weights);
 
         // 6. PPR diffusion
         let activation = personalized_pagerank(
@@ -327,19 +337,21 @@ fn build_edge_matrix(n: usize, edges: &[TypedEdge], weights: &IntentWeights) -> 
     tri2.to_csr()
 }
 
-/// Build the personalization vector: 1.0 at each seed node index.
-/// (We don't use specificity here because seeds are articles, not entities;
-/// specificity is keyed by entity_id.)
+/// Build the personalization vector: seeds weighted by per-article salience (P8).
+/// Seeds with weight 0.0 are excluded from the vector entirely.
 fn build_personalization_vector(
     n: usize,
     nodes: &NodeIndex,
     seeds: &[String],
-    _specificity: &HashMap<String, f32>,
+    weights: &HashMap<String, f32>,
 ) -> CsVec<f32> {
     let mut paired: Vec<(usize, f32)> = Vec::new();
     for seed_id in seeds {
         if let Some(&idx) = nodes.id_to_idx.get(seed_id) {
-            paired.push((idx, 1.0));
+            let w = weights.get(seed_id).copied().unwrap_or(1.0);
+            if w > 0.0 {
+                paired.push((idx, w));
+            }
         }
     }
     paired.sort_by_key(|(i, _)| *i);
@@ -461,6 +473,12 @@ mod ablation {
                 embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
                 reflects: vec![],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: crate::store::Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 

@@ -13,6 +13,7 @@ mod config;
 mod connection;
 mod connectors;
 pub mod constants;
+mod maintenance;
 mod migrate;
 mod store;
 mod discovery;
@@ -245,6 +246,53 @@ enum Commands {
     Event {
         #[command(subcommand)]
         action: EventAction,
+    },
+
+    /// Pin an article so it never tiers down or compacts.
+    Pin {
+        article_id: String,
+    },
+
+    /// Unpin an article (re-enables tier transitions / compaction).
+    Unpin {
+        article_id: String,
+    },
+
+    /// Show salience + tier distribution for a store.
+    DecayStatus {
+        #[arg(long)]
+        store: Option<String>,
+    },
+
+    /// Run compaction-via-reflection over Cold-tier redundant clusters.
+    Compact {
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Preview what would be compacted without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Browse the audit log.
+    AuditLog {
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Filter: only entries at or after this RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Admin tier override. Audit-logged.
+    Tier {
+        article_id: String,
+
+        /// One of: hot, warm, cold, archive
+        new_tier: String,
     },
 }
 
@@ -551,6 +599,12 @@ fn main() -> Result<()> {
                     cmd_event_list(store.as_deref(), since.as_deref(), until.as_deref(), limit).await?;
                 }
             },
+            Commands::Pin { article_id } => cmd_pin(&article_id).await?,
+            Commands::Unpin { article_id } => cmd_unpin(&article_id).await?,
+            Commands::DecayStatus { store } => cmd_decay_status(store.as_deref()).await?,
+            Commands::Compact { store, dry_run } => cmd_compact(store.as_deref(), dry_run).await?,
+            Commands::AuditLog { store, since, limit } => cmd_audit_log(store.as_deref(), since.as_deref(), limit).await?,
+            Commands::Tier { article_id, new_tier } => cmd_tier(&article_id, &new_tier).await?,
         }
         Ok(())
     })
@@ -1779,6 +1833,12 @@ async fn cmd_reflect(
                         created_at: now.clone(),
                         updated_at: now,
                         reflects: result.source_ids.clone(),
+                        access_count: 0,
+                        last_accessed_at: String::new(),
+                        importance_score: 0.5,
+                        tier: store::Tier::Hot,
+                        pinned: false,
+                        compacted_into: None,
                     };
 
                     db.create_article(&reflection_article).await
@@ -1866,6 +1926,12 @@ async fn cmd_segment_events(
             extraction_method: store::ExtractionMethod::Llm,
             created_at: now.clone(),
             updated_at: now.clone(),
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: store::Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         };
 
         db.create_event(&event).await
@@ -1926,5 +1992,135 @@ async fn cmd_event_list(
             e.confidence, e.extraction_method, e.source_type);
     }
 
+    Ok(())
+}
+
+async fn cmd_pin(article_id: &str) -> Result<()> {
+    use anyhow::Context as _;
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    db.pin_article(article_id).await
+        .with_context(|| format!("Failed to pin article {}", article_id))?;
+    println!("Pinned: {}", article_id);
+    Ok(())
+}
+
+async fn cmd_unpin(article_id: &str) -> Result<()> {
+    use anyhow::Context as _;
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    db.unpin_article(article_id).await
+        .with_context(|| format!("Failed to unpin article {}", article_id))?;
+    println!("Unpinned: {}", article_id);
+    Ok(())
+}
+
+async fn cmd_decay_status(store_filter: Option<&str>) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
+
+    println!("Decay status for store: {}", store_id);
+    println!();
+
+    // Per-tier counts
+    let mut total = 0usize;
+    for (tier, label) in [
+        (store::Tier::Hot, "Hot"),
+        (store::Tier::Warm, "Warm"),
+        (store::Tier::Cold, "Cold"),
+        (store::Tier::Archive, "Archive"),
+    ] {
+        let articles = db.list_articles_by_tier(&store_id, tier).await
+            .unwrap_or_default();
+        let count = articles.len();
+        total += count;
+        let pinned_count = articles.iter().filter(|a| a.pinned).count();
+
+        println!("  {:8} {:6} articles ({} pinned)", label, count, pinned_count);
+    }
+    println!();
+    println!("  Total: {} articles", total);
+
+    Ok(())
+}
+
+async fn cmd_compact(store_filter: Option<&str>, dry_run: bool) -> Result<()> {
+    use maintenance::compact_low_salience;
+
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
+
+    info!("Compacting store: {} (dry_run={})", store_id, dry_run);
+    let report = compact_low_salience(
+        db, &store_id, &cfg.compaction, &cfg.extraction, dry_run,
+    ).await?;
+
+    println!();
+    if dry_run {
+        println!("[dry-run] Compaction preview for store {}:", store_id);
+    } else {
+        println!("Compaction complete for store {}:", store_id);
+    }
+    println!("  Clusters examined:         {}", report.clusters_examined);
+    println!("  Clusters compacted:        {}", report.clusters_compacted);
+    println!("  Articles archived:         {}", report.articles_archived);
+    println!("  Clusters below threshold:  {}", report.clusters_below_threshold);
+    println!("  Pinned articles skipped:   {}", report.skipped_pinned);
+
+    if !dry_run && !report.reflection_ids.is_empty() {
+        println!();
+        println!("Reflection articles created:");
+        for rid in &report.reflection_ids {
+            println!("  {}", rid);
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_audit_log(store_filter: Option<&str>, since: Option<&str>, limit: usize) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
+
+    let entries = db.list_audit_log(&store_id, since, limit).await?;
+
+    if entries.is_empty() {
+        println!("No audit entries for store {}", store_id);
+        return Ok(());
+    }
+
+    println!("Audit log for store {} ({} entries shown):", store_id, entries.len());
+    println!();
+    for e in &entries {
+        println!("  [{}] {} {} {}", e.recorded_at, e.action, e.subject_type, e.subject_id);
+        if !e.details.is_null() && !matches!(&e.details, serde_json::Value::Object(m) if m.is_empty()) {
+            println!("       {}", e.details);
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_tier(article_id: &str, new_tier_str: &str) -> Result<()> {
+    use anyhow::Context as _;
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+
+    let new_tier = match new_tier_str.to_lowercase().as_str() {
+        "hot" => store::Tier::Hot,
+        "warm" => store::Tier::Warm,
+        "cold" => store::Tier::Cold,
+        "archive" => store::Tier::Archive,
+        _ => anyhow::bail!("Invalid tier: '{}'. Must be one of: hot, warm, cold, archive", new_tier_str),
+    };
+
+    db.set_article_tier(article_id, new_tier, "admin_override").await
+        .with_context(|| format!("Failed to set tier for {}", article_id))?;
+
+    println!("Set tier of {} to {:?} (audit-logged with reason='admin_override')",
+        article_id, new_tier);
     Ok(())
 }

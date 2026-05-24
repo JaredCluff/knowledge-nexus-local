@@ -233,6 +233,12 @@ mod tests {
             created_at: "2026-05-24T00:00:00Z".into(),
             updated_at: "2026-05-24T00:00:00Z".into(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: crate::store::Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }
     }
 

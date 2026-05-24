@@ -3,7 +3,7 @@
 //!
 //! The schema is SCHEMAFULL — unknown fields are rejected.
 
-pub const SCHEMA_VERSION: &str = "1.0.0-p7";
+pub const SCHEMA_VERSION: &str = "1.0.0-p8";
 
 /// Returns the full SurrealQL DDL script. Idempotent: every statement uses
 /// `IF NOT EXISTS` or `OVERWRITE` so re-running on an initialized DB is a
@@ -54,6 +54,13 @@ DEFINE FIELD IF NOT EXISTS created_at ON article TYPE string;
 DEFINE FIELD IF NOT EXISTS updated_at ON article TYPE string;
 DEFINE FIELD IF NOT EXISTS reflects ON article TYPE array DEFAULT [];
 DEFINE FIELD IF NOT EXISTS reflects.* ON article TYPE string;
+-- P8 fields (added via IF NOT EXISTS to upgrade in place)
+DEFINE FIELD IF NOT EXISTS access_count ON article TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS last_accessed_at ON article TYPE string DEFAULT "";
+DEFINE FIELD IF NOT EXISTS importance_score ON article TYPE float DEFAULT 0.5;
+DEFINE FIELD IF NOT EXISTS tier ON article TYPE string DEFAULT "hot";
+DEFINE FIELD IF NOT EXISTS pinned ON article TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS compacted_into ON article TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS article_store_idx ON article FIELDS store_id;
 DEFINE INDEX IF NOT EXISTS article_hash_idx ON article FIELDS store_id, content_hash;
 
@@ -257,6 +264,13 @@ DEFINE FIELD IF NOT EXISTS confidence ON event TYPE float DEFAULT 1.0;
 DEFINE FIELD IF NOT EXISTS extraction_method ON event TYPE string DEFAULT "user_asserted";
 DEFINE FIELD IF NOT EXISTS created_at ON event TYPE string;
 DEFINE FIELD IF NOT EXISTS updated_at ON event TYPE string;
+-- P8 fields (added via IF NOT EXISTS to upgrade in place)
+DEFINE FIELD IF NOT EXISTS access_count ON event TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS last_accessed_at ON event TYPE string DEFAULT "";
+DEFINE FIELD IF NOT EXISTS importance_score ON event TYPE float DEFAULT 0.5;
+DEFINE FIELD IF NOT EXISTS tier ON event TYPE string DEFAULT "hot";
+DEFINE FIELD IF NOT EXISTS pinned ON event TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS compacted_into ON event TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS event_store_idx ON event FIELDS store_id;
 DEFINE INDEX IF NOT EXISTS event_time_idx ON event FIELDS started_at;
 
@@ -296,5 +310,17 @@ DEFINE FIELD IF NOT EXISTS count ON _ingest_counters TYPE int DEFAULT 0;
 DEFINE FIELD IF NOT EXISTS last_reset_at ON _ingest_counters TYPE string;
 DEFINE INDEX IF NOT EXISTS _ingest_counters_store_unique
     ON _ingest_counters FIELDS store_id UNIQUE;
+
+-- P8 audit log (append-only)
+DEFINE TABLE IF NOT EXISTS _audit_log SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS store_id ON _audit_log TYPE string;
+DEFINE FIELD IF NOT EXISTS action ON _audit_log TYPE string;
+DEFINE FIELD IF NOT EXISTS subject_type ON _audit_log TYPE string;
+DEFINE FIELD IF NOT EXISTS subject_id ON _audit_log TYPE string;
+DEFINE FIELD IF NOT EXISTS details ON _audit_log FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS recorded_at ON _audit_log TYPE string;
+DEFINE INDEX IF NOT EXISTS _audit_log_subject_idx ON _audit_log FIELDS subject_id;
+DEFINE INDEX IF NOT EXISTS _audit_log_time_idx ON _audit_log FIELDS recorded_at;
+DEFINE INDEX IF NOT EXISTS _audit_log_store_idx ON _audit_log FIELDS store_id;
 "#
 }

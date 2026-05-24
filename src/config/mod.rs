@@ -61,6 +61,14 @@ pub struct Config {
     /// Reflection scheduling settings (P7)
     #[serde(default)]
     pub reflection: ReflectionConfig,
+
+    /// Decay / tier-transition settings (P8)
+    #[serde(default)]
+    pub decay: DecayConfig,
+
+    /// Compaction settings (P8)
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 // ============================================================================
@@ -326,6 +334,12 @@ pub struct RetrievalConfig {
     /// Spreading-activation parameters (P6).
     #[serde(default)]
     pub activation: ActivationConfig,
+
+    /// If true, include Archive-tier items in retrieval (default false: P8
+    /// archived items are excluded from default queries to honor the
+    /// quarantine semantics — surface only via explicit query parameter).
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 fn default_rrf_k() -> f32 {
@@ -358,6 +372,7 @@ impl Default for RetrievalConfig {
             edge_types: EdgeTypeFilter::default(),
             graph_strategy: default_graph_strategy(),
             activation: ActivationConfig::default(),
+            include_archive: false,
         }
     }
 }
@@ -385,6 +400,145 @@ impl Default for ReflectionConfig {
         Self {
             ingests_per_reflection_trigger: default_ingests_per_reflection(),
             min_reflection_interval_hours: default_min_reflection_interval_hours(),
+        }
+    }
+}
+
+/// Choice of salience formula used by the tier-transition job (P8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SalienceFormula {
+    /// SYNAPSE-aligned activation-driven decay (default).
+    /// `salience = importance · exp(-lambda · days_since_access)`.
+    /// Per SYNAPSE ablation: removing decay drops Temporal F1 50.1→14.2.
+    ActivationDriven,
+    /// MemoryOS heat formula (arXiv 2506.06326).
+    /// `heat = α·visits + β·interaction_length + γ·recency_factor` with
+    /// recency decay constant μ.
+    MemoryOsHeat,
+    /// Generative Agents formula (Park et al., named in Du survey 2603.07670).
+    /// `salience = w_rec·recency + w_rel·relevance + w_imp·importance`.
+    GenerativeAgents,
+    /// MemoryBank Ebbinghaus-curve (Du survey 2603.07670 §9.8).
+    /// `salience = exp(-t/S)` with reinforcement-on-access raising S.
+    Ebbinghaus,
+}
+
+impl Default for SalienceFormula {
+    fn default() -> Self {
+        SalienceFormula::ActivationDriven
+    }
+}
+
+/// Decay / tier-transition configuration (P8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecayConfig {
+    /// Salience formula choice. Default ActivationDriven (SYNAPSE-aligned).
+    #[serde(default)]
+    pub formula: SalienceFormula,
+
+    /// Activation-driven decay constant. Default 0.02 ≈ 35-day half-life.
+    /// Equivalent: λ in `salience = importance · exp(-λ · days_since_access)`.
+    #[serde(default = "default_lambda")]
+    pub lambda: f64,
+
+    /// Tier threshold: salience >= this stays in Hot.
+    #[serde(default = "default_hot_threshold")]
+    pub hot_threshold: f64,
+    /// Tier threshold: salience >= this stays in Warm (else Cold).
+    #[serde(default = "default_warm_threshold")]
+    pub warm_threshold: f64,
+    /// Tier threshold: salience >= this stays in Cold (else Archive).
+    #[serde(default = "default_cold_threshold")]
+    pub cold_threshold: f64,
+
+    // MemoryOS heat formula parameters
+    #[serde(default = "default_heat_alpha")]
+    pub heat_alpha: f64,
+    #[serde(default = "default_heat_beta")]
+    pub heat_beta: f64,
+    #[serde(default = "default_heat_gamma")]
+    pub heat_gamma: f64,
+    /// Recency decay constant in MemoryOS heat formula.
+    #[serde(default = "default_heat_mu")]
+    pub heat_mu: f64,
+
+    // Generative Agents weights
+    #[serde(default = "default_ga_w_recency")]
+    pub ga_w_recency: f64,
+    #[serde(default = "default_ga_w_relevance")]
+    pub ga_w_relevance: f64,
+    #[serde(default = "default_ga_w_importance")]
+    pub ga_w_importance: f64,
+    /// Recency decay constant for the Generative Agents formula.
+    #[serde(default = "default_ga_decay")]
+    pub ga_decay: f64,
+
+    // Ebbinghaus
+    /// Memory strength constant in `salience = exp(-t/S)`. Higher = slower decay.
+    #[serde(default = "default_ebbinghaus_strength")]
+    pub ebbinghaus_strength: f64,
+}
+
+fn default_lambda() -> f64 { 0.02 }
+fn default_hot_threshold() -> f64 { 0.5 }
+fn default_warm_threshold() -> f64 { 0.1 }
+fn default_cold_threshold() -> f64 { 0.01 }
+
+fn default_heat_alpha() -> f64 { 1.0 }
+fn default_heat_beta() -> f64 { 0.5 }
+fn default_heat_gamma() -> f64 { 2.0 }
+fn default_heat_mu() -> f64 { 1.0e7 }
+
+fn default_ga_w_recency() -> f64 { 0.5 }
+fn default_ga_w_relevance() -> f64 { 0.3 }
+fn default_ga_w_importance() -> f64 { 0.2 }
+fn default_ga_decay() -> f64 { 0.99 }
+
+fn default_ebbinghaus_strength() -> f64 { 10.0 }
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            formula: SalienceFormula::default(),
+            lambda: default_lambda(),
+            hot_threshold: default_hot_threshold(),
+            warm_threshold: default_warm_threshold(),
+            cold_threshold: default_cold_threshold(),
+            heat_alpha: default_heat_alpha(),
+            heat_beta: default_heat_beta(),
+            heat_gamma: default_heat_gamma(),
+            heat_mu: default_heat_mu(),
+            ga_w_recency: default_ga_w_recency(),
+            ga_w_relevance: default_ga_w_relevance(),
+            ga_w_importance: default_ga_w_importance(),
+            ga_decay: default_ga_decay(),
+            ebbinghaus_strength: default_ebbinghaus_strength(),
+        }
+    }
+}
+
+/// Compaction-via-reflection configuration (P8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// Minimum cluster size (number of Cold-tier articles sharing an entity)
+    /// to qualify for compaction. Smaller clusters are skipped.
+    #[serde(default = "default_compaction_min_cluster")]
+    pub min_cluster_size: usize,
+
+    /// Maximum number of clusters to compact per run (rate-limiting).
+    #[serde(default = "default_compaction_max_clusters_per_run")]
+    pub max_clusters_per_run: usize,
+}
+
+fn default_compaction_min_cluster() -> usize { 5 }
+fn default_compaction_max_clusters_per_run() -> usize { 50 }
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            min_cluster_size: default_compaction_min_cluster(),
+            max_clusters_per_run: default_compaction_max_clusters_per_run(),
         }
     }
 }
@@ -902,6 +1056,8 @@ impl Default for Config {
             retrieval: RetrievalConfig::default(),
             graph: GraphConfig::default(),
             reflection: ReflectionConfig::default(),
+            decay: DecayConfig::default(),
+            compaction: CompactionConfig::default(),
         }
     }
 }

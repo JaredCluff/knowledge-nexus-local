@@ -281,6 +281,20 @@ pub trait Store: Send + Sync {
     /// reflection job is submitted so the next 100 ingests trigger the
     /// next reflection.
     async fn reset_ingest_counter(&self, store_id: &str) -> Result<()>;
+
+    // P8 access tracking + tier + pin/unpin + audit log
+    async fn record_article_access(&self, article_id: &str) -> Result<()>;
+    #[allow(dead_code)] // P9+ will call this when event access tracking is wired
+    async fn record_event_access(&self, event_id: &str) -> Result<()>;
+    async fn set_article_tier(&self, article_id: &str, new_tier: Tier, reason: &str) -> Result<()>;
+    async fn set_event_tier(&self, event_id: &str, new_tier: Tier, reason: &str) -> Result<()>;
+    async fn pin_article(&self, article_id: &str) -> Result<()>;
+    async fn unpin_article(&self, article_id: &str) -> Result<()>;
+    async fn list_articles_by_tier(&self, store_id: &str, tier: Tier) -> Result<Vec<Article>>;
+    async fn write_audit_log(&self, entry: &AuditLogEntry) -> Result<()>;
+    async fn list_audit_log(&self, store_id: &str, since_rfc3339: Option<&str>, limit: usize) -> Result<Vec<AuditLogEntry>>;
+    async fn count_recent_access_audit(&self, article_id: &str, since_rfc3339: &str) -> Result<usize>;
+    async fn set_article_compacted_into(&self, article_id: &str, reflection_id: &str) -> Result<()>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -435,6 +449,15 @@ pub async fn open_from_config(cfg: &crate::config::Config) -> Result<std::sync::
 }
 
 
+fn tier_to_string(t: Tier) -> &'static str {
+    match t {
+        Tier::Hot => "hot",
+        Tier::Warm => "warm",
+        Tier::Cold => "cold",
+        Tier::Archive => "archive",
+    }
+}
+
 #[async_trait]
 impl Store for SurrealStore {
     // Users
@@ -558,7 +581,13 @@ impl Store for SurrealStore {
                     source_type: $source_type, source_id: $source_id,
                     content_hash: $content_hash, tags: $tags,
                     embedded_at: $embedded_at, created_at: $created_at,
-                    updated_at: $updated_at, reflects: $reflects
+                    updated_at: $updated_at, reflects: $reflects,
+                    access_count: $access_count,
+                    last_accessed_at: $last_accessed_at,
+                    importance_score: $importance_score,
+                    tier: $tier,
+                    pinned: $pinned,
+                    compacted_into: $compacted_into
                 }",
             )
             .bind(("id", a.id.clone()))
@@ -573,6 +602,17 @@ impl Store for SurrealStore {
             .bind(("created_at", a.created_at.clone()))
             .bind(("updated_at", a.updated_at.clone()))
             .bind(("reflects", a.reflects.clone()))
+            .bind(("access_count", a.access_count))
+            .bind(("last_accessed_at", a.last_accessed_at.clone()))
+            .bind(("importance_score", a.importance_score))
+            .bind(("tier", match a.tier {
+                Tier::Hot => "hot",
+                Tier::Warm => "warm",
+                Tier::Cold => "cold",
+                Tier::Archive => "archive",
+            }))
+            .bind(("pinned", a.pinned))
+            .bind(("compacted_into", a.compacted_into.clone()))
             .await?
             .check()?;
         Ok(())
@@ -596,7 +636,13 @@ impl Store for SurrealStore {
                     source_type: $source_type, source_id: $source_id,
                     content_hash: $content_hash, tags: $tags,
                     embedded_at: $embedded_at, updated_at: $updated_at,
-                    reflects: $reflects
+                    reflects: $reflects,
+                    access_count: $access_count,
+                    last_accessed_at: $last_accessed_at,
+                    importance_score: $importance_score,
+                    tier: $tier,
+                    pinned: $pinned,
+                    compacted_into: $compacted_into
                 }",
             )
             .bind(("id", a.id.clone()))
@@ -609,6 +655,17 @@ impl Store for SurrealStore {
             .bind(("embedded_at", a.embedded_at.clone()))
             .bind(("updated_at", a.updated_at.clone()))
             .bind(("reflects", a.reflects.clone()))
+            .bind(("access_count", a.access_count))
+            .bind(("last_accessed_at", a.last_accessed_at.clone()))
+            .bind(("importance_score", a.importance_score))
+            .bind(("tier", match a.tier {
+                Tier::Hot => "hot",
+                Tier::Warm => "warm",
+                Tier::Cold => "cold",
+                Tier::Archive => "archive",
+            }))
+            .bind(("pinned", a.pinned))
+            .bind(("compacted_into", a.compacted_into.clone()))
             .await?
             .check()?;
         Ok(())
@@ -1868,7 +1925,13 @@ impl Store for SurrealStore {
                     confidence: $confidence,
                     extraction_method: $method,
                     created_at: $created_at,
-                    updated_at: $updated_at
+                    updated_at: $updated_at,
+                    access_count: $access_count,
+                    last_accessed_at: $last_accessed_at,
+                    importance_score: $importance_score,
+                    tier: $tier,
+                    pinned: $pinned,
+                    compacted_into: $compacted_into
                  }"
             )
             .bind(("id", event.id.clone()))
@@ -1883,6 +1946,17 @@ impl Store for SurrealStore {
             .bind(("method", method_str))
             .bind(("created_at", event.created_at.clone()))
             .bind(("updated_at", event.updated_at.clone()))
+            .bind(("access_count", event.access_count))
+            .bind(("last_accessed_at", event.last_accessed_at.clone()))
+            .bind(("importance_score", event.importance_score))
+            .bind(("tier", match event.tier {
+                Tier::Hot => "hot",
+                Tier::Warm => "warm",
+                Tier::Cold => "cold",
+                Tier::Archive => "archive",
+            }))
+            .bind(("pinned", event.pinned))
+            .bind(("compacted_into", event.compacted_into.clone()))
             .await
             .context("create_event")?;
         let _ = res;
@@ -1894,7 +1968,9 @@ impl Store for SurrealStore {
             .query(
                 "SELECT meta::id(id) AS id, store_id, title, summary, started_at, ended_at,
                         participants, source_type, confidence, extraction_method,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        access_count, last_accessed_at, importance_score,
+                        tier, pinned, compacted_into
                  FROM event
                  WHERE id = type::thing('event', $id)"
             )
@@ -1910,7 +1986,9 @@ impl Store for SurrealStore {
             .query(
                 "SELECT meta::id(id) AS id, store_id, title, summary, started_at, ended_at,
                         participants, source_type, confidence, extraction_method,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        access_count, last_accessed_at, importance_score,
+                        tier, pinned, compacted_into
                  FROM event
                  WHERE store_id = $sid
                  ORDER BY started_at"
@@ -2005,7 +2083,9 @@ impl Store for SurrealStore {
             .query(
                 "SELECT meta::id(id) AS id, store_id, title, summary, started_at, ended_at,
                         participants, source_type, confidence, extraction_method,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        access_count, last_accessed_at, importance_score,
+                        tier, pinned, compacted_into
                  FROM event
                  WHERE id IN (
                     SELECT VALUE in FROM contains_evidence
@@ -2168,16 +2248,392 @@ impl Store for SurrealStore {
             Err(_) => Ok(()),
         }
     }
+
+    // ── P8: access tracking + tier + pin/unpin + audit log ─────────────────
+
+    async fn record_article_access(&self, article_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let current_tier = {
+            let mut resp = self.db()
+                .query("SELECT tier, store_id, pinned FROM article WHERE id = type::thing('article', $aid)")
+                .bind(("aid", article_id.to_string()))
+                .await
+                .context("record_article_access: fetch tier")?;
+            #[derive(serde::Deserialize)]
+            struct Row { tier: String, store_id: String, pinned: bool }
+            let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        };
+
+        let (current_tier_str, store_id, pinned) = match current_tier {
+            Some(r) => (r.tier, r.store_id, r.pinned),
+            None => return Ok(()),
+        };
+
+        let promote_to_hot = !pinned && current_tier_str != "hot";
+        let new_tier_str = if promote_to_hot { "hot" } else { current_tier_str.as_str() };
+
+        let res = self.db()
+            .query(
+                "UPDATE article SET access_count += 1, last_accessed_at = $now, tier = $tier
+                 WHERE id = type::thing('article', $aid)"
+            )
+            .bind(("aid", article_id.to_string()))
+            .bind(("now", now.clone()))
+            .bind(("tier", new_tier_str.to_string()))
+            .await
+            .context("record_article_access: update")?;
+        let _ = res.check();
+
+        if promote_to_hot {
+            let entry = AuditLogEntry {
+                id: format!("al-{}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), article_id),
+                store_id,
+                action: "tier_change".into(),
+                subject_type: "article".into(),
+                subject_id: article_id.to_string(),
+                details: serde_json::json!({
+                    "from": current_tier_str,
+                    "to": "hot",
+                    "reason": "access_promote"
+                }),
+                recorded_at: now,
+            };
+            self.write_audit_log(&entry).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn record_event_access(&self, event_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let current_tier = {
+            let mut resp = self.db()
+                .query("SELECT tier, store_id, pinned FROM event WHERE id = type::thing('event', $eid)")
+                .bind(("eid", event_id.to_string()))
+                .await
+                .context("record_event_access: fetch tier")?;
+            #[derive(serde::Deserialize)]
+            struct Row { tier: String, store_id: String, pinned: bool }
+            let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        };
+
+        let (current_tier_str, store_id, pinned) = match current_tier {
+            Some(r) => (r.tier, r.store_id, r.pinned),
+            None => return Ok(()),
+        };
+
+        let promote_to_hot = !pinned && current_tier_str != "hot";
+        let new_tier_str = if promote_to_hot { "hot" } else { current_tier_str.as_str() };
+
+        let res = self.db()
+            .query(
+                "UPDATE event SET access_count += 1, last_accessed_at = $now, tier = $tier
+                 WHERE id = type::thing('event', $eid)"
+            )
+            .bind(("eid", event_id.to_string()))
+            .bind(("now", now.clone()))
+            .bind(("tier", new_tier_str.to_string()))
+            .await
+            .context("record_event_access: update")?;
+        let _ = res.check();
+
+        if promote_to_hot {
+            let entry = AuditLogEntry {
+                id: format!("al-{}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), event_id),
+                store_id,
+                action: "tier_change".into(),
+                subject_type: "event".into(),
+                subject_id: event_id.to_string(),
+                details: serde_json::json!({
+                    "from": current_tier_str,
+                    "to": "hot",
+                    "reason": "access_promote"
+                }),
+                recorded_at: now,
+            };
+            self.write_audit_log(&entry).await?;
+        }
+        Ok(())
+    }
+
+    async fn set_article_tier(&self, article_id: &str, new_tier: Tier, reason: &str) -> Result<()> {
+        let tier_str = tier_to_string(new_tier);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let prev = {
+            let mut resp = self.db()
+                .query("SELECT tier, store_id FROM article WHERE id = type::thing('article', $aid)")
+                .bind(("aid", article_id.to_string()))
+                .await
+                .context("set_article_tier: fetch prev")?;
+            #[derive(serde::Deserialize)] struct R { tier: String, store_id: String }
+            let rows: Vec<R> = resp.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        };
+        let (prev_tier, store_id) = match prev {
+            Some(r) => (r.tier, r.store_id),
+            None => return Ok(()),
+        };
+
+        if prev_tier == tier_str {
+            return Ok(());
+        }
+
+        let res = self.db()
+            .query(
+                "UPDATE article SET tier = $tier
+                 WHERE id = type::thing('article', $aid)"
+            )
+            .bind(("aid", article_id.to_string()))
+            .bind(("tier", tier_str.to_string()))
+            .await
+            .context("set_article_tier: update")?;
+        let _ = res.check();
+
+        let entry = AuditLogEntry {
+            id: format!("al-{}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), article_id),
+            store_id,
+            action: "tier_change".into(),
+            subject_type: "article".into(),
+            subject_id: article_id.to_string(),
+            details: serde_json::json!({ "from": prev_tier, "to": tier_str, "reason": reason }),
+            recorded_at: now,
+        };
+        self.write_audit_log(&entry).await
+    }
+
+    async fn set_event_tier(&self, event_id: &str, new_tier: Tier, reason: &str) -> Result<()> {
+        let tier_str = tier_to_string(new_tier);
+        let now = chrono::Utc::now().to_rfc3339();
+        let prev = {
+            let mut resp = self.db()
+                .query("SELECT tier, store_id FROM event WHERE id = type::thing('event', $eid)")
+                .bind(("eid", event_id.to_string()))
+                .await
+                .context("set_event_tier: fetch prev")?;
+            #[derive(serde::Deserialize)] struct R { tier: String, store_id: String }
+            let rows: Vec<R> = resp.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        };
+        let (prev_tier, store_id) = match prev {
+            Some(r) => (r.tier, r.store_id),
+            None => return Ok(()),
+        };
+        if prev_tier == tier_str { return Ok(()); }
+
+        let res = self.db()
+            .query("UPDATE event SET tier = $tier WHERE id = type::thing('event', $eid)")
+            .bind(("eid", event_id.to_string()))
+            .bind(("tier", tier_str.to_string()))
+            .await.context("set_event_tier: update")?;
+        let _ = res.check();
+
+        let entry = AuditLogEntry {
+            id: format!("al-{}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), event_id),
+            store_id,
+            action: "tier_change".into(),
+            subject_type: "event".into(),
+            subject_id: event_id.to_string(),
+            details: serde_json::json!({ "from": prev_tier, "to": tier_str, "reason": reason }),
+            recorded_at: now,
+        };
+        self.write_audit_log(&entry).await
+    }
+
+    async fn pin_article(&self, article_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let store_id_opt = {
+            let mut resp = self.db()
+                .query("SELECT store_id FROM article WHERE id = type::thing('article', $aid)")
+                .bind(("aid", article_id.to_string()))
+                .await
+                .context("pin_article: fetch")?;
+            #[derive(serde::Deserialize)] struct R { store_id: String }
+            let rows: Vec<R> = resp.take(0).unwrap_or_default();
+            rows.into_iter().next().map(|r| r.store_id)
+        };
+        let store_id = match store_id_opt {
+            Some(sid) => sid,
+            None => return Ok(()),
+        };
+
+        let res = self.db()
+            .query("UPDATE article SET pinned = true WHERE id = type::thing('article', $aid)")
+            .bind(("aid", article_id.to_string()))
+            .await.context("pin_article: update")?;
+        let _ = res.check();
+
+        let entry = AuditLogEntry {
+            id: format!("al-{}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), article_id),
+            store_id,
+            action: "pin".into(),
+            subject_type: "article".into(),
+            subject_id: article_id.to_string(),
+            details: serde_json::json!({}),
+            recorded_at: now,
+        };
+        self.write_audit_log(&entry).await
+    }
+
+    async fn unpin_article(&self, article_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let store_id_opt = {
+            let mut resp = self.db()
+                .query("SELECT store_id FROM article WHERE id = type::thing('article', $aid)")
+                .bind(("aid", article_id.to_string()))
+                .await.context("unpin_article: fetch")?;
+            #[derive(serde::Deserialize)] struct R { store_id: String }
+            let rows: Vec<R> = resp.take(0).unwrap_or_default();
+            rows.into_iter().next().map(|r| r.store_id)
+        };
+        let store_id = match store_id_opt { Some(s) => s, None => return Ok(()) };
+
+        let res = self.db()
+            .query("UPDATE article SET pinned = false WHERE id = type::thing('article', $aid)")
+            .bind(("aid", article_id.to_string()))
+            .await.context("unpin_article: update")?;
+        let _ = res.check();
+
+        let entry = AuditLogEntry {
+            id: format!("al-{}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), article_id),
+            store_id,
+            action: "unpin".into(),
+            subject_type: "article".into(),
+            subject_id: article_id.to_string(),
+            details: serde_json::json!({}),
+            recorded_at: now,
+        };
+        self.write_audit_log(&entry).await
+    }
+
+    async fn list_articles_by_tier(&self, store_id: &str, tier: Tier) -> Result<Vec<Article>> {
+        let tier_str = tier_to_string(tier);
+        let mut resp = self.db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM article
+                 WHERE store_id = $sid AND tier = $tier
+                 ORDER BY last_accessed_at DESC"
+            )
+            .bind(("sid", store_id.to_string()))
+            .bind(("tier", tier_str.to_string()))
+            .await.context("list_articles_by_tier")?;
+        let articles: Vec<Article> = resp.take(0).unwrap_or_default();
+        Ok(articles)
+    }
+
+    async fn write_audit_log(&self, entry: &AuditLogEntry) -> Result<()> {
+        let res = self.db()
+            .query(
+                "CREATE type::thing('_audit_log', $id) CONTENT {
+                    store_id: $store_id,
+                    action: $action,
+                    subject_type: $subject_type,
+                    subject_id: $subject_id,
+                    details: $details,
+                    recorded_at: $recorded_at
+                 }"
+            )
+            .bind(("id", entry.id.clone()))
+            .bind(("store_id", entry.store_id.clone()))
+            .bind(("action", entry.action.clone()))
+            .bind(("subject_type", entry.subject_type.clone()))
+            .bind(("subject_id", entry.subject_id.clone()))
+            .bind(("details", entry.details.clone()))
+            .bind(("recorded_at", entry.recorded_at.clone()))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn list_audit_log(&self, store_id: &str, since_rfc3339: Option<&str>, limit: usize) -> Result<Vec<AuditLogEntry>> {
+        let q = if since_rfc3339.is_some() {
+            "SELECT meta::id(id) AS id, store_id, action, subject_type, subject_id, details, recorded_at
+             FROM _audit_log
+             WHERE store_id = $sid AND recorded_at >= $since
+             ORDER BY recorded_at DESC LIMIT $limit"
+        } else {
+            "SELECT meta::id(id) AS id, store_id, action, subject_type, subject_id, details, recorded_at
+             FROM _audit_log
+             WHERE store_id = $sid
+             ORDER BY recorded_at DESC LIMIT $limit"
+        };
+        let mut query = self.db().query(q)
+            .bind(("sid", store_id.to_string()))
+            .bind(("limit", limit as i64));
+        if let Some(s) = since_rfc3339 {
+            query = query.bind(("since", s.to_string()));
+        }
+        let mut resp = query.await.context("list_audit_log")?;
+        let entries: Vec<AuditLogEntry> = resp.take(0).unwrap_or_default();
+        Ok(entries)
+    }
+
+    async fn count_recent_access_audit(&self, article_id: &str, since_rfc3339: &str) -> Result<usize> {
+        let mut resp = self.db()
+            .query(
+                "SELECT count() AS n FROM _audit_log
+                 WHERE subject_id = $aid
+                   AND action = 'tier_change'
+                   AND recorded_at > $since
+                 GROUP ALL"
+            )
+            .bind(("aid", article_id.to_string()))
+            .bind(("since", since_rfc3339.to_string()))
+            .await.context("count_recent_access_audit")?;
+        #[derive(serde::Deserialize)] struct Cnt { n: i64 }
+        let rows: Vec<Cnt> = resp.take(0).unwrap_or_default();
+        Ok(rows.first().map(|c| c.n as usize).unwrap_or(0))
+    }
+
+    async fn set_article_compacted_into(&self, article_id: &str, reflection_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let store_id_opt = {
+            let mut resp = self.db()
+                .query("SELECT store_id FROM article WHERE id = type::thing('article', $aid)")
+                .bind(("aid", article_id.to_string()))
+                .await.context("set_compacted_into: fetch")?;
+            #[derive(serde::Deserialize)] struct R { store_id: String }
+            let rows: Vec<R> = resp.take(0).unwrap_or_default();
+            rows.into_iter().next().map(|r| r.store_id)
+        };
+        let store_id = match store_id_opt { Some(s) => s, None => return Ok(()) };
+
+        let res = self.db()
+            .query(
+                "UPDATE article SET compacted_into = $refl, tier = 'archive'
+                 WHERE id = type::thing('article', $aid)"
+            )
+            .bind(("aid", article_id.to_string()))
+            .bind(("refl", reflection_id.to_string()))
+            .await.context("set_compacted_into: update")?;
+        let _ = res.check();
+
+        let entry = AuditLogEntry {
+            id: format!("al-{}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), article_id),
+            store_id,
+            action: "compact".into(),
+            subject_type: "article".into(),
+            subject_id: article_id.to_string(),
+            details: serde_json::json!({ "into": reflection_id, "tier": "archive" }),
+            recorded_at: now,
+        };
+        self.write_audit_log(&entry).await
+    }
 }
 
 /// Convenience alias used across the codebase.
+#[allow(dead_code)] // consumed by P9+ services
 pub type DynStore = dyn Store;
 
 /// Boxed, arc'd instance. Handed into every service that used to hold
 /// `Arc<Database>`.
+#[allow(dead_code)] // consumed by P9+ services
 pub type SharedStore = Arc<DynStore>;
 
 /// Wrap a concrete `SurrealStore` into the shared trait object.
+#[allow(dead_code)] // consumed by P9+ services
 pub fn shared(store: SurrealStore) -> SharedStore {
     Arc::new(store)
 }
@@ -2254,6 +2710,12 @@ mod article_tests {
             tags: serde_json::json!(["test"]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         };
         s.create_article(&article).await.unwrap();
 
@@ -2454,6 +2916,12 @@ mod fts_tests {
                 embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
                 reflects: vec![],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -2682,6 +3150,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "lafe-a2".into(), store_id: "s1".into(), title: "Tokio Deep Dive".into(),
@@ -2690,6 +3164,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_entity(&Entity {
@@ -2776,6 +3256,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "co-art2".into(), store_id: "co-s1".into(), title: "More Rust".into(),
@@ -2784,6 +3270,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Entity IDs that don't contain colons, to avoid any SurrealDB ID-parsing ambiguity.
@@ -2824,6 +3316,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5pre-a2".into(), store_id: "p5pre-s1".into(), title: "B".into(), content: "y".into(),
@@ -2831,6 +3329,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_precedes_edge(
@@ -2854,6 +3358,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5sem-a2".into(), store_id: "p5sem-s1".into(), title: "B".into(), content: "".into(),
@@ -2861,6 +3371,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_semantically_related_edge("p5sem-s1", "p5sem-a1", "p5sem-a2", 0.91).await.expect("first");
@@ -2882,6 +3398,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5cb-a2".into(), store_id: "p5cb-s1".into(), title: "B".into(), content: "".into(),
@@ -2889,6 +3411,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_caused_by_edge(
@@ -2911,6 +3439,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5ref-a2".into(), store_id: "p5ref-s1".into(), title: "B".into(), content: "".into(),
@@ -2918,6 +3452,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_references_edge(
@@ -3013,6 +3553,12 @@ mod entity_tests {
             confidence: 0.9,
             extraction_method: ExtractionMethod::UserAsserted,
             created_at: ts.clone(), updated_at: ts.clone(),
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         };
         s.create_event(&event).await.unwrap();
 
@@ -3049,6 +3595,12 @@ mod entity_tests {
                 confidence: 1.0,
                 extraction_method: ExtractionMethod::UserAsserted,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3073,6 +3625,12 @@ mod entity_tests {
             confidence: 1.0,
             extraction_method: ExtractionMethod::UserAsserted,
             created_at: ts.clone(), updated_at: ts.clone(),
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_article(&Article {
@@ -3082,6 +3640,12 @@ mod entity_tests {
             content_hash: "ce-h".into(), tags: serde_json::json!([]),
             embedded_at: None, created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_contains_evidence_edge("ce_ev1", "ce_a1", 0.85).await.unwrap();
@@ -3107,6 +3671,12 @@ mod entity_tests {
                 confidence: 1.0,
                 extraction_method: ExtractionMethod::UserAsserted,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3137,6 +3707,12 @@ mod entity_tests {
                 confidence: 1.0,
                 extraction_method: ExtractionMethod::UserAsserted,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3170,6 +3746,12 @@ mod entity_tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             reflects: vec!["p7r-a1".into(), "p7r-a2".into()],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         let got = s.get_article("p7r-refl").await.unwrap().expect("reflection exists");
@@ -3196,6 +3778,12 @@ mod entity_tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Two reflections pointing at the source
@@ -3213,6 +3801,12 @@ mod entity_tests {
                 created_at: ts.clone(),
                 updated_at: ts.clone(),
                 reflects: vec!["lrfa-src".into()],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3230,6 +3824,12 @@ mod entity_tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             reflects: vec!["other-id".into()],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         let reflections = s.list_reflections_for_article("lrfa-src").await.unwrap();
@@ -3238,6 +3838,199 @@ mod entity_tests {
         assert!(ids.contains("lrfa-r1"));
         assert!(ids.contains("lrfa-r2"));
         assert!(!ids.contains("lrfa-unrelated"));
+    }
+
+    // ── P8 Task 3 tests ────────────────────────────────────────────────────
+
+    fn p8_article(id: &str, store_id: &str, tier: Tier, pinned: bool, ts: &str) -> Article {
+        Article {
+            id: id.to_string(),
+            store_id: store_id.to_string(),
+            title: "T".into(),
+            content: "C".into(),
+            source_type: "user".into(),
+            source_id: String::new(),
+            content_hash: format!("{}-h", id),
+            tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts.to_string(),
+            updated_at: ts.to_string(),
+            reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier,
+            pinned,
+            compacted_into: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn record_article_access_increments_counter_and_promotes_tier() {
+        let s = fixture().await;
+        let ts = now();
+        s.create_article(&p8_article("p8t3-a1", "p8t3-s1", Tier::Warm, false, &ts))
+            .await.unwrap();
+
+        s.record_article_access("p8t3-a1").await.unwrap();
+
+        let got = s.get_article("p8t3-a1").await.unwrap().expect("exists");
+        assert_eq!(got.access_count, 1);
+        assert_eq!(got.tier, Tier::Hot, "access should promote Warm -> Hot");
+        assert!(!got.last_accessed_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_article_access_hot_stays_hot() {
+        let s = fixture().await;
+        let ts = now();
+        s.create_article(&p8_article("p8t3-a2", "p8t3-s2", Tier::Hot, false, &ts))
+            .await.unwrap();
+
+        s.record_article_access("p8t3-a2").await.unwrap();
+
+        let got = s.get_article("p8t3-a2").await.unwrap().expect("exists");
+        assert_eq!(got.access_count, 1);
+        assert_eq!(got.tier, Tier::Hot, "already Hot stays Hot");
+    }
+
+    #[tokio::test]
+    async fn pin_article_sets_pinned_and_logs_audit() {
+        let s = fixture().await;
+        let ts = now();
+        // Use a store that exists in the fixture
+        let mut art = p8_article("p8t3-pin1", "s1", Tier::Warm, false, &ts);
+        art.store_id = "s1".into();
+        s.create_article(&art).await.unwrap();
+
+        s.pin_article("p8t3-pin1").await.unwrap();
+
+        let got = s.get_article("p8t3-pin1").await.unwrap().expect("exists");
+        assert!(got.pinned, "pinned flag must be set");
+
+        let log = s.list_audit_log("s1", None, 10).await.unwrap();
+        assert!(
+            log.iter().any(|e| e.action == "pin" && e.subject_id == "p8t3-pin1"),
+            "audit log must contain a pin entry for the article"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpin_article_clears_pinned() {
+        let s = fixture().await;
+        let ts = now();
+        let mut art = p8_article("p8t3-unpin1", "s1", Tier::Hot, true, &ts);
+        art.pinned = true;
+        s.create_article(&art).await.unwrap();
+
+        s.unpin_article("p8t3-unpin1").await.unwrap();
+
+        let got = s.get_article("p8t3-unpin1").await.unwrap().expect("exists");
+        assert!(!got.pinned, "pinned flag must be cleared");
+
+        let log = s.list_audit_log("s1", None, 10).await.unwrap();
+        assert!(
+            log.iter().any(|e| e.action == "unpin" && e.subject_id == "p8t3-unpin1"),
+            "audit log must contain an unpin entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_article_tier_logs_transition() {
+        let s = fixture().await;
+        let ts = now();
+        let mut art = p8_article("p8t3-tier1", "s1", Tier::Hot, false, &ts);
+        art.store_id = "s1".into();
+        s.create_article(&art).await.unwrap();
+
+        s.set_article_tier("p8t3-tier1", Tier::Cold, "test_reason").await.unwrap();
+
+        let got = s.get_article("p8t3-tier1").await.unwrap().expect("exists");
+        assert_eq!(got.tier, Tier::Cold, "tier must be updated to Cold");
+
+        let log = s.list_audit_log("s1", None, 10).await.unwrap();
+        let entry = log.iter().find(|e| e.action == "tier_change" && e.subject_id == "p8t3-tier1")
+            .expect("tier_change audit entry must exist");
+        // SurrealDB object fields round-trip through serde; check via serialized string
+        let details_str = entry.details.to_string();
+        assert!(details_str.contains("\"hot\"") || details_str.contains("hot"),
+            "details must record from=hot; got: {}", details_str);
+        assert!(details_str.contains("cold"),
+            "details must record to=cold; got: {}", details_str);
+    }
+
+    #[tokio::test]
+    async fn list_articles_by_tier_filters_correctly() {
+        let s = fixture().await;
+        let ts = now();
+        // Two Hot articles and one Cold article in the same store
+        for (id, tier) in &[
+            ("p8t3-list-h1", Tier::Hot),
+            ("p8t3-list-h2", Tier::Hot),
+            ("p8t3-list-c1", Tier::Cold),
+        ] {
+            let mut art = p8_article(id, "s1", *tier, false, &ts);
+            art.store_id = "s1".into();
+            s.create_article(&art).await.unwrap();
+        }
+
+        let hot = s.list_articles_by_tier("s1", Tier::Hot).await.unwrap();
+        let cold = s.list_articles_by_tier("s1", Tier::Cold).await.unwrap();
+
+        let hot_ids: std::collections::HashSet<&str> = hot.iter().map(|a| a.id.as_str()).collect();
+        assert!(hot_ids.contains("p8t3-list-h1"), "h1 must be in Hot list");
+        assert!(hot_ids.contains("p8t3-list-h2"), "h2 must be in Hot list");
+        assert!(!hot_ids.contains("p8t3-list-c1"), "c1 must NOT be in Hot list");
+
+        let cold_ids: std::collections::HashSet<&str> = cold.iter().map(|a| a.id.as_str()).collect();
+        assert!(cold_ids.contains("p8t3-list-c1"), "c1 must be in Cold list");
+        assert!(!cold_ids.contains("p8t3-list-h1"), "h1 must NOT be in Cold list");
+    }
+
+    #[tokio::test]
+    async fn write_audit_log_persists_entry() {
+        let s = fixture().await;
+        let ts = now();
+        let entry = AuditLogEntry {
+            id: "p8t3-al-manual-1".into(),
+            store_id: "s1".into(),
+            action: "tier_change".into(),
+            subject_type: "article".into(),
+            subject_id: "p8t3-any-art".into(),
+            details: serde_json::json!({ "from": "warm", "to": "cold" }),
+            recorded_at: ts.clone(),
+        };
+        s.write_audit_log(&entry).await.unwrap();
+
+        let log = s.list_audit_log("s1", None, 50).await.unwrap();
+        assert!(
+            log.iter().any(|e| e.id == "p8t3-al-manual-1"),
+            "manually written audit entry must round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_article_compacted_into_archives_and_logs() {
+        let s = fixture().await;
+        let ts = now();
+        let mut art = p8_article("p8t3-compact-src", "s1", Tier::Cold, false, &ts);
+        art.store_id = "s1".into();
+        s.create_article(&art).await.unwrap();
+
+        s.set_article_compacted_into("p8t3-compact-src", "p8t3-refl-1").await.unwrap();
+
+        let got = s.get_article("p8t3-compact-src").await.unwrap().expect("exists");
+        assert_eq!(got.compacted_into, Some("p8t3-refl-1".into()), "compacted_into must be set");
+        assert_eq!(got.tier, Tier::Archive, "tier must become Archive after compaction");
+
+        let log = s.list_audit_log("s1", None, 10).await.unwrap();
+        let entry = log.iter().find(|e| e.action == "compact" && e.subject_id == "p8t3-compact-src")
+            .expect("compact audit entry must exist");
+        let details_str = entry.details.to_string();
+        assert!(details_str.contains("p8t3-refl-1"),
+            "details must contain reflection id; got: {}", details_str);
+        assert!(details_str.contains("archive"),
+            "details must contain archive tier; got: {}", details_str);
     }
 }
 
@@ -3366,6 +4159,12 @@ mod graph_edge_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "a2".into(), store_id: "s1".into(), title: "Async Rust".into(),
@@ -3374,6 +4173,12 @@ mod graph_edge_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_entity(&Entity {
             id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
@@ -3486,6 +4291,12 @@ mod p3_integration_tests {
                 tags: serde_json::json!([]), embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
                 reflects: vec![],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3548,6 +4359,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Simulate dedup detection
@@ -3606,6 +4423,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_tagged_edge("a1", "rust").await.unwrap();
 
@@ -3629,6 +4452,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "a2".into(), store_id: "s1".into(), title: "No mentions".into(),
@@ -3637,6 +4466,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.upsert_entity(&Entity {
@@ -3666,6 +4501,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "tgsi-a2".into(), store_id: "s1".into(), title: "Go Concurrency".into(),
@@ -3674,6 +4515,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "tgsi-a3".into(), store_id: "s1".into(), title: "Tokio Internals".into(),
@@ -3682,6 +4529,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Create entities
@@ -3767,6 +4620,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "gse-a2".into(), store_id: "s1".into(),
@@ -3776,6 +4635,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "gse-a3".into(), store_id: "s1".into(),
@@ -3785,6 +4650,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Create entities
@@ -3871,6 +4742,12 @@ mod p3_integration_tests {
             embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_entity(&Entity {
@@ -3882,8 +4759,7 @@ mod p3_integration_tests {
         s.create_mentions_edge("gj-a1", "gj-tool-rust", "Rust provides", 0.95).await.unwrap();
 
         // Explicit jaccard strategy
-        let mut config = RetrievalConfig::default();
-        config.graph_strategy = "jaccard".into();
+        let config = RetrievalConfig { graph_strategy: "jaccard".into(), ..RetrievalConfig::default() };
         let db: Arc<dyn Store> = Arc::new(s);
         let searcher = GraphSearcher::new(db, config);
 
@@ -3926,6 +4802,12 @@ mod p3_integration_tests {
                 embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
                 reflects: vec![],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -4020,6 +4902,12 @@ mod p3_integration_tests {
             embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         let db: Arc<dyn Store> = Arc::new(s);
@@ -4067,6 +4955,12 @@ mod p3_integration_tests {
                 created_at: ts.clone(),
                 updated_at: ts.clone(),
                 reflects: vec![],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -4107,6 +5001,12 @@ mod p3_integration_tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             reflects: source_ids.clone(),
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Verify the reflection round-trips its reflects field
@@ -4150,5 +5050,175 @@ mod p3_integration_tests {
         let user_source: f64 = 1.0;
         let capped_noop = llm_high.min(user_source).clamp(0.0, 1.0);
         assert_eq!(capped_noop, 0.7);
+    }
+
+    /// Verifies that record_article_access increments access_count and
+    /// records an audit entry. (The pipeline-level fire-and-forget spawn
+    /// is implicitly tested by Task 6's tests, which already exercise the
+    /// executor path; this test focuses on the direct Store-level call
+    /// that the spawn ultimately makes.)
+    #[tokio::test]
+    async fn p8_record_access_increments_counter_and_logs_audit() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Seed a Warm-tier article (will be promoted to Hot via access)
+        s.create_article(&Article {
+            id: "p8t8-a1".into(),
+            store_id: "p8t8-s1".into(),
+            title: "T".into(),
+            content: "C".into(),
+            source_type: "user".into(),
+            source_id: String::new(),
+            content_hash: "h".into(),
+            tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            reflects: vec![],
+            access_count: 0,
+            last_accessed_at: "".into(),
+            importance_score: 0.5,
+            tier: Tier::Warm,
+            pinned: false,
+            compacted_into: None,
+        }).await.unwrap();
+
+        // Also create the store since we're using a different store_id
+        s.create_store(&KnowledgeStore {
+            id: "p8t8-s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "P8T8".into(), lancedb_collection: "store_p8t8_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.record_article_access("p8t8-a1").await.unwrap();
+
+        let got = s.get_article("p8t8-a1").await.unwrap().unwrap();
+        assert_eq!(got.access_count, 1, "access_count must increment");
+        assert_eq!(got.tier, Tier::Hot, "Warm article should be promoted to Hot on access");
+        assert!(!got.last_accessed_at.is_empty(), "last_accessed_at must be set");
+
+        // Audit log should have a tier_change entry
+        let entries = s.list_audit_log("p8t8-s1", None, 10).await.unwrap();
+        let has_audit = entries.iter().any(|e|
+            e.action == "tier_change"
+            && e.subject_id == "p8t8-a1"
+            && e.details.get("reason").and_then(|v| v.as_str()) == Some("access_promote")
+        );
+        assert!(has_audit, "access promotion must write an audit entry; got {:?}", entries);
+    }
+
+    /// P8 end-to-end: 10 articles with varied last_accessed_at timestamps.
+    /// After nightly_tier_transition, verify the salience-driven demotion
+    /// pattern and that pinned items override decay.
+    #[tokio::test]
+    async fn p8_e2e_tier_transitions_on_10_article_fixture() {
+        use crate::maintenance::nightly_tier_transition;
+        use crate::config::DecayConfig;
+        use std::sync::Arc;
+
+        let s = fixture().await;
+        let now = chrono::Utc::now();
+
+        // Build 10 articles with varied recency. With λ=0.02 (35-day half-life)
+        // and thresholds Hot=0.5 / Warm=0.1 / Cold=0.01 / Archive<0.01:
+        // - days≤35 + importance=0.8 → salience ≥ 0.4 → Hot (just under 0.5 OK)
+        // - days≤35 + importance=1.0 → salience ≈ 0.5 → Hot
+        // - days≈100 → salience ≈ 0.13 → Warm
+        // - days≈200 → salience ≈ 0.018 → Cold
+        // - days≈365 → salience < 0.01 → Archive
+        // - days≈500 → salience < 0.01 → Archive
+        let fixtures = [
+            ("p8e-fresh1", 0, 1.0, false),    // → Hot
+            ("p8e-fresh2", 5, 1.0, false),    // → Hot
+            ("p8e-recent", 30, 1.0, false),   // → Hot (importance=1.0 → salience ≈ 0.55)
+            ("p8e-mid1", 100, 1.0, false),    // → Warm (salience ≈ 0.13)
+            ("p8e-mid2", 120, 1.0, false),    // → Warm/Cold boundary (salience ≈ 0.09)
+            ("p8e-old1", 200, 1.0, false),    // → Cold (salience ≈ 0.018)
+            ("p8e-old2", 220, 1.0, false),    // → Cold (salience ≈ 0.016)
+            ("p8e-ancient1", 365, 1.0, false), // → Archive (salience ≈ 0.00067)
+            ("p8e-ancient2", 500, 1.0, false), // → Archive (salience ≈ 0.000045)
+            ("p8e-pinned-old", 365, 1.0, true), // PINNED → stays Hot regardless
+        ];
+
+        for (id, days_ago, importance, pinned) in &fixtures {
+            let ts = (now - chrono::Duration::days(*days_ago)).to_rfc3339();
+            s.create_article(&Article {
+                id: id.to_string(),
+                store_id: "p8e-s1".into(),
+                title: format!("Article {}", id),
+                content: format!("content of {}", id),
+                source_type: "user".into(),
+                source_id: String::new(),
+                content_hash: format!("{}-h", id),
+                tags: serde_json::json!([]),
+                embedded_at: None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+                reflects: vec![],
+                access_count: 0,
+                last_accessed_at: ts,
+                importance_score: *importance,
+                tier: Tier::Hot,    // all start Hot; transition will demote some
+                pinned: *pinned,
+                compacted_into: None,
+            }).await.unwrap();
+        }
+
+        let db: Arc<dyn Store> = Arc::new(s);
+        let cfg = DecayConfig::default();
+        let report = nightly_tier_transition(db.clone(), "p8e-s1", &cfg, now).await.unwrap();
+
+        // Sanity: scanned all 10
+        assert_eq!(report.articles_scanned, 10, "should scan all 10 articles");
+        assert_eq!(report.pinned_skipped, 1, "pinned article must be skipped");
+
+        // Fetch all final tiers using a helper
+        let get_tier = |aid: &str| {
+            let db = db.clone();
+            let aid = aid.to_string();
+            async move {
+                db.get_article(&aid).await.unwrap().unwrap().tier
+            }
+        };
+
+        // Recent articles stay Hot (with importance=1.0 they're salience ≥0.5)
+        assert_eq!(get_tier("p8e-fresh1").await, Tier::Hot, "0-day article should be Hot");
+        assert_eq!(get_tier("p8e-fresh2").await, Tier::Hot, "5-day article should be Hot");
+        assert_eq!(get_tier("p8e-recent").await, Tier::Hot, "30-day article should be Hot");
+
+        // Ancient articles go to Cold or Archive
+        let ancient1 = get_tier("p8e-ancient1").await;
+        let ancient2 = get_tier("p8e-ancient2").await;
+        assert!(matches!(ancient1, Tier::Cold | Tier::Archive),
+            "365-day article should be Cold or Archive; got {:?}", ancient1);
+        assert!(matches!(ancient2, Tier::Cold | Tier::Archive),
+            "500-day article should be Cold or Archive; got {:?}", ancient2);
+
+        // PIN OVERRIDE: pinned 365-day article stays Hot
+        let pinned_tier = get_tier("p8e-pinned-old").await;
+        assert_eq!(pinned_tier, Tier::Hot,
+            "pinned article must stay Hot regardless of age; got {:?}", pinned_tier);
+
+        // Audit log: should have entries for non-pinned demotions only
+        let entries = db.list_audit_log("p8e-s1", None, 100).await.unwrap();
+        let nightly_entries: Vec<&AuditLogEntry> = entries.iter()
+            .filter(|e|
+                e.action == "tier_change"
+                && e.details.get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.contains("nightly_decay"))
+                    .unwrap_or(false)
+            )
+            .collect();
+
+        // At least 2 transitions (the ancients); pinned must NOT appear
+        assert!(nightly_entries.len() >= 2,
+            "expected at least 2 nightly transitions; got {}", nightly_entries.len());
+        assert!(
+            !nightly_entries.iter().any(|e| e.subject_id == "p8e-pinned-old"),
+            "pinned article must not appear in transition audit log"
+        );
     }
 }

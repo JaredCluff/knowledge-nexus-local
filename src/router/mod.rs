@@ -47,6 +47,7 @@ impl LocalRouter {
             classifier: ContextClassifier::new(),
             planner: QueryPlanner::new(db.clone()),
             executor: QueryExecutor::new(
+                db,
                 vectordb,
                 embedding_model,
                 hybrid_searcher,
