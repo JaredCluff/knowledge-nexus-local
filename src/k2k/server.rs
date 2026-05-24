@@ -78,6 +78,7 @@ impl K2KServer {
             embedding_model.clone(),
             hybrid_searcher,
             remote_executor,
+            config.retrieval.clone(),
         ));
 
         let article_service = Arc::new(ArticleService::new(
