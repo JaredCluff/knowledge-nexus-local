@@ -140,4 +140,91 @@ mod tests {
         assert_eq!(report.citation_edges, 0);
         assert_eq!(report.causal_edges, 0);
     }
+
+    /// E2E backfill test on a 10-article fixture. Exercises temporal + semantic
+    /// + citation paths together (causal is opt-in and requires Ollama; skipped).
+    #[tokio::test]
+    async fn e2e_backfill_emits_expected_edges_on_10_article_fixture() {
+        let store = crate::store::SurrealStore::open_in_memory().await.expect("open mem");
+
+        // Seed 10 articles with deterministic timestamps in 2026-01-01..2026-01-10
+        let mut seed_q = String::new();
+        for i in 1..=10usize {
+            let day = i;
+            // Article 5 cites article 3 via markdown link
+            let content = if i == 5 {
+                "see [retro](e2ea3) for prior context".to_string()
+            } else {
+                String::new()
+            };
+            seed_q.push_str(&format!(
+                "CREATE article:e2ea{i} CONTENT {{ store_id: \"e2e-s1\", title: \"A{i}\",
+                    content: \"{content}\",
+                    source_type: \"user\", source_id: \"\", content_hash: \"e2ea{i}\",
+                    tags: [], created_at: \"2026-01-{day:02}T00:00:00Z\",
+                    updated_at: \"2026-01-{day:02}T00:00:00Z\" }};\n",
+            ));
+        }
+        // 3 entity-overlap pairs: (a1,a2), (a3,a5), (a7,a8) — seeded directly into entity_overlap
+        for (a, b) in &[(1usize, 2usize), (3, 5), (7, 8)] {
+            seed_q.push_str(&format!(
+                "RELATE article:e2ea{a}->entity_overlap->article:e2ea{b} CONTENT {{
+                    shared_entity_count: 2, strength: 0.5, confidence: 0.5,
+                    extraction_method: \"heuristic\", store_id: \"e2e-s1\",
+                    created_at: \"2026-01-10T00:00:00Z\", updated_at: \"2026-01-10T00:00:00Z\"
+                }};\n",
+            ));
+        }
+        store.db().query(&seed_q).await.expect("seed").check().expect("seed check");
+
+        // MockVectorDb: e2ea2 <-> e2ea3 are very similar (0.95); other neighbors <0.6
+        let mock = MockVectorDb::with_pairs("e2e-s1", &[
+            ("e2ea1",  &[("e2ea2", 0.5), ("e2ea3", 0.5)][..]),
+            ("e2ea2",  &[("e2ea3", 0.95), ("e2ea1", 0.5)][..]),
+            ("e2ea3",  &[("e2ea2", 0.95), ("e2ea5", 0.5)][..]),
+            ("e2ea4",  &[("e2ea5", 0.5)][..]),
+            ("e2ea5",  &[("e2ea3", 0.5)][..]),
+            ("e2ea6",  &[("e2ea7", 0.5)][..]),
+            ("e2ea7",  &[("e2ea8", 0.5), ("e2ea6", 0.5)][..]),
+            ("e2ea8",  &[("e2ea7", 0.5)][..]),
+            ("e2ea9",  &[("e2ea10", 0.5)][..]),
+            ("e2ea10", &[("e2ea9", 0.5)][..]),
+        ]);
+
+        let cfg = crate::config::GraphConfig {
+            semantic_threshold: 0.85,
+            semantic_top_k: 5,
+            ..Default::default()
+        };
+        let req = ExtractRelationsRequest {
+            temporal: true,
+            semantic: true,
+            citations: true,
+            causal: false,
+        };
+        let report = extract_relations(&store, &mock, &cfg, "e2e-s1", req).await.expect("extract");
+
+        // Temporal: 3 PRECEDES edges, one per entity_overlap pair (all pairs have
+        // distinct created_at: e.g. day 1 < day 2)
+        assert_eq!(report.temporal_edges, 3, "expected 3 temporal edges from 3 overlap pairs");
+
+        // Semantic: e2ea2-e2ea3 pair. Two calls attempted (a2->a3, a3->a2 ordered
+        // lex by from < to so both write the same edge). UNIQUE index dedups to 1.
+        // The returned count is the number of CALLS, which is 2.
+        assert!(report.semantic_edges >= 1, "at least one semantic edge create attempted");
+
+        // Citations: a5 -> a3 (one explicit markdown link)
+        assert_eq!(report.citation_edges, 1);
+
+        // Causal disabled.
+        assert_eq!(report.causal_edges, 0);
+
+        // Verify per-edge-type counts via Store::count_edges_by_type
+        let counts = store.count_edges_by_type("e2e-s1").await.expect("counts");
+        assert_eq!(counts.entity_overlap, 3, "seeded entity_overlap edges unchanged");
+        assert_eq!(counts.precedes, 3);
+        assert_eq!(counts.semantically_related, 1, "one unique semantic edge after dedup");
+        assert_eq!(counts.caused_by, 0);
+        assert_eq!(counts.references_edge, 1);
+    }
 }
