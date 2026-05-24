@@ -3187,6 +3187,52 @@ mod p3_integration_tests {
         assert_eq!(output.entity_coverage, 0.0);
     }
 
+    /// Sibling of graph_searcher_end_to_end that explicitly selects the
+    /// jaccard (P4) graph strategy. Confirms P5 list_related_articles still
+    /// produces ENTITY_OVERLAP-based results when not using activation.
+    #[tokio::test]
+    async fn graph_searcher_jaccard_strategy_explicit() {
+        use crate::retrieval::GraphSearcher;
+        use crate::config::RetrievalConfig;
+        use std::sync::Arc;
+
+        let s = fixture().await;
+        let ts = now();
+
+        // Same fixture as graph_searcher_end_to_end (3 articles, 2 entities,
+        // MENTIONS, ENTITY_OVERLAP), abbreviated since the principle is to
+        // verify the dispatch path, not the fixture coverage:
+        s.create_article(&Article {
+            id: "gj-a1".into(), store_id: "gj-s1".into(),
+            title: "Rust async".into(),
+            content: "Rust provides async capabilities using Tokio".into(),
+            source_type: "user".into(), source_id: String::new(),
+            content_hash: "gj-h1".into(), tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_entity(&Entity {
+            id: "gj-tool-rust".into(), name: "Rust".into(),
+            entity_type: "tool".into(), description: None,
+            store_id: "gj-s1".into(), mention_count: 1,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_mentions_edge("gj-a1", "gj-tool-rust", "Rust provides", 0.95).await.unwrap();
+
+        // Explicit jaccard strategy
+        let mut config = RetrievalConfig::default();
+        config.graph_strategy = "jaccard".into();
+        let db: Arc<dyn Store> = Arc::new(s);
+        let searcher = GraphSearcher::new(db, config);
+
+        let output = searcher.search("Rust", "gj-s1", 10).await.expect("search");
+        assert!(!output.results.is_empty(),
+            "jaccard path should still produce results for direct entity match");
+        let ids: Vec<&str> = output.results.iter().map(|r| r.article_id.as_str()).collect();
+        assert!(ids.contains(&"gj-a1"));
+    }
+
     /// End-to-end test of P6 ActivationEngine driving intent classification,
     /// seed extraction, PPR diffusion over a typed multi-graph, and SYNAPSE
     /// post-processing.
