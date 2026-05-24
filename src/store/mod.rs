@@ -203,6 +203,10 @@ pub trait Store: Send + Sync {
         article_id: &str,
         filter: &crate::config::EdgeTypeFilter,
     ) -> Result<Vec<(String, String, f64)>>;
+
+    /// Returns per-edge-type counts for a store. Used by P5 `graph stats`
+    /// CLI to surface multi-graph coverage.
+    async fn count_edges_by_type(&self, store_id: &str) -> Result<EdgeCounts>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -1642,6 +1646,24 @@ impl Store for SurrealStore {
         }
 
         Ok(results)
+    }
+
+    async fn count_edges_by_type(&self, store_id: &str) -> Result<EdgeCounts> {
+        async fn count_one(db: &surrealdb::Surreal<surrealdb::engine::any::Any>, table: &str, sid: &str) -> Result<i64> {
+            let q = format!("SELECT count() AS n FROM {} WHERE store_id = $sid GROUP ALL", table);
+            let mut resp = db.query(&q).bind(("sid", sid.to_string())).await?;
+            #[derive(serde::Deserialize)] struct C { n: i64 }
+            let rows: Vec<C> = resp.take(0).unwrap_or_default();
+            Ok(rows.first().map(|c| c.n).unwrap_or(0))
+        }
+
+        Ok(EdgeCounts {
+            entity_overlap:       count_one(self.db(), "entity_overlap", store_id).await?,
+            semantically_related: count_one(self.db(), "semantically_related", store_id).await?,
+            precedes:             count_one(self.db(), "precedes", store_id).await?,
+            caused_by:            count_one(self.db(), "caused_by", store_id).await?,
+            references_edge:      count_one(self.db(), "references_edge", store_id).await?,
+        })
     }
 }
 

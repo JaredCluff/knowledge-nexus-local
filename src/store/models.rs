@@ -248,6 +248,17 @@ pub struct ReferencesEdgeRow {
     pub created_at: String,
 }
 
+/// Per-edge-type row counts for a store. Returned by `Store::count_edges_by_type`.
+/// Used by `graph stats` to surface multi-graph coverage at a glance.
+#[derive(Debug, Clone, Default)]
+pub struct EdgeCounts {
+    pub entity_overlap: i64,
+    pub semantically_related: i64,
+    pub precedes: i64,
+    pub caused_by: i64,
+    pub references_edge: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

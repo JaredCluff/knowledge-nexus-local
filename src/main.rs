@@ -166,6 +166,33 @@ enum Commands {
         limit: Option<usize>,
     },
 
+    /// Run P5 multi-graph backfill: temporal, semantic, citation, causal
+    ExtractRelations {
+        /// Knowledge store id (uses default store if omitted)
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Backfill temporal PRECEDES edges (deterministic, free)
+        #[arg(long)]
+        temporal: bool,
+
+        /// Backfill SEMANTICALLY_RELATED edges via LanceDB ANN
+        #[arg(long)]
+        semantic: bool,
+
+        /// Backfill REFERENCES_EDGE from markdown citations
+        #[arg(long)]
+        citations: bool,
+
+        /// Backfill CAUSED_BY edges via local LLM (requires [graph].causal_enabled = true)
+        #[arg(long)]
+        causal: bool,
+
+        /// Run all four backfill paths
+        #[arg(long)]
+        all: bool,
+    },
+
     /// Migrate a 0.8 SQLite database into 1.0.0 SurrealDB format.
     Migrate {
         /// Source database format. Only `sqlite` is supported.
@@ -393,6 +420,9 @@ fn main() -> Result<()> {
             }
             Commands::ExtractEntities { store, limit } => {
                 cmd_extract_entities(&store, limit).await?;
+            }
+            Commands::ExtractRelations { store, temporal, semantic, citations, causal, all } => {
+                cmd_extract_relations(store.as_deref(), temporal, semantic, citations, causal, all).await?;
             }
             Commands::Graph { action } => {
                 match action {
@@ -1524,6 +1554,49 @@ async fn cmd_graph_article(article_id: &str) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_extract_relations(
+    store_filter: Option<&str>,
+    temporal: bool,
+    semantic: bool,
+    citations: bool,
+    causal: bool,
+    all: bool,
+) -> Result<()> {
+    use knowledge::relation_extractor::{extract_relations, ExtractRelationsRequest};
+
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
+
+    // Build VectorDB (needed for semantic backfill)
+    let registry = vectordb::quantizer::QuantizerRegistry::new();
+    let owner = db.get_owner_user().await?
+        .ok_or_else(|| anyhow::anyhow!("No owner user found. Run `init` first."))?;
+    let stores = db.list_stores_for_user(&owner.id).await?;
+    let default_store = stores.first()
+        .ok_or_else(|| anyhow::anyhow!("No knowledge stores found"))?;
+    let quantizer = registry.resolve(&default_store.quantizer_version)?;
+    let vdb = vectordb::VectorDB::open(quantizer).await?;
+
+    let req = ExtractRelationsRequest {
+        temporal: temporal || all,
+        semantic: semantic || all,
+        citations: citations || all,
+        causal: causal || all,
+    };
+
+    info!("Running P5 backfill on store {}: {:?}", store_id, req);
+    let report = extract_relations(&*db, &vdb, &cfg.graph, &store_id, req).await?;
+
+    println!("P5 backfill complete:");
+    println!("  temporal:  {} edges", report.temporal_edges);
+    println!("  semantic:  {} edges", report.semantic_edges);
+    println!("  citations: {} edges", report.citation_edges);
+    println!("  causal:    {} edges", report.causal_edges);
+
+    Ok(())
+}
+
 async fn cmd_graph_stats(store_filter: Option<&str>) -> Result<()> {
     let cfg = config::load_config().await?;
     let db = open_store_or_bail(&cfg).await?;
@@ -1558,6 +1631,16 @@ async fn cmd_graph_stats(store_filter: Option<&str>) -> Result<()> {
         let avg = total_entities as f64 / with_mentions as f64;
         println!("  Avg entities per article: {:.1}", avg);
     }
+
+    // P5 per-edge-type counts
+    let edge_counts = db.count_edges_by_type(&store_id).await?;
+    println!();
+    println!("Graph edges:");
+    println!("  entity_overlap:       {}", edge_counts.entity_overlap);
+    println!("  semantically_related: {}", edge_counts.semantically_related);
+    println!("  precedes:             {}", edge_counts.precedes);
+    println!("  caused_by:            {}", edge_counts.caused_by);
+    println!("  references_edge:      {}", edge_counts.references_edge);
 
     Ok(())
 }
