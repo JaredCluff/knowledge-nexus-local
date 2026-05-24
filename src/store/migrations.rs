@@ -56,6 +56,19 @@ pub async fn run_migrations(db: &Surreal<Any>) -> Result<()> {
         migrate_related_to_to_entity_overlap(db).await?;
     }
 
+    // P8 migration: backfill last_accessed_at = created_at on existing
+    // articles + events (DEFAULT "" doesn't reflect that creation was the
+    // initial access). Other P8 fields are correctly defaulted by the DDL.
+    if current_version.starts_with("1.0.0-p1")
+        || current_version.starts_with("1.0.0-p2")
+        || current_version.starts_with("1.0.0-p3")
+        || current_version.starts_with("1.0.0-p5")
+        || current_version.starts_with("1.0.0-p7")
+    {
+        tracing::info!("P8 migration: backfilling last_accessed_at from created_at");
+        migrate_backfill_last_accessed_at(db).await?;
+    }
+
     // Record current schema version
     let applied_at = chrono::Utc::now().to_rfc3339();
     db.query(
@@ -154,6 +167,34 @@ async fn migrate_tags_to_edges(db: &Surreal<Any>) -> Result<()> {
         "P3 tag migration complete: {} tags upserted, {} TAGGED edges created",
         tag_count, edge_count
     );
+    Ok(())
+}
+
+/// P8 migration: for articles + events where last_accessed_at is empty,
+/// set it to the created_at value. Treats creation as the initial access
+/// so freshly-migrated articles aren't immediately demoted by decay.
+async fn migrate_backfill_last_accessed_at(db: &Surreal<Any>) -> Result<()> {
+    // Articles
+    let res = db
+        .query(
+            "UPDATE article SET last_accessed_at = created_at
+             WHERE last_accessed_at = '' OR last_accessed_at IS NONE"
+        )
+        .await
+        .context("P8 migration: backfill article.last_accessed_at")?;
+    let _ = res.check();
+
+    // Events
+    let res = db
+        .query(
+            "UPDATE event SET last_accessed_at = created_at
+             WHERE last_accessed_at = '' OR last_accessed_at IS NONE"
+        )
+        .await
+        .context("P8 migration: backfill event.last_accessed_at")?;
+    let _ = res.check();
+
+    tracing::info!("P8 migration: backfill complete");
     Ok(())
 }
 
@@ -407,6 +448,82 @@ mod tests {
         let cnts: Vec<Cnt> = resp.take(0).unwrap_or_default();
         assert_eq!(cnts.first().map(|c| c.n).unwrap_or(0), 0,
             "event table should remain empty on second run");
+    }
+
+    /// Helper: Seeds a p7-state DB with one article that has empty last_accessed_at.
+    async fn setup_p7_corpus() -> Surreal<Any> {
+        let db = connect("memory").await.expect("connect mem");
+        db.use_ns("test").use_db("test").await.expect("use ns/db");
+        db.query(schema::ddl()).await.expect("ddl").check().expect("ddl check");
+
+        // Set version to p7
+        db.query(
+            "UPSERT type::thing('_schema_version', 'current') CONTENT { version: $v, applied_at: $t }"
+        )
+        .bind(("v", "1.0.0-p7"))
+        .bind(("t", "2026-05-24T00:00:00Z"))
+        .await.expect("seed p7 version").check().expect("seed p7 check");
+
+        // Article with empty last_accessed_at (P7-state — field exists via DDL but unset)
+        db.query(r#"
+            CREATE article:p8m_a1 CONTENT { store_id: "p8m-s1", title: "T", content: "C",
+                source_type: "user", source_id: "", content_hash: "p8m-h", tags: [],
+                created_at: "2026-05-20T00:00:00Z", updated_at: "2026-05-20T00:00:00Z",
+                reflects: [],
+                access_count: 0, last_accessed_at: "", importance_score: 0.5,
+                tier: "hot", pinned: false, compacted_into: NONE
+            };
+        "#).await.expect("seed article").check().expect("seed article check");
+
+        db
+    }
+
+    #[tokio::test]
+    async fn migration_p7_to_p8_backfills_last_accessed_at() {
+        let db = setup_p7_corpus().await;
+        run_migrations(&db).await.expect("run migrations");
+
+        // last_accessed_at should now equal created_at
+        let mut resp = db
+            .query("SELECT last_accessed_at, created_at FROM article WHERE id = type::thing('article', 'p8m_a1')")
+            .await.expect("query").check().expect("check");
+        #[derive(serde::Deserialize)]
+        struct Row { last_accessed_at: String, created_at: String }
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_accessed_at, rows[0].created_at);
+        assert_eq!(rows[0].last_accessed_at, "2026-05-20T00:00:00Z");
+
+        // Schema version is p8
+        let mut resp = db.query(
+            "SELECT version FROM _schema_version WHERE id = type::thing('_schema_version', 'current')"
+        ).await.expect("version").check().expect("check");
+        #[derive(serde::Deserialize)] struct V { version: String }
+        let vs: Vec<V> = resp.take(0).unwrap_or_default();
+        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p8"));
+    }
+
+    #[tokio::test]
+    async fn migration_p8_to_p8_is_noop() {
+        let db = setup_p7_corpus().await;
+        run_migrations(&db).await.expect("first run (p7 → p8)");
+
+        // Modify the article to test that re-running doesn't clobber
+        let _ = db.query(
+            "UPDATE article SET last_accessed_at = '2026-06-01T00:00:00Z'
+             WHERE id = type::thing('article', 'p8m_a1')"
+        ).await.unwrap().check();
+
+        // Second migration run should not touch last_accessed_at (it's not empty)
+        run_migrations(&db).await.expect("second run idempotent");
+
+        let mut resp = db
+            .query("SELECT last_accessed_at FROM article WHERE id = type::thing('article', 'p8m_a1')")
+            .await.unwrap().check().unwrap();
+        #[derive(serde::Deserialize)] struct Row { last_accessed_at: String }
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        assert_eq!(rows[0].last_accessed_at, "2026-06-01T00:00:00Z",
+            "second migration must not clobber existing non-empty last_accessed_at");
     }
 }
 
