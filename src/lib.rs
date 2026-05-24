@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod embeddings;
+pub mod maintenance;
 /// Partial k2k re-export for lib-visible retrieval module.
 /// The full k2k module (server, handlers, etc.) lives in main.rs because it
 /// transitively depends on bin-only modules (connectors, federation, ...).

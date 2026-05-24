@@ -243,6 +243,32 @@ pub trait Store: Send + Sync {
     /// Returns articles where `reflects` array contains this article_id.
     /// Use case: drill-down — "show me what was synthesized from this article."
     async fn list_reflections_for_article(&self, article_id: &str) -> Result<Vec<Article>>;
+
+    // P7 maintenance bookkeeping
+
+    /// Was the given idempotency key used to start (any status) a maintenance
+    /// run since `cutoff_rfc3339`? Used by MaintenanceScheduler to dedup.
+    async fn recent_maintenance_run_by_key(
+        &self,
+        key: &str,
+        cutoff_rfc3339: &str,
+    ) -> Result<bool>;
+
+    /// Record the start of a maintenance run.
+    async fn record_maintenance_run(
+        &self,
+        job_name: &str,
+        idempotency_key: &str,
+        started_at: &str,
+    ) -> Result<()>;
+
+    /// Mark a maintenance run as completed (success or failure).
+    async fn complete_maintenance_run(
+        &self,
+        idempotency_key: &str,
+        completed_at: &str,
+        status: &str,
+    ) -> Result<()>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -1994,6 +2020,89 @@ impl Store for SurrealStore {
             .context("list_reflections_for_article")?;
         let articles: Vec<Article> = resp.take(0).unwrap_or_default();
         Ok(articles)
+    }
+
+    // P7 maintenance bookkeeping
+
+    async fn recent_maintenance_run_by_key(
+        &self,
+        key: &str,
+        cutoff_rfc3339: &str,
+    ) -> Result<bool> {
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT count() AS n FROM _maintenance_runs
+                 WHERE idempotency_key = $key AND started_at > $cutoff
+                 GROUP ALL",
+            )
+            .bind(("key", key.to_string()))
+            .bind(("cutoff", cutoff_rfc3339.to_string()))
+            .await
+            .context("recent_maintenance_run_by_key")?;
+        #[derive(serde::Deserialize)]
+        struct Cnt {
+            n: i64,
+        }
+        let rows: Vec<Cnt> = resp.take(0).unwrap_or_default();
+        Ok(rows.first().map(|c| c.n > 0).unwrap_or(false))
+    }
+
+    async fn record_maintenance_run(
+        &self,
+        job_name: &str,
+        idempotency_key: &str,
+        started_at: &str,
+    ) -> Result<()> {
+        // The UNIQUE constraint on idempotency_key prevents duplicate inserts;
+        // swallow conflicts so concurrent invocations don't error.
+        let res = self
+            .db()
+            .query(
+                "CREATE _maintenance_runs CONTENT {
+                    job_name: $job_name,
+                    idempotency_key: $key,
+                    started_at: $started_at,
+                    completed_at: NONE,
+                    status: 'running'
+                 }",
+            )
+            .bind(("job_name", job_name.to_string()))
+            .bind(("key", idempotency_key.to_string()))
+            .bind(("started_at", started_at.to_string()))
+            .await;
+        match res {
+            Ok(r) => {
+                let _ = r.check();
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        }
+    }
+
+    async fn complete_maintenance_run(
+        &self,
+        idempotency_key: &str,
+        completed_at: &str,
+        status: &str,
+    ) -> Result<()> {
+        let res = self
+            .db()
+            .query(
+                "UPDATE _maintenance_runs SET completed_at = $completed_at, status = $status
+                 WHERE idempotency_key = $key",
+            )
+            .bind(("key", idempotency_key.to_string()))
+            .bind(("completed_at", completed_at.to_string()))
+            .bind(("status", status.to_string()))
+            .await;
+        match res {
+            Ok(r) => {
+                let _ = r.check();
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        }
     }
 }
 

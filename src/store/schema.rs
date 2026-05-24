@@ -277,5 +277,16 @@ DEFINE FIELD IF NOT EXISTS confidence ON part_of TYPE float;
 DEFINE FIELD IF NOT EXISTS extraction_method ON part_of TYPE string DEFAULT "llm";
 DEFINE FIELD IF NOT EXISTS created_at ON part_of TYPE string;
 DEFINE INDEX IF NOT EXISTS part_of_unique ON part_of FIELDS in, out UNIQUE;
+
+-- P7 maintenance runs tracking
+DEFINE TABLE IF NOT EXISTS _maintenance_runs SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS job_name ON _maintenance_runs TYPE string;
+DEFINE FIELD IF NOT EXISTS idempotency_key ON _maintenance_runs TYPE string;
+DEFINE FIELD IF NOT EXISTS started_at ON _maintenance_runs TYPE string;
+DEFINE FIELD IF NOT EXISTS completed_at ON _maintenance_runs TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS status ON _maintenance_runs TYPE string DEFAULT "running";
+DEFINE INDEX IF NOT EXISTS _maintenance_runs_key_idx
+    ON _maintenance_runs FIELDS idempotency_key UNIQUE;
+DEFINE INDEX IF NOT EXISTS _maintenance_runs_job_idx ON _maintenance_runs FIELDS job_name;
 "#
 }
