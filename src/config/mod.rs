@@ -304,9 +304,14 @@ pub struct RetrievalConfig {
     #[serde(default = "default_graph_weight_max")]
     pub graph_weight_max: f32,
 
-    /// Max hops for RELATED_TO traversal (1 = direct neighbors only)
+    /// Max hops for entity_overlap traversal (1 = direct neighbors only)
     #[serde(default = "default_graph_hops")]
     pub graph_hops: usize,
+
+    /// Which edge types graph traversal should follow. P6 spreading activation
+    /// uses richer filters; P4/P5 default is entity_overlap only.
+    #[serde(default)]
+    pub edge_types: EdgeTypeFilter,
 }
 
 fn default_rrf_k() -> f32 {
@@ -333,6 +338,7 @@ impl Default for RetrievalConfig {
             keyword_weight: default_keyword_weight(),
             graph_weight_max: default_graph_weight_max(),
             graph_hops: default_graph_hops(),
+            edge_types: EdgeTypeFilter::default(),
         }
     }
 }
@@ -379,6 +385,34 @@ impl Default for GraphConfig {
             causal_enabled: false,
             causal_model: default_causal_model(),
             causal_confidence_threshold: default_causal_confidence_threshold(),
+        }
+    }
+}
+
+/// Which edge types graph traversal should follow. Defaults preserve P4
+/// behavior (entity_overlap only). P6 spreading activation uses richer filters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeTypeFilter {
+    #[serde(default = "default_true")]
+    pub entity_overlap: bool,
+    #[serde(default)]
+    pub semantically_related: bool,
+    #[serde(default)]
+    pub precedes: bool,
+    #[serde(default)]
+    pub caused_by: bool,
+    #[serde(default)]
+    pub references: bool,
+}
+
+impl Default for EdgeTypeFilter {
+    fn default() -> Self {
+        Self {
+            entity_overlap: true,
+            semantically_related: false,
+            precedes: false,
+            caused_by: false,
+            references: false,
         }
     }
 }
