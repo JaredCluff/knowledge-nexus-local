@@ -279,6 +279,7 @@ pub struct Event {
 
 /// CONTAINS_EVIDENCE edge: event → article (evidence the event happened).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ContainsEvidenceEdge {
     pub from_event_id: String,
     pub to_article_id: String,
@@ -289,6 +290,7 @@ pub struct ContainsEvidenceEdge {
 /// MOTIVATES edge: event → event (one event motivated another).
 /// CompassMem relation taxonomy. LLM-extracted only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct MotivatesEdge {
     pub from_event_id: String,
     pub to_event_id: String,
@@ -301,6 +303,7 @@ pub struct MotivatesEdge {
 /// PART_OF edge: child event → parent event (hierarchical composition).
 /// CompassMem relation taxonomy. LLM-extracted only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct PartOfEdge {
     pub from_event_id: String,
     pub to_parent_event_id: String,

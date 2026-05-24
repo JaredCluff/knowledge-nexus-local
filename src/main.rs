@@ -1830,7 +1830,7 @@ async fn cmd_segment_events(
     // Pull articles for the store, optionally filtered by since
     let articles = db.list_articles_for_store(&store_id).await?;
     let filtered: Vec<_> = articles.into_iter()
-        .filter(|a| since.map_or(true, |s| a.created_at.as_str() >= s))
+        .filter(|a| since.is_none_or(|s| a.created_at.as_str() >= s))
         .collect();
 
     if filtered.is_empty() {
@@ -1899,8 +1899,8 @@ async fn cmd_event_list(
 
     let events = db.list_events_for_store(&store_id).await?;
     let filtered: Vec<_> = events.into_iter()
-        .filter(|e| since.map_or(true, |s| e.started_at.as_str() >= s))
-        .filter(|e| until.map_or(true, |u| e.ended_at.as_str() <= u))
+        .filter(|e| since.is_none_or(|s| e.started_at.as_str() >= s))
+        .filter(|e| until.is_none_or(|u| e.ended_at.as_str() <= u))
         .take(limit)
         .collect();
 

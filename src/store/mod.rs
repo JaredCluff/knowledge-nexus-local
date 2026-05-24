@@ -248,6 +248,7 @@ pub trait Store: Send + Sync {
 
     /// Was the given idempotency key used to start (any status) a maintenance
     /// run since `cutoff_rfc3339`? Used by MaintenanceScheduler to dedup.
+    #[allow(dead_code)]
     async fn recent_maintenance_run_by_key(
         &self,
         key: &str,
@@ -255,6 +256,7 @@ pub trait Store: Send + Sync {
     ) -> Result<bool>;
 
     /// Record the start of a maintenance run.
+    #[allow(dead_code)]
     async fn record_maintenance_run(
         &self,
         job_name: &str,
@@ -263,6 +265,7 @@ pub trait Store: Send + Sync {
     ) -> Result<()>;
 
     /// Mark a maintenance run as completed (success or failure).
+    #[allow(dead_code)]
     async fn complete_maintenance_run(
         &self,
         idempotency_key: &str,

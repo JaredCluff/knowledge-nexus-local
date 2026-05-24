@@ -9,7 +9,7 @@
 //! consecutive articles share fewer than N entities (topic shift) OR
 //! when there's a long gap between created_at timestamps (silence).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
