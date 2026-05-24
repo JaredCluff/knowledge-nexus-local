@@ -558,7 +558,13 @@ impl Store for SurrealStore {
                     source_type: $source_type, source_id: $source_id,
                     content_hash: $content_hash, tags: $tags,
                     embedded_at: $embedded_at, created_at: $created_at,
-                    updated_at: $updated_at, reflects: $reflects
+                    updated_at: $updated_at, reflects: $reflects,
+                    access_count: $access_count,
+                    last_accessed_at: $last_accessed_at,
+                    importance_score: $importance_score,
+                    tier: $tier,
+                    pinned: $pinned,
+                    compacted_into: $compacted_into
                 }",
             )
             .bind(("id", a.id.clone()))
@@ -573,6 +579,17 @@ impl Store for SurrealStore {
             .bind(("created_at", a.created_at.clone()))
             .bind(("updated_at", a.updated_at.clone()))
             .bind(("reflects", a.reflects.clone()))
+            .bind(("access_count", a.access_count))
+            .bind(("last_accessed_at", a.last_accessed_at.clone()))
+            .bind(("importance_score", a.importance_score))
+            .bind(("tier", match a.tier {
+                Tier::Hot => "hot",
+                Tier::Warm => "warm",
+                Tier::Cold => "cold",
+                Tier::Archive => "archive",
+            }))
+            .bind(("pinned", a.pinned))
+            .bind(("compacted_into", a.compacted_into.clone()))
             .await?
             .check()?;
         Ok(())
@@ -596,7 +613,13 @@ impl Store for SurrealStore {
                     source_type: $source_type, source_id: $source_id,
                     content_hash: $content_hash, tags: $tags,
                     embedded_at: $embedded_at, updated_at: $updated_at,
-                    reflects: $reflects
+                    reflects: $reflects,
+                    access_count: $access_count,
+                    last_accessed_at: $last_accessed_at,
+                    importance_score: $importance_score,
+                    tier: $tier,
+                    pinned: $pinned,
+                    compacted_into: $compacted_into
                 }",
             )
             .bind(("id", a.id.clone()))
@@ -609,6 +632,17 @@ impl Store for SurrealStore {
             .bind(("embedded_at", a.embedded_at.clone()))
             .bind(("updated_at", a.updated_at.clone()))
             .bind(("reflects", a.reflects.clone()))
+            .bind(("access_count", a.access_count))
+            .bind(("last_accessed_at", a.last_accessed_at.clone()))
+            .bind(("importance_score", a.importance_score))
+            .bind(("tier", match a.tier {
+                Tier::Hot => "hot",
+                Tier::Warm => "warm",
+                Tier::Cold => "cold",
+                Tier::Archive => "archive",
+            }))
+            .bind(("pinned", a.pinned))
+            .bind(("compacted_into", a.compacted_into.clone()))
             .await?
             .check()?;
         Ok(())
@@ -1868,7 +1902,13 @@ impl Store for SurrealStore {
                     confidence: $confidence,
                     extraction_method: $method,
                     created_at: $created_at,
-                    updated_at: $updated_at
+                    updated_at: $updated_at,
+                    access_count: $access_count,
+                    last_accessed_at: $last_accessed_at,
+                    importance_score: $importance_score,
+                    tier: $tier,
+                    pinned: $pinned,
+                    compacted_into: $compacted_into
                  }"
             )
             .bind(("id", event.id.clone()))
@@ -1883,6 +1923,17 @@ impl Store for SurrealStore {
             .bind(("method", method_str))
             .bind(("created_at", event.created_at.clone()))
             .bind(("updated_at", event.updated_at.clone()))
+            .bind(("access_count", event.access_count))
+            .bind(("last_accessed_at", event.last_accessed_at.clone()))
+            .bind(("importance_score", event.importance_score))
+            .bind(("tier", match event.tier {
+                Tier::Hot => "hot",
+                Tier::Warm => "warm",
+                Tier::Cold => "cold",
+                Tier::Archive => "archive",
+            }))
+            .bind(("pinned", event.pinned))
+            .bind(("compacted_into", event.compacted_into.clone()))
             .await
             .context("create_event")?;
         let _ = res;
@@ -1894,7 +1945,9 @@ impl Store for SurrealStore {
             .query(
                 "SELECT meta::id(id) AS id, store_id, title, summary, started_at, ended_at,
                         participants, source_type, confidence, extraction_method,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        access_count, last_accessed_at, importance_score,
+                        tier, pinned, compacted_into
                  FROM event
                  WHERE id = type::thing('event', $id)"
             )
@@ -1910,7 +1963,9 @@ impl Store for SurrealStore {
             .query(
                 "SELECT meta::id(id) AS id, store_id, title, summary, started_at, ended_at,
                         participants, source_type, confidence, extraction_method,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        access_count, last_accessed_at, importance_score,
+                        tier, pinned, compacted_into
                  FROM event
                  WHERE store_id = $sid
                  ORDER BY started_at"
@@ -2005,7 +2060,9 @@ impl Store for SurrealStore {
             .query(
                 "SELECT meta::id(id) AS id, store_id, title, summary, started_at, ended_at,
                         participants, source_type, confidence, extraction_method,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        access_count, last_accessed_at, importance_score,
+                        tier, pinned, compacted_into
                  FROM event
                  WHERE id IN (
                     SELECT VALUE in FROM contains_evidence
@@ -2254,6 +2311,12 @@ mod article_tests {
             tags: serde_json::json!(["test"]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         };
         s.create_article(&article).await.unwrap();
 
@@ -2454,6 +2517,12 @@ mod fts_tests {
                 embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
                 reflects: vec![],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -2682,6 +2751,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "lafe-a2".into(), store_id: "s1".into(), title: "Tokio Deep Dive".into(),
@@ -2690,6 +2765,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_entity(&Entity {
@@ -2776,6 +2857,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "co-art2".into(), store_id: "co-s1".into(), title: "More Rust".into(),
@@ -2784,6 +2871,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Entity IDs that don't contain colons, to avoid any SurrealDB ID-parsing ambiguity.
@@ -2824,6 +2917,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5pre-a2".into(), store_id: "p5pre-s1".into(), title: "B".into(), content: "y".into(),
@@ -2831,6 +2930,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_precedes_edge(
@@ -2854,6 +2959,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5sem-a2".into(), store_id: "p5sem-s1".into(), title: "B".into(), content: "".into(),
@@ -2861,6 +2972,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_semantically_related_edge("p5sem-s1", "p5sem-a1", "p5sem-a2", 0.91).await.expect("first");
@@ -2882,6 +2999,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5cb-a2".into(), store_id: "p5cb-s1".into(), title: "B".into(), content: "".into(),
@@ -2889,6 +3012,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_caused_by_edge(
@@ -2911,6 +3040,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5ref-a2".into(), store_id: "p5ref-s1".into(), title: "B".into(), content: "".into(),
@@ -2918,6 +3053,12 @@ mod entity_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_references_edge(
@@ -3013,6 +3154,12 @@ mod entity_tests {
             confidence: 0.9,
             extraction_method: ExtractionMethod::UserAsserted,
             created_at: ts.clone(), updated_at: ts.clone(),
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         };
         s.create_event(&event).await.unwrap();
 
@@ -3049,6 +3196,12 @@ mod entity_tests {
                 confidence: 1.0,
                 extraction_method: ExtractionMethod::UserAsserted,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3073,6 +3226,12 @@ mod entity_tests {
             confidence: 1.0,
             extraction_method: ExtractionMethod::UserAsserted,
             created_at: ts.clone(), updated_at: ts.clone(),
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_article(&Article {
@@ -3082,6 +3241,12 @@ mod entity_tests {
             content_hash: "ce-h".into(), tags: serde_json::json!([]),
             embedded_at: None, created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_contains_evidence_edge("ce_ev1", "ce_a1", 0.85).await.unwrap();
@@ -3107,6 +3272,12 @@ mod entity_tests {
                 confidence: 1.0,
                 extraction_method: ExtractionMethod::UserAsserted,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3137,6 +3308,12 @@ mod entity_tests {
                 confidence: 1.0,
                 extraction_method: ExtractionMethod::UserAsserted,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3170,6 +3347,12 @@ mod entity_tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             reflects: vec!["p7r-a1".into(), "p7r-a2".into()],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         let got = s.get_article("p7r-refl").await.unwrap().expect("reflection exists");
@@ -3196,6 +3379,12 @@ mod entity_tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Two reflections pointing at the source
@@ -3213,6 +3402,12 @@ mod entity_tests {
                 created_at: ts.clone(),
                 updated_at: ts.clone(),
                 reflects: vec!["lrfa-src".into()],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3230,6 +3425,12 @@ mod entity_tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             reflects: vec!["other-id".into()],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         let reflections = s.list_reflections_for_article("lrfa-src").await.unwrap();
@@ -3366,6 +3567,12 @@ mod graph_edge_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "a2".into(), store_id: "s1".into(), title: "Async Rust".into(),
@@ -3374,6 +3581,12 @@ mod graph_edge_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_entity(&Entity {
             id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
@@ -3486,6 +3699,12 @@ mod p3_integration_tests {
                 tags: serde_json::json!([]), embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
                 reflects: vec![],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -3548,6 +3767,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Simulate dedup detection
@@ -3606,6 +3831,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_tagged_edge("a1", "rust").await.unwrap();
 
@@ -3629,6 +3860,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "a2".into(), store_id: "s1".into(), title: "No mentions".into(),
@@ -3637,6 +3874,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.upsert_entity(&Entity {
@@ -3666,6 +3909,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "tgsi-a2".into(), store_id: "s1".into(), title: "Go Concurrency".into(),
@@ -3674,6 +3923,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "tgsi-a3".into(), store_id: "s1".into(), title: "Tokio Internals".into(),
@@ -3682,6 +3937,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Create entities
@@ -3767,6 +4028,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "gse-a2".into(), store_id: "s1".into(),
@@ -3776,6 +4043,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
         s.create_article(&Article {
             id: "gse-a3".into(), store_id: "s1".into(),
@@ -3785,6 +4058,12 @@ mod p3_integration_tests {
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Create entities
@@ -3871,6 +4150,12 @@ mod p3_integration_tests {
             embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         s.create_entity(&Entity {
@@ -3926,6 +4211,12 @@ mod p3_integration_tests {
                 embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
                 reflects: vec![],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -4020,6 +4311,12 @@ mod p3_integration_tests {
             embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         let db: Arc<dyn Store> = Arc::new(s);
@@ -4067,6 +4364,12 @@ mod p3_integration_tests {
                 created_at: ts.clone(),
                 updated_at: ts.clone(),
                 reflects: vec![],
+                access_count: 0,
+                last_accessed_at: String::new(),
+                importance_score: 0.5,
+                tier: Tier::Hot,
+                pinned: false,
+                compacted_into: None,
             }).await.unwrap();
         }
 
@@ -4107,6 +4410,12 @@ mod p3_integration_tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             reflects: source_ids.clone(),
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         }).await.unwrap();
 
         // Verify the reflection round-trips its reflects field

@@ -56,6 +56,30 @@ pub struct Article {
     /// articles. Populated by P7 Reflector when a reflection is stored.
     #[serde(default)]
     pub reflects: Vec<String>,
+    /// Number of times this article was returned by a recall query (P8).
+    #[serde(default)]
+    pub access_count: i64,
+    /// RFC3339 of last access (P8). Empty string = never accessed.
+    #[serde(default)]
+    pub last_accessed_at: String,
+    /// Importance score in [0.0, 1.0]. Computed from entity-degree + manual
+    /// boosts. Default 0.5 for unpinned user articles (P8).
+    #[serde(default = "default_importance")]
+    pub importance_score: f64,
+    /// Current salience tier (P8).
+    #[serde(default)]
+    pub tier: Tier,
+    /// User-pinned items never tier-down or compact (P8).
+    #[serde(default)]
+    pub pinned: bool,
+    /// If this article was compacted into a reflection, this is the
+    /// reflection's article id. P8 compaction. Quarantine, never delete.
+    #[serde(default)]
+    pub compacted_into: Option<String>,
+}
+
+fn default_importance() -> f64 {
+    0.5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +200,41 @@ pub struct RelatedToEdge {
     pub updated_at: String,
 }
 
+/// Memory tier for salience-based retention (P8).
+/// Tier transitions are nightly; pinned items never tier down.
+/// Per SYNAPSE (arXiv 2601.02744) ablation: removing decay drops
+/// Temporal F1 from 50.1 → 14.2 — tier metadata is load-bearing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    Hot,
+    Warm,
+    Cold,
+    Archive,
+}
+
+impl Default for Tier {
+    fn default() -> Self {
+        Tier::Hot
+    }
+}
+
+/// Append-only audit log entry (P8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub id: String,
+    pub store_id: String,
+    /// One of: tier_change, pin, unpin, compact, hard_delete (admin only),
+    /// access_recorded (rate-limited), retrieval_event.
+    pub action: String,
+    /// "article" | "event" | "reflection"
+    pub subject_type: String,
+    pub subject_id: String,
+    /// Free-form details — e.g. {"from_tier": "hot", "to_tier": "warm"}
+    pub details: serde_json::Value,
+    pub recorded_at: String,
+}
+
 /// How an edge was derived. Stored as a lowercase string in SurrealDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -275,6 +334,26 @@ pub struct Event {
     pub extraction_method: ExtractionMethod,
     pub created_at: String,
     pub updated_at: String,
+    /// Number of times this event was returned by a recall query (P8).
+    #[serde(default)]
+    pub access_count: i64,
+    /// RFC3339 of last access (P8). Empty string = never accessed.
+    #[serde(default)]
+    pub last_accessed_at: String,
+    /// Importance score in [0.0, 1.0]. Computed from entity-degree + manual
+    /// boosts. Default 0.5 for unpinned user events (P8).
+    #[serde(default = "default_importance")]
+    pub importance_score: f64,
+    /// Current salience tier (P8).
+    #[serde(default)]
+    pub tier: Tier,
+    /// User-pinned items never tier-down or compact (P8).
+    #[serde(default)]
+    pub pinned: bool,
+    /// If this event was compacted into a reflection, this is the
+    /// reflection's article id. P8 compaction. Quarantine, never delete.
+    #[serde(default)]
+    pub compacted_into: Option<String>,
 }
 
 /// CONTAINS_EVIDENCE edge: event → article (evidence the event happened).
@@ -342,6 +421,12 @@ mod tests {
             created_at: "2026-04-15T00:00:00Z".into(),
             updated_at: "2026-04-15T00:00:00Z".into(),
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         let decoded: Article = serde_json::from_str(&json).unwrap();
@@ -522,6 +607,12 @@ mod tests {
             extraction_method: ExtractionMethod::Llm,
             created_at: "2026-05-24T00:00:00Z".into(),
             updated_at: "2026-05-24T00:00:00Z".into(),
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         let d: Event = serde_json::from_str(&json).unwrap();
@@ -570,5 +661,55 @@ mod tests {
         let json = serde_json::to_string(&edge).unwrap();
         let d: PartOfEdge = serde_json::from_str(&json).unwrap();
         assert_eq!(d.from_event_id, "sub_e1");
+    }
+
+    #[test]
+    fn test_tier_serde() {
+        let t = Tier::Warm;
+        let s = serde_json::to_string(&t).unwrap();
+        assert_eq!(s, "\"warm\"");
+        let back: Tier = serde_json::from_str("\"archive\"").unwrap();
+        assert_eq!(back, Tier::Archive);
+    }
+
+    #[test]
+    fn test_article_with_p8_fields_serde() {
+        let a = Article {
+            id: "a1".into(), store_id: "s1".into(),
+            title: "T".into(), content: "C".into(),
+            source_type: "user".into(), source_id: String::new(),
+            content_hash: "h".into(), tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: "2026-05-24T00:00:00Z".into(),
+            updated_at: "2026-05-24T00:00:00Z".into(),
+            reflects: vec![],
+            access_count: 5,
+            last_accessed_at: "2026-05-24T10:00:00Z".into(),
+            importance_score: 0.75,
+            tier: Tier::Warm,
+            pinned: false,
+            compacted_into: Some("refl-1".into()),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let d: Article = serde_json::from_str(&json).unwrap();
+        assert_eq!(d.tier, Tier::Warm);
+        assert_eq!(d.access_count, 5);
+        assert_eq!(d.compacted_into.as_deref(), Some("refl-1"));
+    }
+
+    #[test]
+    fn test_audit_log_entry_serde() {
+        let e = AuditLogEntry {
+            id: "al1".into(), store_id: "s1".into(),
+            action: "tier_change".into(),
+            subject_type: "article".into(),
+            subject_id: "a1".into(),
+            details: serde_json::json!({"from": "hot", "to": "warm"}),
+            recorded_at: "2026-05-24T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let d: AuditLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(d.action, "tier_change");
+        assert_eq!(d.details["from"], serde_json::Value::String("hot".into()));
     }
 }

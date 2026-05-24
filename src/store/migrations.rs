@@ -312,13 +312,13 @@ mod tests {
         let n = cnts.first().map(|c| c.n).unwrap_or(0);
         assert_eq!(n, 0, "related_to should be empty after migration");
 
-        // Schema version is now 1.0.0-p7
+        // Schema version is now 1.0.0-p8 (the current latest)
         let mut resp3 = db.query(
             "SELECT version FROM _schema_version WHERE id = type::thing('_schema_version', 'current')"
         ).await.expect("version").check().expect("check3");
         #[derive(serde::Deserialize)] struct V { version: String }
         let vs: Vec<V> = resp3.take(0).unwrap_or_default();
-        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p7"));
+        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p8"));
     }
 
     #[tokio::test]
@@ -383,14 +383,14 @@ mod tests {
         assert_eq!(cnts.first().map(|c| c.n).unwrap_or(0), 1,
             "existing article should be preserved");
 
-        // Verify: schema version is now P7
+        // Verify: schema version is now P8 (the current latest)
         let mut resp = db.query(
             "SELECT version FROM _schema_version WHERE id = type::thing('_schema_version', 'current')"
         ).await.expect("version").check().expect("check");
         #[derive(serde::Deserialize)] struct V { version: String }
         let vs: Vec<V> = resp.take(0).unwrap_or_default();
-        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p7"),
-            "schema version should be 1.0.0-p7");
+        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p8"),
+            "schema version should be 1.0.0-p8");
     }
 
     #[tokio::test]

@@ -102,6 +102,12 @@ impl WebClipReceiver {
             created_at: now.clone(),
             updated_at: now,
             reflects: vec![],
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: crate::store::Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         };
 
         self.article_service

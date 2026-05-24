@@ -1779,6 +1779,12 @@ async fn cmd_reflect(
                         created_at: now.clone(),
                         updated_at: now,
                         reflects: result.source_ids.clone(),
+                        access_count: 0,
+                        last_accessed_at: String::new(),
+                        importance_score: 0.5,
+                        tier: store::Tier::Hot,
+                        pinned: false,
+                        compacted_into: None,
                     };
 
                     db.create_article(&reflection_article).await
@@ -1866,6 +1872,12 @@ async fn cmd_segment_events(
             extraction_method: store::ExtractionMethod::Llm,
             created_at: now.clone(),
             updated_at: now.clone(),
+            access_count: 0,
+            last_accessed_at: String::new(),
+            importance_score: 0.5,
+            tier: store::Tier::Hot,
+            pinned: false,
+            compacted_into: None,
         };
 
         db.create_event(&event).await
