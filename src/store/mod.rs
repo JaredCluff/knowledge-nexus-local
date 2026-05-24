@@ -185,6 +185,10 @@ pub trait Store: Send + Sync {
     /// a given store. Used by P5 backfills that operate over the existing
     /// entity-overlap graph.
     async fn list_entity_overlap_pairs(&self, store_id: &str) -> Result<Vec<(String, String)>>;
+
+    /// Returns all article ids for the given store. Used by P5 backfills
+    /// that walk the article corpus.
+    async fn list_article_ids(&self, store_id: &str) -> Result<Vec<String>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -1531,6 +1535,17 @@ impl Store for SurrealStore {
         struct Row { from_id: String, to_id: String }
         let rows: Vec<Row> = resp.take(0).unwrap_or_default();
         Ok(rows.into_iter().map(|r| (r.from_id, r.to_id)).collect())
+    }
+
+    async fn list_article_ids(&self, store_id: &str) -> Result<Vec<String>> {
+        let mut resp = self.db()
+            .query("SELECT meta::id(id) AS id FROM article WHERE store_id = $sid")
+            .bind(("sid", store_id.to_string()))
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct Row { id: String }
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(|r| r.id).collect())
     }
 }
 

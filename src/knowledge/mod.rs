@@ -2,6 +2,7 @@ pub mod articles;
 pub mod conversations;
 pub mod entity_extractor;
 pub mod extraction;
+pub mod semantic_backfill;
 pub mod temporal_backfill;
 
 pub use articles::ArticleService;
