@@ -174,6 +174,26 @@ impl QueryExecutor {
                 vec![]
             });
 
+            // P8: record access for each surfaced article. Fire-and-forget
+            // (spawned), rate-limited via audit log (no record if a tier_change
+            // audit entry for the same article exists in the last 60 seconds).
+            for r in &final_results {
+                let db_clone = self.db.clone();
+                let article_id = r.article_id.clone();
+                tokio::spawn(async move {
+                    // Rate limit: skip if recently recorded
+                    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+                    if let Ok(n) = db_clone.count_recent_access_audit(&article_id, &cutoff).await {
+                        if n > 0 {
+                            return;
+                        }
+                    }
+                    if let Err(e) = db_clone.record_article_access(&article_id).await {
+                        tracing::warn!("Failed to record access for {}: {}", article_id, e);
+                    }
+                });
+            }
+
             all_results.push(StoreSearchResult {
                 store_id: store_id.clone(),
                 store_type: store_type.clone(),

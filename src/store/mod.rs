@@ -5048,4 +5048,61 @@ mod p3_integration_tests {
         let capped_noop = llm_high.min(user_source).clamp(0.0, 1.0);
         assert_eq!(capped_noop, 0.7);
     }
+
+    /// Verifies that record_article_access increments access_count and
+    /// records an audit entry. (The pipeline-level fire-and-forget spawn
+    /// is implicitly tested by Task 6's tests, which already exercise the
+    /// executor path; this test focuses on the direct Store-level call
+    /// that the spawn ultimately makes.)
+    #[tokio::test]
+    async fn p8_record_access_increments_counter_and_logs_audit() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Seed a Warm-tier article (will be promoted to Hot via access)
+        s.create_article(&Article {
+            id: "p8t8-a1".into(),
+            store_id: "p8t8-s1".into(),
+            title: "T".into(),
+            content: "C".into(),
+            source_type: "user".into(),
+            source_id: String::new(),
+            content_hash: "h".into(),
+            tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            reflects: vec![],
+            access_count: 0,
+            last_accessed_at: "".into(),
+            importance_score: 0.5,
+            tier: Tier::Warm,
+            pinned: false,
+            compacted_into: None,
+        }).await.unwrap();
+
+        // Also create the store since we're using a different store_id
+        s.create_store(&KnowledgeStore {
+            id: "p8t8-s1".into(), owner_id: "u1".into(), store_type: "personal".into(),
+            name: "P8T8".into(), lancedb_collection: "store_p8t8_s1".into(),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.record_article_access("p8t8-a1").await.unwrap();
+
+        let got = s.get_article("p8t8-a1").await.unwrap().unwrap();
+        assert_eq!(got.access_count, 1, "access_count must increment");
+        assert_eq!(got.tier, Tier::Hot, "Warm article should be promoted to Hot on access");
+        assert!(!got.last_accessed_at.is_empty(), "last_accessed_at must be set");
+
+        // Audit log should have a tier_change entry
+        let entries = s.list_audit_log("p8t8-s1", None, 10).await.unwrap();
+        let has_audit = entries.iter().any(|e|
+            e.action == "tier_change"
+            && e.subject_id == "p8t8-a1"
+            && e.details.get("reason").and_then(|v| v.as_str()) == Some("access_promote")
+        );
+        assert!(has_audit, "access promotion must write an audit entry; got {:?}", entries);
+    }
 }
