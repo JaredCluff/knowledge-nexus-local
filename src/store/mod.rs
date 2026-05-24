@@ -2471,8 +2471,10 @@ mod entity_tests {
             };
         "#).await.expect("seed").check().expect("seed check");
 
-        let mut filter = crate::config::EdgeTypeFilter::default();
-        filter.semantically_related = true;
+        let filter = crate::config::EdgeTypeFilter {
+            semantically_related: true,
+            ..Default::default()
+        };
         let neighbors = s.list_graph_neighbors("lgn2-s1", "lgn2a", &filter).await.expect("traverse");
         assert_eq!(neighbors.len(), 2);
         let types: std::collections::HashSet<&str> = neighbors.iter().map(|n| n.1.as_str()).collect();

@@ -4,8 +4,6 @@
 //! that `ann_query` can decode it and look up the pre-seeded neighbor list —
 //! without ever touching the file-system LanceDB.
 
-#![cfg(test)]
-
 use anyhow::Result;
 use std::collections::HashMap;
 

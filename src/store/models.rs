@@ -190,6 +190,7 @@ pub enum ExtractionMethod {
 /// Row returned when querying an ENTITY_OVERLAP edge (renamed from `RelatedToEdge`
 /// in P5). Same Jaccard-on-shared-entities semantics as P3's `RELATED_TO`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct EntityOverlapEdge {
     pub from_article_id: String,
     pub to_article_id: String,
@@ -204,6 +205,7 @@ pub struct EntityOverlapEdge {
 /// Row returned when querying a SEMANTICALLY_RELATED edge. Built from
 /// LanceDB ANN: `cos(embedding_i, embedding_j) > θ_sim` (default 0.85).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct SemanticallyRelatedEdge {
     pub from_article_id: String,
     pub to_article_id: String,
@@ -216,6 +218,7 @@ pub struct SemanticallyRelatedEdge {
 /// Row returned when querying a PRECEDES edge. Built deterministically from
 /// `article.created_at` ordering within an entity-overlap cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct PrecedesEdge {
     pub from_article_id: String,
     pub to_article_id: String,
@@ -227,6 +230,7 @@ pub struct PrecedesEdge {
 /// Row returned when querying a CAUSED_BY edge. LLM-extracted; `rationale` is
 /// the LLM's verbatim justification for the causal claim (stored for audit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct CausedByEdge {
     pub from_article_id: String,
     pub to_article_id: String,
@@ -239,6 +243,7 @@ pub struct CausedByEdge {
 /// Row returned when querying a REFERENCES_EDGE. Built from explicit markdown
 /// links `[anchor](target_article_id)` inside article content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ReferencesEdgeRow {
     pub from_article_id: String,
     pub to_article_id: String,

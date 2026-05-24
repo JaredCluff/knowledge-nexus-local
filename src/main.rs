@@ -1386,7 +1386,7 @@ async fn cmd_extract_entities(store_id: &str, limit: Option<usize>) -> Result<()
                     success_count += 1;
                 } else {
                     if let Err(e) = article_svc
-                        .backfill_entities(&article, &entities)
+                        .backfill_entities(article, &entities)
                         .await
                     {
                         println!("ERROR: {}", e);
