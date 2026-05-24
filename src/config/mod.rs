@@ -65,6 +65,10 @@ pub struct Config {
     /// Decay / tier-transition settings (P8)
     #[serde(default)]
     pub decay: DecayConfig,
+
+    /// Compaction settings (P8)
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 // ============================================================================
@@ -510,6 +514,31 @@ impl Default for DecayConfig {
             ga_w_importance: default_ga_w_importance(),
             ga_decay: default_ga_decay(),
             ebbinghaus_strength: default_ebbinghaus_strength(),
+        }
+    }
+}
+
+/// Compaction-via-reflection configuration (P8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// Minimum cluster size (number of Cold-tier articles sharing an entity)
+    /// to qualify for compaction. Smaller clusters are skipped.
+    #[serde(default = "default_compaction_min_cluster")]
+    pub min_cluster_size: usize,
+
+    /// Maximum number of clusters to compact per run (rate-limiting).
+    #[serde(default = "default_compaction_max_clusters_per_run")]
+    pub max_clusters_per_run: usize,
+}
+
+fn default_compaction_min_cluster() -> usize { 5 }
+fn default_compaction_max_clusters_per_run() -> usize { 50 }
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            min_cluster_size: default_compaction_min_cluster(),
+            max_clusters_per_run: default_compaction_max_clusters_per_run(),
         }
     }
 }
@@ -1028,6 +1057,7 @@ impl Default for Config {
             graph: GraphConfig::default(),
             reflection: ReflectionConfig::default(),
             decay: DecayConfig::default(),
+            compaction: CompactionConfig::default(),
         }
     }
 }
