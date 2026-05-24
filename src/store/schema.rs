@@ -317,7 +317,7 @@ DEFINE FIELD IF NOT EXISTS store_id ON _audit_log TYPE string;
 DEFINE FIELD IF NOT EXISTS action ON _audit_log TYPE string;
 DEFINE FIELD IF NOT EXISTS subject_type ON _audit_log TYPE string;
 DEFINE FIELD IF NOT EXISTS subject_id ON _audit_log TYPE string;
-DEFINE FIELD IF NOT EXISTS details ON _audit_log TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS details ON _audit_log FLEXIBLE TYPE object DEFAULT {};
 DEFINE FIELD IF NOT EXISTS recorded_at ON _audit_log TYPE string;
 DEFINE INDEX IF NOT EXISTS _audit_log_subject_idx ON _audit_log FIELDS subject_id;
 DEFINE INDEX IF NOT EXISTS _audit_log_time_idx ON _audit_log FIELDS recorded_at;
