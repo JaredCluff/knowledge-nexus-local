@@ -5,6 +5,8 @@
 //! is persisted to a `_maintenance_runs` table so the scheduler survives
 //! process restarts.
 
+pub mod decay;
 pub mod scheduler;
 
+pub use decay::{salience, tier_for_salience, SalienceInput};
 pub use scheduler::{JobSpec, MaintenanceScheduler};
