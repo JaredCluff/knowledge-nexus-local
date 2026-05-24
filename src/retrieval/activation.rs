@@ -460,6 +460,7 @@ mod ablation {
                 content_hash: format!("{}-h", id), tags: serde_json::json!([]),
                 embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                reflects: vec![],
             }).await.unwrap();
         }
 

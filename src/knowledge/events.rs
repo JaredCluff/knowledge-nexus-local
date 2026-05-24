@@ -289,6 +289,7 @@ mod tests {
             embedded_at: None,
             created_at: created_at.into(),
             updated_at: created_at.into(),
+            reflects: vec![],
         }
     }
 

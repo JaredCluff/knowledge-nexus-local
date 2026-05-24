@@ -52,6 +52,10 @@ pub struct Article {
     pub embedded_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// IDs of source articles this article reflects on. Empty for non-reflection
+    /// articles. Populated by P7 Reflector when a reflection is stored.
+    #[serde(default)]
+    pub reflects: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +338,7 @@ mod tests {
             embedded_at: None,
             created_at: "2026-04-15T00:00:00Z".into(),
             updated_at: "2026-04-15T00:00:00Z".into(),
+            reflects: vec![],
         };
         let json = serde_json::to_string(&a).unwrap();
         let decoded: Article = serde_json::from_str(&json).unwrap();

@@ -52,6 +52,8 @@ DEFINE FIELD IF NOT EXISTS tags.* ON article TYPE string;
 DEFINE FIELD IF NOT EXISTS embedded_at ON article TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at ON article TYPE string;
 DEFINE FIELD IF NOT EXISTS updated_at ON article TYPE string;
+DEFINE FIELD IF NOT EXISTS reflects ON article TYPE array DEFAULT [];
+DEFINE FIELD IF NOT EXISTS reflects.* ON article TYPE string;
 DEFINE INDEX IF NOT EXISTS article_store_idx ON article FIELDS store_id;
 DEFINE INDEX IF NOT EXISTS article_hash_idx ON article FIELDS store_id, content_hash;
 

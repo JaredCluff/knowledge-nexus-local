@@ -232,6 +232,7 @@ mod tests {
             embedded_at: None,
             created_at: "2026-05-24T00:00:00Z".into(),
             updated_at: "2026-05-24T00:00:00Z".into(),
+            reflects: vec![],
         }
     }
 

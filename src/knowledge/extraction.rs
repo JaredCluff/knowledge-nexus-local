@@ -51,6 +51,7 @@ impl KnowledgeExtractor {
             embedded_at: None,
             created_at: now.clone(),
             updated_at: now,
+            reflects: vec![],
         };
 
         match self.article_service.create(&article, store_collection).await? {

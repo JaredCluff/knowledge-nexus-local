@@ -239,6 +239,10 @@ pub trait Store: Send + Sync {
         confidence: f64,
     ) -> Result<()>;
     async fn list_events_for_article(&self, article_id: &str) -> Result<Vec<Event>>;
+
+    /// Returns articles where `reflects` array contains this article_id.
+    /// Use case: drill-down — "show me what was synthesized from this article."
+    async fn list_reflections_for_article(&self, article_id: &str) -> Result<Vec<Article>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -516,7 +520,7 @@ impl Store for SurrealStore {
                     source_type: $source_type, source_id: $source_id,
                     content_hash: $content_hash, tags: $tags,
                     embedded_at: $embedded_at, created_at: $created_at,
-                    updated_at: $updated_at
+                    updated_at: $updated_at, reflects: $reflects
                 }",
             )
             .bind(("id", a.id.clone()))
@@ -530,6 +534,7 @@ impl Store for SurrealStore {
             .bind(("embedded_at", a.embedded_at.clone()))
             .bind(("created_at", a.created_at.clone()))
             .bind(("updated_at", a.updated_at.clone()))
+            .bind(("reflects", a.reflects.clone()))
             .await?
             .check()?;
         Ok(())
@@ -552,7 +557,8 @@ impl Store for SurrealStore {
                     title: $title, content: $content,
                     source_type: $source_type, source_id: $source_id,
                     content_hash: $content_hash, tags: $tags,
-                    embedded_at: $embedded_at, updated_at: $updated_at
+                    embedded_at: $embedded_at, updated_at: $updated_at,
+                    reflects: $reflects
                 }",
             )
             .bind(("id", a.id.clone()))
@@ -564,6 +570,7 @@ impl Store for SurrealStore {
             .bind(("tags", a.tags.clone()))
             .bind(("embedded_at", a.embedded_at.clone()))
             .bind(("updated_at", a.updated_at.clone()))
+            .bind(("reflects", a.reflects.clone()))
             .await?
             .check()?;
         Ok(())
@@ -1974,6 +1981,20 @@ impl Store for SurrealStore {
         let events: Vec<Event> = resp.take(0).unwrap_or_default();
         Ok(events)
     }
+
+    async fn list_reflections_for_article(&self, article_id: &str) -> Result<Vec<Article>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT *, meta::id(id) AS id FROM article
+                 WHERE $aid IN reflects
+                   AND source_type = 'reflection'"
+            )
+            .bind(("aid", article_id.to_string()))
+            .await
+            .context("list_reflections_for_article")?;
+        let articles: Vec<Article> = resp.take(0).unwrap_or_default();
+        Ok(articles)
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -2059,6 +2080,7 @@ mod article_tests {
             source_id: "".into(), content_hash: "abc123".into(),
             tags: serde_json::json!(["test"]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         };
         s.create_article(&article).await.unwrap();
 
@@ -2258,6 +2280,7 @@ mod fts_tests {
                 tags: serde_json::json!([]),
                 embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                reflects: vec![],
             }).await.unwrap();
         }
 
@@ -2485,6 +2508,7 @@ mod entity_tests {
             source_id: String::new(), content_hash: "lafe-h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "lafe-a2".into(), store_id: "s1".into(), title: "Tokio Deep Dive".into(),
@@ -2492,6 +2516,7 @@ mod entity_tests {
             source_id: String::new(), content_hash: "lafe-h2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         s.create_entity(&Entity {
@@ -2577,6 +2602,7 @@ mod entity_tests {
             source_id: String::new(), content_hash: "co-hx1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "co-art2".into(), store_id: "co-s1".into(), title: "More Rust".into(),
@@ -2584,6 +2610,7 @@ mod entity_tests {
             source_id: String::new(), content_hash: "co-hx2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         // Entity IDs that don't contain colons, to avoid any SurrealDB ID-parsing ambiguity.
@@ -2623,12 +2650,14 @@ mod entity_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "p5pre-h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5pre-a2".into(), store_id: "p5pre-s1".into(), title: "B".into(), content: "y".into(),
             source_type: "user".into(), source_id: String::new(), content_hash: "p5pre-h2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         s.create_precedes_edge(
@@ -2651,12 +2680,14 @@ mod entity_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "p5sem-h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5sem-a2".into(), store_id: "p5sem-s1".into(), title: "B".into(), content: "".into(),
             source_type: "user".into(), source_id: String::new(), content_hash: "p5sem-h2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         s.create_semantically_related_edge("p5sem-s1", "p5sem-a1", "p5sem-a2", 0.91).await.expect("first");
@@ -2677,12 +2708,14 @@ mod entity_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "p5cb-h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5cb-a2".into(), store_id: "p5cb-s1".into(), title: "B".into(), content: "".into(),
             source_type: "user".into(), source_id: String::new(), content_hash: "p5cb-h2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         s.create_caused_by_edge(
@@ -2704,12 +2737,14 @@ mod entity_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "p5ref-h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "p5ref-a2".into(), store_id: "p5ref-s1".into(), title: "B".into(), content: "".into(),
             source_type: "user".into(), source_id: String::new(), content_hash: "p5ref-h2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         s.create_references_edge(
@@ -2873,6 +2908,7 @@ mod entity_tests {
             source_type: "user".into(), source_id: String::new(),
             content_hash: "ce-h".into(), tags: serde_json::json!([]),
             embedded_at: None, created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         s.create_contains_evidence_edge("ce_ev1", "ce_a1", 0.85).await.unwrap();
@@ -2940,6 +2976,95 @@ mod entity_tests {
         let rows: Vec<Row> = resp.take(0).unwrap_or_default();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].child_id, "po_child");
+    }
+
+    #[tokio::test]
+    async fn article_reflects_field_serde_round_trip() {
+        let s = fixture().await;
+        let ts = now();
+
+        // A reflection-typed article pointing to two source articles
+        s.create_article(&Article {
+            id: "p7r-refl".into(),
+            store_id: "p7r-s1".into(),
+            title: "Reflection on Rust async".into(),
+            content: "Synthesized delta from two source articles".into(),
+            source_type: "reflection".into(),
+            source_id: String::new(),
+            content_hash: "p7r-refl-h".into(),
+            tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            reflects: vec!["p7r-a1".into(), "p7r-a2".into()],
+        }).await.unwrap();
+
+        let got = s.get_article("p7r-refl").await.unwrap().expect("reflection exists");
+        assert_eq!(got.reflects, vec!["p7r-a1".to_string(), "p7r-a2".to_string()]);
+        assert_eq!(got.source_type, "reflection");
+    }
+
+    #[tokio::test]
+    async fn list_reflections_for_article_finds_synthesizers() {
+        let s = fixture().await;
+        let ts = now();
+
+        // Source article
+        s.create_article(&Article {
+            id: "lrfa-src".into(),
+            store_id: "lrfa-s1".into(),
+            title: "Source".into(),
+            content: "src content".into(),
+            source_type: "user".into(),
+            source_id: String::new(),
+            content_hash: "lrfa-src-h".into(),
+            tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            reflects: vec![],
+        }).await.unwrap();
+
+        // Two reflections pointing at the source
+        for refl_id in &["lrfa-r1", "lrfa-r2"] {
+            s.create_article(&Article {
+                id: refl_id.to_string(),
+                store_id: "lrfa-s1".into(),
+                title: format!("Reflection {}", refl_id),
+                content: "synthesized content".into(),
+                source_type: "reflection".into(),
+                source_id: String::new(),
+                content_hash: format!("{}-h", refl_id),
+                tags: serde_json::json!([]),
+                embedded_at: None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+                reflects: vec!["lrfa-src".into()],
+            }).await.unwrap();
+        }
+
+        // An unrelated reflection
+        s.create_article(&Article {
+            id: "lrfa-unrelated".into(),
+            store_id: "lrfa-s1".into(),
+            title: "Other".into(),
+            content: "".into(),
+            source_type: "reflection".into(),
+            source_id: String::new(),
+            content_hash: "lrfa-other-h".into(),
+            tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            reflects: vec!["other-id".into()],
+        }).await.unwrap();
+
+        let reflections = s.list_reflections_for_article("lrfa-src").await.unwrap();
+        assert_eq!(reflections.len(), 2, "expected 2 reflections pointing to lrfa-src");
+        let ids: std::collections::HashSet<&str> = reflections.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains("lrfa-r1"));
+        assert!(ids.contains("lrfa-r2"));
+        assert!(!ids.contains("lrfa-unrelated"));
     }
 }
 
@@ -3067,6 +3192,7 @@ mod graph_edge_tests {
             source_id: "".into(), content_hash: "h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "a2".into(), store_id: "s1".into(), title: "Async Rust".into(),
@@ -3074,6 +3200,7 @@ mod graph_edge_tests {
             source_id: "".into(), content_hash: "h2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_entity(&Entity {
             id: "tool:rust".into(), name: "Rust".into(), entity_type: "tool".into(),
@@ -3185,6 +3312,7 @@ mod p3_integration_tests {
                 source_id: "".into(), content_hash: hash.into(),
                 tags: serde_json::json!([]), embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                reflects: vec![],
             }).await.unwrap();
         }
 
@@ -3246,6 +3374,7 @@ mod p3_integration_tests {
             source_id: "".into(), content_hash: "hash1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         // Simulate dedup detection
@@ -3303,6 +3432,7 @@ mod p3_integration_tests {
             source_id: "".into(), content_hash: "h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_tagged_edge("a1", "rust").await.unwrap();
 
@@ -3325,6 +3455,7 @@ mod p3_integration_tests {
             source_id: "".into(), content_hash: "h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "a2".into(), store_id: "s1".into(), title: "No mentions".into(),
@@ -3332,6 +3463,7 @@ mod p3_integration_tests {
             source_id: "".into(), content_hash: "h2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         s.upsert_entity(&Entity {
@@ -3360,6 +3492,7 @@ mod p3_integration_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "tgsi-h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "tgsi-a2".into(), store_id: "s1".into(), title: "Go Concurrency".into(),
@@ -3367,6 +3500,7 @@ mod p3_integration_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "tgsi-h2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "tgsi-a3".into(), store_id: "s1".into(), title: "Tokio Internals".into(),
@@ -3374,6 +3508,7 @@ mod p3_integration_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "tgsi-h3".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         // Create entities
@@ -3458,6 +3593,7 @@ mod p3_integration_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "gse-h1".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "gse-a2".into(), store_id: "s1".into(),
@@ -3466,6 +3602,7 @@ mod p3_integration_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "gse-h2".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
         s.create_article(&Article {
             id: "gse-a3".into(), store_id: "s1".into(),
@@ -3474,6 +3611,7 @@ mod p3_integration_tests {
             source_type: "user".into(), source_id: String::new(), content_hash: "gse-h3".into(),
             tags: serde_json::json!([]), embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         // Create entities
@@ -3559,6 +3697,7 @@ mod p3_integration_tests {
             content_hash: "gj-h1".into(), tags: serde_json::json!([]),
             embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         s.create_entity(&Entity {
@@ -3613,6 +3752,7 @@ mod p3_integration_tests {
                 content_hash: format!("{}-h", id), tags: serde_json::json!([]),
                 embedded_at: None,
                 created_at: ts.clone(), updated_at: ts.clone(),
+                reflects: vec![],
             }).await.unwrap();
         }
 
@@ -3706,6 +3846,7 @@ mod p3_integration_tests {
             content_hash: "ae2-h1".into(), tags: serde_json::json!([]),
             embedded_at: None,
             created_at: ts.clone(), updated_at: ts.clone(),
+            reflects: vec![],
         }).await.unwrap();
 
         let db: Arc<dyn Store> = Arc::new(s);

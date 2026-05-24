@@ -101,6 +101,7 @@ impl WebClipReceiver {
             embedded_at: None,
             created_at: now.clone(),
             updated_at: now,
+            reflects: vec![],
         };
 
         self.article_service
