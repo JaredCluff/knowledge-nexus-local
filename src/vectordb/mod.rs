@@ -12,7 +12,7 @@ use arrow_schema::{DataType, Field, Schema};
 use lancedb::connect;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::embeddings::EMBEDDING_DIM;
@@ -29,6 +29,7 @@ const CHUNKS_TABLE: &str = "chunks";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentMetadata {
     // Core identification
+    pub store_id: String,
     pub id: String,
     pub title: String,
     pub path: String,
@@ -75,6 +76,7 @@ pub struct DocumentMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMetadata {
     // Chunk identification
+    pub store_id: String,
     pub chunk_id: String,
     pub document_id: String,
     pub chunk_index: u32,
@@ -142,8 +144,37 @@ impl VectorDB {
             .await
             .context("Failed to connect to LanceDB")?;
         let vectordb = Self { db, quantizer };
+
+        // P5 followup: detect legacy schema without store_id column and drop+recreate.
+        // Pre-1.0 acceptable simplification — users must re-ingest via `reindex`.
+        if vectordb.has_legacy_schema().await? {
+            warn!(
+                "LanceDB tables have pre-multi-store schema (missing store_id column). \
+                 Dropping and recreating tables. Re-ingest content via `cargo run -- reindex` \
+                 to rebuild the vector index."
+            );
+            // Attempt to drop both tables; ignore errors if they don't exist.
+            let _ = vectordb.db.drop_table(TABLE_NAME).await;
+            let _ = vectordb.db.drop_table(CHUNKS_TABLE).await;
+        }
+
         vectordb.ensure_tables().await?;
         Ok(vectordb)
+    }
+
+    /// Return `true` if any existing table is missing the `store_id` column.
+    ///
+    /// This detects the pre-multi-store schema so that `open` can drop and
+    /// recreate the tables rather than silently writing to an incompatible schema.
+    async fn has_legacy_schema(&self) -> Result<bool> {
+        let tables = self.db.table_names().execute().await?;
+        // Only check if at least one table already exists.
+        if !tables.contains(&CHUNKS_TABLE.to_string()) {
+            return Ok(false); // Fresh install — no migration needed.
+        }
+        let table = self.db.open_table(CHUNKS_TABLE).execute().await?;
+        let schema = table.schema().await?;
+        Ok(schema.field_with_name("store_id").is_err())
     }
 
     /// Backwards-compatible constructor — uses IvfPqQuantizer as default.
@@ -172,6 +203,7 @@ impl VectorDB {
     async fn create_documents_table(&self) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             // Core identification
+            Field::new("store_id", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
             Field::new("title", DataType::Utf8, false),
             Field::new("path", DataType::Utf8, false),
@@ -221,6 +253,7 @@ impl VectorDB {
     async fn create_chunks_table(&self) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             // Chunk identification
+            Field::new("store_id", DataType::Utf8, false),
             Field::new("chunk_id", DataType::Utf8, false),
             Field::new("document_id", DataType::Utf8, false),
             Field::new("chunk_index", DataType::UInt32, false),
@@ -303,6 +336,7 @@ impl VectorDB {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(vec![meta.store_id.as_str()])),
                 Arc::new(StringArray::from(vec![meta.id.as_str()])),
                 Arc::new(StringArray::from(vec![meta.title.as_str()])),
                 Arc::new(StringArray::from(vec![meta.path.as_str()])),
@@ -345,6 +379,7 @@ impl VectorDB {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(vec![meta.store_id.as_str()])),
                 Arc::new(StringArray::from(vec![meta.chunk_id.as_str()])),
                 Arc::new(StringArray::from(vec![meta.document_id.as_str()])),
                 Arc::new(UInt32Array::from(vec![meta.chunk_index])),
@@ -393,6 +428,7 @@ impl VectorDB {
 
         // Create minimal document metadata
         let doc_meta = DocumentMetadata {
+            store_id: "local".to_string(),
             id: id.clone(),
             title: filename.clone(),
             path: path.to_string(),
@@ -423,6 +459,7 @@ impl VectorDB {
 
         // Create single chunk
         let chunk_meta = ChunkMetadata {
+            store_id: "local".to_string(),
             chunk_id: format!("{}-0", id),
             document_id: id,
             chunk_index: 0,
@@ -611,6 +648,7 @@ impl VectorDB {
 
     fn documents_schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
+            Field::new("store_id", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
             Field::new("title", DataType::Utf8, false),
             Field::new("path", DataType::Utf8, false),
@@ -640,6 +678,7 @@ impl VectorDB {
 
     fn chunks_schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
+            Field::new("store_id", DataType::Utf8, false),
             Field::new("chunk_id", DataType::Utf8, false),
             Field::new("document_id", DataType::Utf8, false),
             Field::new("chunk_index", DataType::UInt32, false),
@@ -673,11 +712,10 @@ impl VectorDB {
 
     /// Retrieve the embedding for a specific article (document) from the chunks table.
     ///
-    /// The `store_id` parameter is accepted for API consistency with the
-    /// `VectorDbBackfillApi` trait but is not used for filtering (the chunks
-    /// table is a single global table; document_id is globally unique).
-    /// Returns `None` if no chunks are stored for the given article_id.
-    pub async fn get_embedding(&self, _store_id: &str, article_id: &str) -> Result<Option<Vec<f32>>> {
+    /// Filters by both `store_id` and `article_id` to ensure cross-store isolation
+    /// in multi-tenant / federated deployments.
+    /// Returns `None` if no chunks are stored for the given store + article combination.
+    pub async fn get_embedding(&self, store_id: &str, article_id: &str) -> Result<Option<Vec<f32>>> {
         use arrow_array::FixedSizeListArray;
         use futures_util::TryStreamExt;
         use lancedb::query::{ExecutableQuery, QueryBase};
@@ -686,9 +724,13 @@ impl VectorDB {
 
         // Escape single quotes to prevent filter injection.
         let safe_id = article_id.replace('\'', "''");
+        let safe_store = store_id.replace('\'', "''");
         let stream = table
             .query()
-            .only_if(format!("document_id = '{}'", safe_id))
+            .only_if(format!(
+                "document_id = '{}' AND store_id = '{}'",
+                safe_id, safe_store
+            ))
             .limit(1)
             .execute()
             .await
@@ -722,16 +764,19 @@ impl VectorDB {
     /// (best similarity wins if a document has multiple chunks).
     ///
     /// LanceDB returns cosine *distance*; we convert: `similarity = 1.0 - distance`.
+    /// Filters by `store_id` to enforce cross-store isolation.
     pub async fn ann_query(
         &self,
-        _store_id: &str,
+        store_id: &str,
         query_embedding: &[f32],
         top_k: usize,
     ) -> Result<Vec<(String, f64)>> {
         let table = self.db.open_table(CHUNKS_TABLE).execute().await?;
+        // Escape single quotes to prevent filter injection.
+        let safe_store = store_id.replace('\'', "''");
         let filter = crate::vectordb::quantizer::QuantizerFilter {
             limit: Some(top_k),
-            ..Default::default()
+            where_clause: Some(format!("store_id = '{}'", safe_store)),
         };
         let batches = self.quantizer.search(&table, query_embedding, &filter).await?;
 
@@ -864,6 +909,8 @@ fn detect_language(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vectordb::mock::MockVectorDb;
+    use crate::vectordb::VectorDbBackfillApi;
 
     #[tokio::test]
     async fn test_vectordb_operations() {
@@ -881,5 +928,101 @@ mod tests {
 
         // Delete
         db.delete("/test/file.txt").await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-store isolation tests (Followup 4)
+    // -----------------------------------------------------------------------
+
+    /// `get_embedding` must return None for a store that has no record for the
+    /// given article_id, even when another store does.
+    #[tokio::test]
+    async fn get_embedding_filters_by_store_id() {
+        let mock = MockVectorDb::with_pairs(
+            "store_a",
+            &[("shared_doc", &[("neighbor_a", 0.9)])],
+        );
+
+        // store_a has shared_doc → should return Some(embedding)
+        let result_a = mock.get_embedding("store_a", "shared_doc").await.unwrap();
+        assert!(
+            result_a.is_some(),
+            "store_a should have an embedding for shared_doc"
+        );
+
+        // store_b was never seeded → should return None
+        let result_b = mock.get_embedding("store_b", "shared_doc").await.unwrap();
+        assert!(
+            result_b.is_none(),
+            "store_b should NOT return an embedding seeded under store_a"
+        );
+
+        // store_c does not exist → should return None
+        let result_c = mock.get_embedding("store_c", "shared_doc").await.unwrap();
+        assert!(
+            result_c.is_none(),
+            "store_c (unknown) should return None"
+        );
+    }
+
+    /// `ann_query` must only return neighbors seeded under the queried store.
+    /// Results from another store must not leak across.
+    #[tokio::test]
+    async fn ann_query_filters_by_store_id() {
+        // store_a: article "alpha" has neighbor "alpha_neighbor"
+        // store_b: article "beta"  has neighbor "beta_neighbor"
+        // Both stores have an article with the same document id "shared".
+        let mock_a = MockVectorDb::with_pairs(
+            "store_a",
+            &[
+                ("alpha", &[("alpha_neighbor", 0.95)]),
+                ("shared", &[("shared_in_a", 0.8)]),
+            ],
+        );
+
+        // Query store_a for the "alpha" article embedding, then ANN-search.
+        let emb_alpha = mock_a
+            .get_embedding("store_a", "alpha")
+            .await
+            .unwrap()
+            .expect("alpha must exist in store_a");
+        let neighbors_a = mock_a
+            .ann_query("store_a", &emb_alpha, 10)
+            .await
+            .unwrap();
+        assert_eq!(neighbors_a.len(), 1);
+        assert_eq!(
+            neighbors_a[0].0, "alpha_neighbor",
+            "store_a ANN should return alpha_neighbor"
+        );
+
+        // Query store_a for "shared" — must return only store_a's neighbor.
+        let emb_shared_a = mock_a
+            .get_embedding("store_a", "shared")
+            .await
+            .unwrap()
+            .expect("shared must exist in store_a");
+        let neighbors_shared_a = mock_a
+            .ann_query("store_a", &emb_shared_a, 10)
+            .await
+            .unwrap();
+        let ids_shared_a: Vec<&str> =
+            neighbors_shared_a.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids_shared_a.contains(&"shared_in_a"),
+            "store_a ANN for 'shared' should return shared_in_a, got: {:?}",
+            ids_shared_a
+        );
+
+        // Querying store_b (not seeded) for "alpha" must return empty.
+        let neighbors_b = mock_a
+            .ann_query("store_b", &emb_alpha, 10)
+            .await
+            .unwrap();
+        assert!(
+            neighbors_b.is_empty(),
+            "store_b ANN should return empty when only store_a is seeded, got: {:?}",
+            neighbors_b
+        );
     }
 }
