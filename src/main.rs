@@ -1036,6 +1036,24 @@ async fn cmd_paths(action: PathsAction) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a store id: use the provided filter, or fall back to the owner's first store.
+/// Returns an error if no owner user exists, or if `store_filter` is None and the owner
+/// has no stores.
+async fn resolve_default_store_id(
+    db: &std::sync::Arc<dyn store::Store>,
+    store_filter: Option<&str>,
+) -> Result<String> {
+    if let Some(id) = store_filter {
+        return Ok(id.to_string());
+    }
+    let owner = db.get_owner_user().await?
+        .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
+    let stores = db.list_stores_for_user(&owner.id).await?;
+    Ok(stores.first()
+        .ok_or_else(|| anyhow::anyhow!("No stores found"))?
+        .id.clone())
+}
+
 async fn cmd_search(query: &str, limit: usize, store_filter: Option<&str>, verbose: bool) -> Result<()> {
     info!("Searching for: {}", query);
 
@@ -1426,17 +1444,7 @@ async fn cmd_graph_entity(name: &str, store_filter: Option<&str>) -> Result<()> 
     let cfg = config::load_config().await?;
     let db = open_store_or_bail(&cfg).await?;
 
-    let store_id = match store_filter {
-        Some(id) => id.to_string(),
-        None => {
-            let owner = db.get_owner_user().await?
-                .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
-            let stores = db.list_stores_for_user(&owner.id).await?;
-            stores.first()
-                .ok_or_else(|| anyhow::anyhow!("No stores found"))?
-                .id.clone()
-        }
-    };
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
 
     let entities = db.search_entities_by_name(&store_id, &[name]).await?;
     if entities.is_empty() {
@@ -1520,17 +1528,7 @@ async fn cmd_graph_stats(store_filter: Option<&str>) -> Result<()> {
     let cfg = config::load_config().await?;
     let db = open_store_or_bail(&cfg).await?;
 
-    let store_id = match store_filter {
-        Some(id) => id.to_string(),
-        None => {
-            let owner = db.get_owner_user().await?
-                .ok_or_else(|| anyhow::anyhow!("No owner user found"))?;
-            let stores = db.list_stores_for_user(&owner.id).await?;
-            stores.first()
-                .ok_or_else(|| anyhow::anyhow!("No stores found"))?
-                .id.clone()
-        }
-    };
+    let store_id = resolve_default_store_id(&db, store_filter).await?;
 
     let store = db.get_store(&store_id).await?
         .ok_or_else(|| anyhow::anyhow!("Store '{}' not found", store_id))?;
