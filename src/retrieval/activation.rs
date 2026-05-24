@@ -421,7 +421,7 @@ mod tests {
 #[cfg(test)]
 mod ablation {
     use super::*;
-    use crate::config::{ActivationConfig, EdgeTypeFilter, RetrievalConfig};
+    use crate::config::{EdgeTypeFilter, RetrievalConfig};
     use crate::retrieval::intent::Intent;
     use crate::store::{Article, Entity, SurrealStore, Store};
     use std::sync::Arc;
