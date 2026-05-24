@@ -70,7 +70,7 @@ async fn run_causal_backfill<S: Store + Sync + ?Sized>(
     store_id: &str,
 ) -> Result<u64> {
     use crate::knowledge::causal_extractor::CausalExtractor;
-    let extractor = CausalExtractor::new(config.clone(), "http://localhost:11434".into());
+    let extractor = CausalExtractor::new(config.clone(), config.ollama_url.clone());
 
     let pairs = store.list_entity_overlap_pairs(store_id).await?;
     let mut count = 0u64;
