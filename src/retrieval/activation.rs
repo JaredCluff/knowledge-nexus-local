@@ -522,15 +522,16 @@ mod ablation {
     }
 
     fn base_config() -> RetrievalConfig {
-        let mut c = RetrievalConfig::default();
-        c.edge_types = EdgeTypeFilter {
-            entity_overlap: true,
-            semantically_related: false,
-            precedes: false,
-            caused_by: true,
-            references: false,
-        };
-        c
+        RetrievalConfig {
+            edge_types: EdgeTypeFilter {
+                entity_overlap: true,
+                semantically_related: false,
+                precedes: false,
+                caused_by: true,
+                references: false,
+            },
+            ..RetrievalConfig::default()
+        }
     }
 
     /// Ablation 1: Damping = 0.0 means PPR degenerates to pure restart.

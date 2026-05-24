@@ -9,13 +9,9 @@ pub mod ppr;
 pub mod reranker;
 pub mod specificity;
 
-pub use activation::{ActivationEngine, ActivationOutput};
+pub use activation::ActivationEngine;
 pub use confidence::ConfidenceScorer;
 pub use expansion::QueryExpander;
 pub use graph::GraphSearcher;
 pub use hybrid::HybridSearcher;
-pub use intent::{classify, Intent, IntentWeights};
-pub use post_process::{post_process, lateral_inhibition, sigmoid_normalize, confidence_gate};
-pub use ppr::personalized_pagerank;
 pub use reranker::Reranker;
-pub use specificity::SpecificityCache;

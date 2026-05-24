@@ -54,6 +54,7 @@ impl SpecificityCache {
 
     /// Drop the cached weights for a store. Call after writes that add
     /// or remove mentions edges.
+    #[allow(dead_code)]
     pub async fn invalidate(&self, store_id: &str) {
         self.by_store.write().await.remove(store_id);
     }
