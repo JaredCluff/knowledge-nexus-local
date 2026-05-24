@@ -172,6 +172,82 @@ pub struct RelatedToEdge {
     pub updated_at: String,
 }
 
+/// How an edge was derived. Stored as a lowercase string in SurrealDB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionMethod {
+    /// Deterministic / rule-based extraction (e.g. timestamps for temporal,
+    /// entity-overlap for ENTITY_OVERLAP). Cheap and reproducible.
+    Heuristic,
+    /// LLM-driven extraction (currently only CAUSED_BY in P5).
+    Llm,
+    /// User explicitly asserted this edge (e.g. markdown citation).
+    UserAsserted,
+    /// Derived from another signal (e.g. SEMANTICALLY_RELATED via LanceDB ANN).
+    Derived,
+}
+
+/// Row returned when querying an ENTITY_OVERLAP edge (renamed from `RelatedToEdge`
+/// in P5). Same Jaccard-on-shared-entities semantics as P3's `RELATED_TO`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityOverlapEdge {
+    pub from_article_id: String,
+    pub to_article_id: String,
+    pub shared_entity_count: i64,
+    pub strength: f64,
+    pub confidence: f64,
+    pub extraction_method: ExtractionMethod,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Row returned when querying a SEMANTICALLY_RELATED edge. Built from
+/// LanceDB ANN: `cos(embedding_i, embedding_j) > θ_sim` (default 0.85).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticallyRelatedEdge {
+    pub from_article_id: String,
+    pub to_article_id: String,
+    pub similarity: f64,
+    pub confidence: f64,
+    pub extraction_method: ExtractionMethod,
+    pub created_at: String,
+}
+
+/// Row returned when querying a PRECEDES edge. Built deterministically from
+/// `article.created_at` ordering within an entity-overlap cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrecedesEdge {
+    pub from_article_id: String,
+    pub to_article_id: String,
+    pub confidence: f64,
+    pub extraction_method: ExtractionMethod,
+    pub created_at: String,
+}
+
+/// Row returned when querying a CAUSED_BY edge. LLM-extracted; `rationale` is
+/// the LLM's verbatim justification for the causal claim (stored for audit).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausedByEdge {
+    pub from_article_id: String,
+    pub to_article_id: String,
+    pub confidence: f64,
+    pub rationale: Option<String>,
+    pub extraction_method: ExtractionMethod,
+    pub created_at: String,
+}
+
+/// Row returned when querying a REFERENCES_EDGE. Built from explicit markdown
+/// links `[anchor](target_article_id)` inside article content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferencesEdgeRow {
+    pub from_article_id: String,
+    pub to_article_id: String,
+    pub confidence: f64,
+    pub extraction_method: ExtractionMethod,
+    pub anchor_text: Option<String>,
+    pub created_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +342,92 @@ mod tests {
         let decoded: DedupQueueEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.status, "pending");
         assert!(decoded.resolved_at.is_none());
+    }
+
+    #[test]
+    fn test_extraction_method_serde() {
+        let m = ExtractionMethod::Heuristic;
+        let s = serde_json::to_string(&m).unwrap();
+        assert_eq!(s, "\"heuristic\"");
+        let back: ExtractionMethod = serde_json::from_str("\"llm\"").unwrap();
+        assert_eq!(back, ExtractionMethod::Llm);
+    }
+
+    #[test]
+    fn test_entity_overlap_edge_serde() {
+        let e = EntityOverlapEdge {
+            from_article_id: "a1".into(),
+            to_article_id: "a2".into(),
+            shared_entity_count: 3,
+            strength: 0.42,
+            confidence: 0.42,
+            extraction_method: ExtractionMethod::Heuristic,
+            created_at: "2026-05-23T00:00:00Z".into(),
+            updated_at: "2026-05-23T00:00:00Z".into(),
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        let d: EntityOverlapEdge = serde_json::from_str(&j).unwrap();
+        assert_eq!(d.strength, 0.42);
+        assert_eq!(d.extraction_method, ExtractionMethod::Heuristic);
+    }
+
+    #[test]
+    fn test_semantically_related_edge_serde() {
+        let e = SemanticallyRelatedEdge {
+            from_article_id: "a1".into(),
+            to_article_id: "a2".into(),
+            similarity: 0.93,
+            confidence: 0.93,
+            extraction_method: ExtractionMethod::Derived,
+            created_at: "2026-05-23T00:00:00Z".into(),
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        let d: SemanticallyRelatedEdge = serde_json::from_str(&j).unwrap();
+        assert_eq!(d.similarity, 0.93);
+    }
+
+    #[test]
+    fn test_precedes_edge_serde() {
+        let e = PrecedesEdge {
+            from_article_id: "a1".into(),
+            to_article_id: "a2".into(),
+            confidence: 1.0,
+            extraction_method: ExtractionMethod::Heuristic,
+            created_at: "2026-05-23T00:00:00Z".into(),
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        let d: PrecedesEdge = serde_json::from_str(&j).unwrap();
+        assert_eq!(d.confidence, 1.0);
+    }
+
+    #[test]
+    fn test_caused_by_edge_serde() {
+        let e = CausedByEdge {
+            from_article_id: "a1".into(),
+            to_article_id: "a2".into(),
+            confidence: 0.78,
+            rationale: Some("explicit causal language in source".into()),
+            extraction_method: ExtractionMethod::Llm,
+            created_at: "2026-05-23T00:00:00Z".into(),
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        let d: CausedByEdge = serde_json::from_str(&j).unwrap();
+        assert_eq!(d.confidence, 0.78);
+        assert_eq!(d.rationale.as_deref(), Some("explicit causal language in source"));
+    }
+
+    #[test]
+    fn test_references_edge_row_serde() {
+        let e = ReferencesEdgeRow {
+            from_article_id: "a1".into(),
+            to_article_id: "a2".into(),
+            confidence: 1.0,
+            extraction_method: ExtractionMethod::UserAsserted,
+            anchor_text: Some("see [the deploy retro](a2)".into()),
+            created_at: "2026-05-23T00:00:00Z".into(),
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        let d: ReferencesEdgeRow = serde_json::from_str(&j).unwrap();
+        assert_eq!(d.anchor_text.as_deref(), Some("see [the deploy retro](a2)"));
     }
 }
