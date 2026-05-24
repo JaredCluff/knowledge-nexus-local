@@ -57,6 +57,10 @@ pub struct Config {
     /// Graph / multi-graph settings (P5)
     #[serde(default)]
     pub graph: GraphConfig,
+
+    /// Reflection scheduling settings (P7)
+    #[serde(default)]
+    pub reflection: ReflectionConfig,
 }
 
 // ============================================================================
@@ -354,6 +358,33 @@ impl Default for RetrievalConfig {
             edge_types: EdgeTypeFilter::default(),
             graph_strategy: default_graph_strategy(),
             activation: ActivationConfig::default(),
+        }
+    }
+}
+
+/// Reflection scheduling configuration (P7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReflectionConfig {
+    /// Submit a reflection job for a store after this many ingests.
+    /// Set to 0 to disable rate-triggered reflection (manual + scheduled only).
+    #[serde(default = "default_ingests_per_reflection")]
+    pub ingests_per_reflection_trigger: usize,
+
+    /// Minimum interval between reflection runs per store. The scheduler
+    /// dedups within this window via the idempotency key
+    /// `reflection:<store_id>:<date>`.
+    #[serde(default = "default_min_reflection_interval_hours")]
+    pub min_reflection_interval_hours: u64,
+}
+
+fn default_ingests_per_reflection() -> usize { 100 }
+fn default_min_reflection_interval_hours() -> u64 { 6 }
+
+impl Default for ReflectionConfig {
+    fn default() -> Self {
+        Self {
+            ingests_per_reflection_trigger: default_ingests_per_reflection(),
+            min_reflection_interval_hours: default_min_reflection_interval_hours(),
         }
     }
 }
@@ -870,6 +901,7 @@ impl Default for Config {
             extraction: ExtractionConfig::default(),
             retrieval: RetrievalConfig::default(),
             graph: GraphConfig::default(),
+            reflection: ReflectionConfig::default(),
         }
     }
 }

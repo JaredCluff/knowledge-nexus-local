@@ -288,5 +288,13 @@ DEFINE FIELD IF NOT EXISTS status ON _maintenance_runs TYPE string DEFAULT "runn
 DEFINE INDEX IF NOT EXISTS _maintenance_runs_key_idx
     ON _maintenance_runs FIELDS idempotency_key UNIQUE;
 DEFINE INDEX IF NOT EXISTS _maintenance_runs_job_idx ON _maintenance_runs FIELDS job_name;
+
+-- P7 ingest counters per store, for rate-triggered reflection
+DEFINE TABLE IF NOT EXISTS _ingest_counters SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS store_id ON _ingest_counters TYPE string;
+DEFINE FIELD IF NOT EXISTS count ON _ingest_counters TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS last_reset_at ON _ingest_counters TYPE string;
+DEFINE INDEX IF NOT EXISTS _ingest_counters_store_unique
+    ON _ingest_counters FIELDS store_id UNIQUE;
 "#
 }

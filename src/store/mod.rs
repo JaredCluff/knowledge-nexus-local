@@ -269,6 +269,15 @@ pub trait Store: Send + Sync {
         completed_at: &str,
         status: &str,
     ) -> Result<()>;
+
+    /// Increment the per-store ingest counter and return the new total.
+    /// Used by P7 ingest-triggered reflection.
+    async fn increment_ingest_counter(&self, store_id: &str) -> Result<usize>;
+
+    /// Reset the per-store ingest counter back to 0. Called after a
+    /// reflection job is submitted so the next 100 ingests trigger the
+    /// next reflection.
+    async fn reset_ingest_counter(&self, store_id: &str) -> Result<()>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -2101,6 +2110,58 @@ impl Store for SurrealStore {
                 let _ = r.check();
                 Ok(())
             }
+            Err(_) => Ok(()),
+        }
+    }
+
+    async fn increment_ingest_counter(&self, store_id: &str) -> Result<usize> {
+        let now = chrono::Utc::now().to_rfc3339();
+        // Two-step approach: read current count then upsert with new value.
+        // This is more reliable than relying on += returning the post-increment
+        // value via RETURN AFTER, which has inconsistent behavior across SurrealDB
+        // versions when the record doesn't yet exist.
+        let mut resp = self
+            .db()
+            .query(
+                "SELECT count FROM _ingest_counters WHERE store_id = $store_id LIMIT 1",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .await
+            .context("increment_ingest_counter select")?;
+        #[derive(serde::Deserialize)]
+        struct Row { count: i64 }
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        let new_count = rows.first().map(|r| r.count + 1).unwrap_or(1);
+
+        self.db()
+            .query(
+                "UPSERT type::thing('_ingest_counters', $store_id)
+                 SET count = $new_count, store_id = $store_id, last_reset_at = $now",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .bind(("new_count", new_count))
+            .bind(("now", now))
+            .await
+            .context("increment_ingest_counter upsert")?
+            .check()
+            .context("increment_ingest_counter upsert check")?;
+
+        Ok(new_count as usize)
+    }
+
+    async fn reset_ingest_counter(&self, store_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self
+            .db()
+            .query(
+                "UPSERT type::thing('_ingest_counters', $store_id)
+                 SET count = 0, store_id = $store_id, last_reset_at = $now",
+            )
+            .bind(("store_id", store_id.to_string()))
+            .bind(("now", now))
+            .await;
+        match res {
+            Ok(r) => { let _ = r.check(); Ok(()) }
             Err(_) => Ok(()),
         }
     }

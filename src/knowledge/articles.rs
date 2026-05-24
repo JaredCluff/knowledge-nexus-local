@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::config::ExtractionConfig;
+use crate::config::{ExtractionConfig, ReflectionConfig};
 use crate::knowledge::entity_extractor::{EntityExtractor, entity_id};
 use crate::store::{Article, Store};
 use crate::embeddings::EmbeddingModel;
@@ -24,6 +24,7 @@ pub struct ArticleService {
     vectordb: Arc<VectorDB>,
     embedding_model: Arc<Mutex<EmbeddingModel>>,
     extractor: Option<EntityExtractor>,
+    reflection_config: ReflectionConfig,
 }
 
 impl ArticleService {
@@ -33,6 +34,16 @@ impl ArticleService {
         embedding_model: Arc<Mutex<EmbeddingModel>>,
         extraction_config: Option<ExtractionConfig>,
     ) -> Self {
+        Self::with_reflection(db, vectordb, embedding_model, extraction_config, ReflectionConfig::default())
+    }
+
+    pub fn with_reflection(
+        db: Arc<dyn Store>,
+        vectordb: Arc<VectorDB>,
+        embedding_model: Arc<Mutex<EmbeddingModel>>,
+        extraction_config: Option<ExtractionConfig>,
+        reflection_config: ReflectionConfig,
+    ) -> Self {
         let extractor = extraction_config
             .filter(|c| c.enabled)
             .map(EntityExtractor::new);
@@ -41,6 +52,7 @@ impl ArticleService {
             vectordb,
             embedding_model,
             extractor,
+            reflection_config,
         }
     }
 
@@ -95,6 +107,22 @@ impl ArticleService {
         updated.embedded_at = Some(chrono::Utc::now().to_rfc3339());
         updated.updated_at = chrono::Utc::now().to_rfc3339();
         self.db.update_article(&updated).await?;
+
+        // P7: increment ingest counter; trigger reflection when threshold crossed.
+        let count = self.db.increment_ingest_counter(&article.store_id).await
+            .unwrap_or(0);
+        let trigger = self.reflection_config.ingests_per_reflection_trigger;
+        if trigger > 0 && count >= trigger {
+            tracing::info!(
+                "Ingest counter for store {} crossed reflection threshold ({} >= {}); \
+                 reflection job submission deferred to scheduler",
+                article.store_id, count, trigger
+            );
+            // For P7, we just LOG the crossing and reset the counter.
+            // Actual scheduler invocation is the CLI's job (Task 9) — the
+            // scheduler is foreground-only in P7. P8 may add background dispatch.
+            let _ = self.db.reset_ingest_counter(&article.store_id).await;
+        }
 
         info!("Created and embedded article: {}", article.title);
         Ok(CreateResult::Created)
@@ -366,6 +394,32 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ingest_counter_increments_on_create() {
+        use crate::store::{SurrealStore, Store};
+        use std::sync::Arc;
+
+        let store = SurrealStore::open_in_memory().await.unwrap();
+        let db: Arc<dyn Store> = Arc::new(store);
+
+        // Increment counter directly to verify Store-level semantics first
+        let c1 = db.increment_ingest_counter("itc-s1").await.unwrap();
+        assert_eq!(c1, 1);
+        let c2 = db.increment_ingest_counter("itc-s1").await.unwrap();
+        assert_eq!(c2, 2);
+        let c3 = db.increment_ingest_counter("itc-s1").await.unwrap();
+        assert_eq!(c3, 3);
+
+        // Reset and verify
+        db.reset_ingest_counter("itc-s1").await.unwrap();
+        let c4 = db.increment_ingest_counter("itc-s1").await.unwrap();
+        assert_eq!(c4, 1, "after reset, next increment returns 1");
+
+        // Verify per-store isolation: store_b counter is independent
+        let other = db.increment_ingest_counter("itc-s2").await.unwrap();
+        assert_eq!(other, 1, "different store gets fresh counter");
+    }
 
     #[test]
     fn test_chunk_text_short() {

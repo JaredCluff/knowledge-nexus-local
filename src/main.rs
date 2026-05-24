@@ -1268,8 +1268,9 @@ async fn cmd_dedup_review(action: DedupReviewAction) -> Result<()> {
             let emb = embeddings::EmbeddingModel::new()?;
             let emb_arc = std::sync::Arc::new(tokio::sync::Mutex::new(emb));
 
-            let article_svc = knowledge::ArticleService::new(
+            let article_svc = knowledge::ArticleService::with_reflection(
                 db.clone(), vdb, emb_arc, Some(cfg.extraction.clone()),
+                cfg.reflection.clone(),
             );
             article_svc
                 .update(&updated, &store_record.lancedb_collection)
@@ -1325,8 +1326,9 @@ async fn cmd_extract_entities(store_id: &str, limit: Option<usize>) -> Result<()
     let emb = embeddings::EmbeddingModel::new()?;
     let emb_arc = std::sync::Arc::new(tokio::sync::Mutex::new(emb));
 
-    let article_svc = knowledge::ArticleService::new(
+    let article_svc = knowledge::ArticleService::with_reflection(
         db.clone(), vdb, emb_arc, Some(cfg.extraction.clone()),
+        cfg.reflection.clone(),
     );
 
     let extractor = knowledge::EntityExtractor::new(cfg.extraction.clone());
