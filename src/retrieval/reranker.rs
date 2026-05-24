@@ -2,6 +2,7 @@
 
 use crate::k2k::models::K2KResult;
 
+#[derive(Default)]
 pub struct Reranker;
 
 impl Reranker {
