@@ -140,6 +140,46 @@ pub trait Store: Send + Sync {
     /// the co-occurrence article count — NOT the co-entity's global mention_count.
     /// Sorted by shared-article count descending.
     async fn list_co_mentioned_entities(&self, entity_id: &str) -> Result<Vec<(Entity, usize)>>;
+
+    // P5 typed edges (Task 3)
+    async fn create_precedes_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        confidence: f64,
+        method: ExtractionMethod,
+    ) -> Result<()>;
+
+    async fn create_semantically_related_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        similarity: f64,
+    ) -> Result<()>;
+
+    async fn create_caused_by_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        confidence: f64,
+        rationale: Option<String>,
+    ) -> Result<()>;
+
+    async fn create_references_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        anchor_text: Option<String>,
+    ) -> Result<()>;
+
+    async fn list_precedes_for(&self, store_id: &str, article_id: &str) -> Result<Vec<PrecedesEdge>>;
+    async fn list_semantically_related_for(&self, store_id: &str, article_id: &str) -> Result<Vec<SemanticallyRelatedEdge>>;
+    async fn list_caused_by_for(&self, store_id: &str, article_id: &str) -> Result<Vec<CausedByEdge>>;
+    async fn list_references_for(&self, store_id: &str, article_id: &str) -> Result<Vec<ReferencesEdgeRow>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -1282,6 +1322,196 @@ impl Store for SurrealStore {
         results.sort_by(|a, b| b.1.cmp(&a.1));
         Ok(results)
     }
+
+    // P5 typed edge implementations (Task 3)
+
+    async fn create_precedes_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        confidence: f64,
+        method: ExtractionMethod,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let method_str = serde_json::to_value(method)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "heuristic".into());
+
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to = type::thing('article', $to_id);
+                 RELATE $from->precedes->$to CONTENT {
+                    confidence: $conf,
+                    extraction_method: $method,
+                    store_id: $sid,
+                    created_at: $now
+                 }"
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("conf", confidence))
+            .bind(("method", method_str))
+            .bind(("sid", store_id.to_string()))
+            .bind(("now", now))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn create_semantically_related_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        similarity: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to = type::thing('article', $to_id);
+                 RELATE $from->semantically_related->$to CONTENT {
+                    similarity: $sim,
+                    confidence: $sim,
+                    extraction_method: 'derived',
+                    store_id: $sid,
+                    created_at: $now
+                 }"
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("sim", similarity))
+            .bind(("sid", store_id.to_string()))
+            .bind(("now", now))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn create_caused_by_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        confidence: f64,
+        rationale: Option<String>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to = type::thing('article', $to_id);
+                 RELATE $from->caused_by->$to CONTENT {
+                    confidence: $conf,
+                    rationale: $rationale,
+                    extraction_method: 'llm',
+                    store_id: $sid,
+                    created_at: $now
+                 }"
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("conf", confidence))
+            .bind(("rationale", rationale))
+            .bind(("sid", store_id.to_string()))
+            .bind(("now", now))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn create_references_edge(
+        &self,
+        store_id: &str,
+        from_article_id: &str,
+        to_article_id: &str,
+        anchor_text: Option<String>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = self.db()
+            .query(
+                "LET $from = type::thing('article', $from_id);
+                 LET $to = type::thing('article', $to_id);
+                 RELATE $from->references_edge->$to CONTENT {
+                    confidence: 1.0,
+                    anchor_text: $anchor,
+                    extraction_method: 'user_asserted',
+                    store_id: $sid,
+                    created_at: $now
+                 }"
+            )
+            .bind(("from_id", from_article_id.to_string()))
+            .bind(("to_id", to_article_id.to_string()))
+            .bind(("anchor", anchor_text))
+            .bind(("sid", store_id.to_string()))
+            .bind(("now", now))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn list_precedes_for(&self, store_id: &str, article_id: &str) -> Result<Vec<PrecedesEdge>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_article_id, meta::id(out) AS to_article_id,
+                        confidence, extraction_method, created_at
+                 FROM precedes
+                 WHERE store_id = $sid
+                   AND in = type::thing('article', $aid)"
+            )
+            .bind(("sid", store_id.to_string()))
+            .bind(("aid", article_id.to_string()))
+            .await?;
+        let edges: Vec<PrecedesEdge> = resp.take(0).unwrap_or_default();
+        Ok(edges)
+    }
+
+    async fn list_semantically_related_for(&self, store_id: &str, article_id: &str) -> Result<Vec<SemanticallyRelatedEdge>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_article_id, meta::id(out) AS to_article_id,
+                        similarity, confidence, extraction_method, created_at
+                 FROM semantically_related
+                 WHERE store_id = $sid
+                   AND in = type::thing('article', $aid)"
+            )
+            .bind(("sid", store_id.to_string()))
+            .bind(("aid", article_id.to_string()))
+            .await?;
+        let edges: Vec<SemanticallyRelatedEdge> = resp.take(0).unwrap_or_default();
+        Ok(edges)
+    }
+
+    async fn list_caused_by_for(&self, store_id: &str, article_id: &str) -> Result<Vec<CausedByEdge>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_article_id, meta::id(out) AS to_article_id,
+                        confidence, rationale, extraction_method, created_at
+                 FROM caused_by
+                 WHERE store_id = $sid
+                   AND in = type::thing('article', $aid)"
+            )
+            .bind(("sid", store_id.to_string()))
+            .bind(("aid", article_id.to_string()))
+            .await?;
+        let edges: Vec<CausedByEdge> = resp.take(0).unwrap_or_default();
+        Ok(edges)
+    }
+
+    async fn list_references_for(&self, store_id: &str, article_id: &str) -> Result<Vec<ReferencesEdgeRow>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_article_id, meta::id(out) AS to_article_id,
+                        confidence, anchor_text, extraction_method, created_at
+                 FROM references_edge
+                 WHERE store_id = $sid
+                   AND in = type::thing('article', $aid)"
+            )
+            .bind(("sid", store_id.to_string()))
+            .bind(("aid", article_id.to_string()))
+            .await?;
+        let edges: Vec<ReferencesEdgeRow> = resp.take(0).unwrap_or_default();
+        Ok(edges)
+    }
 }
 
 /// Convenience alias used across the codebase.
@@ -1919,6 +2149,115 @@ mod entity_tests {
         let co = s.list_co_mentioned_entities("co-ent-rust").await.unwrap();
         assert_eq!(co.len(), 2);
         assert!(co.iter().all(|(_, count)| *count == 1));
+    }
+
+    #[tokio::test]
+    async fn create_precedes_edge_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+
+        s.create_article(&Article {
+            id: "p5pre-a1".into(), store_id: "p5pre-s1".into(), title: "A".into(), content: "x".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5pre-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "p5pre-a2".into(), store_id: "p5pre-s1".into(), title: "B".into(), content: "y".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5pre-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_precedes_edge(
+            "p5pre-s1", "p5pre-a1", "p5pre-a2",
+            1.0, ExtractionMethod::Heuristic,
+        ).await.expect("create precedes");
+
+        let edges = s.list_precedes_for("p5pre-s1", "p5pre-a1").await.expect("list");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to_article_id, "p5pre-a2");
+        assert_eq!(edges[0].extraction_method, ExtractionMethod::Heuristic);
+    }
+
+    #[tokio::test]
+    async fn create_semantically_related_edge_dedups_on_unique() {
+        let s = fixture().await;
+        let ts = now();
+        s.create_article(&Article {
+            id: "p5sem-a1".into(), store_id: "p5sem-s1".into(), title: "A".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5sem-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "p5sem-a2".into(), store_id: "p5sem-s1".into(), title: "B".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5sem-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_semantically_related_edge("p5sem-s1", "p5sem-a1", "p5sem-a2", 0.91).await.expect("first");
+        // Second insert of same pair should be a no-op (UNIQUE index)
+        let res = s.create_semantically_related_edge("p5sem-s1", "p5sem-a1", "p5sem-a2", 0.95).await;
+        assert!(res.is_ok(), "duplicate insert should not error; got {:?}", res);
+
+        let edges = s.list_semantically_related_for("p5sem-s1", "p5sem-a1").await.expect("list");
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_caused_by_edge_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+        s.create_article(&Article {
+            id: "p5cb-a1".into(), store_id: "p5cb-s1".into(), title: "A".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5cb-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "p5cb-a2".into(), store_id: "p5cb-s1".into(), title: "B".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5cb-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_caused_by_edge(
+            "p5cb-s1", "p5cb-a1", "p5cb-a2",
+            0.82, Some("explicit 'because' clause".into()),
+        ).await.expect("create caused_by");
+
+        let edges = s.list_caused_by_for("p5cb-s1", "p5cb-a1").await.expect("list");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].rationale.as_deref(), Some("explicit 'because' clause"));
+    }
+
+    #[tokio::test]
+    async fn create_references_edge_round_trips() {
+        let s = fixture().await;
+        let ts = now();
+        s.create_article(&Article {
+            id: "p5ref-a1".into(), store_id: "p5ref-s1".into(), title: "A".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5ref-h1".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_article(&Article {
+            id: "p5ref-a2".into(), store_id: "p5ref-s1".into(), title: "B".into(), content: "".into(),
+            source_type: "user".into(), source_id: String::new(), content_hash: "p5ref-h2".into(),
+            tags: serde_json::json!([]), embedded_at: None,
+            created_at: ts.clone(), updated_at: ts.clone(),
+        }).await.unwrap();
+
+        s.create_references_edge(
+            "p5ref-s1", "p5ref-a1", "p5ref-a2",
+            Some("see [related](p5ref-a2)".into()),
+        ).await.expect("create references");
+
+        let edges = s.list_references_for("p5ref-s1", "p5ref-a1").await.expect("list");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].anchor_text.as_deref(), Some("see [related](p5ref-a2)"));
     }
 }
 
