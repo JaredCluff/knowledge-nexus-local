@@ -115,19 +115,6 @@ impl HybridSearcher {
             .collect())
     }
 
-    /// Merge vector search results with keyword search results using RRF
-    pub fn merge_hybrid(
-        &self,
-        vector_results: Vec<K2KResult>,
-        keyword_results: Vec<K2KResult>,
-        top_k: usize,
-    ) -> Vec<K2KResult> {
-        let signals = vec![
-            RankedSignal { results: vector_results, weight: 1.0 },
-            RankedSignal { results: keyword_results, weight: 1.1 },
-        ];
-        merge_signals(signals, top_k, RRF_K)
-    }
 }
 
 #[cfg(test)]

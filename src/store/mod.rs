@@ -2297,8 +2297,10 @@ mod p3_integration_tests {
         assert_eq!(without[0].id, "a2");
     }
 
+    /// Tests the store-level graph query methods used by GraphSearcher:
+    /// search_entities_by_name, list_articles_for_entities, list_co_mentioned_entities.
     #[tokio::test]
-    async fn test_graph_search_integration() {
+    async fn test_graph_store_queries_for_searcher() {
         let s = fixture().await;
         let ts = now();
 
@@ -2345,27 +2347,35 @@ mod p3_integration_tests {
         // Create RELATED_TO edge (a1 and a3 share tokio)
         s.create_or_update_related_to_edge("tgsi-a1", "tgsi-a3", 1, 0.5).await.unwrap();
 
-        // Test GraphSearcher
-        let config = crate::config::RetrievalConfig::default();
-        let db: std::sync::Arc<dyn Store> = std::sync::Arc::new(s);
-        let searcher = crate::retrieval::GraphSearcher::new(db, config);
+        // search_entities_by_name: "Rust" should match tgsi-tool-rust
+        let rust_matches = s.search_entities_by_name("s1", &["Rust"]).await.unwrap();
+        assert!(!rust_matches.is_empty());
+        assert!(rust_matches.iter().any(|e| e.id == "tgsi-tool-rust"));
 
-        // Search for "Rust" — should find a1 (direct mention)
-        let output = searcher.search("Rust", "s1", 10).await.unwrap();
-        assert!(!output.results.is_empty());
-        assert!(output.entity_coverage > 0.0);
-        assert!(output.results.iter().any(|r| r.article_id == "tgsi-a1"));
+        // search_entities_by_name: "Tokio" should match tgsi-tool-tokio
+        let tokio_matches = s.search_entities_by_name("s1", &["Tokio"]).await.unwrap();
+        assert!(!tokio_matches.is_empty());
+        assert!(tokio_matches.iter().any(|e| e.id == "tgsi-tool-tokio"));
 
-        // Search for "Tokio" — should find a1 and a3 (both mention tokio)
-        let output = searcher.search("Tokio", "s1", 10).await.unwrap();
-        assert!(output.results.len() >= 2);
-        let article_ids: Vec<&str> = output.results.iter().map(|r| r.article_id.as_str()).collect();
-        assert!(article_ids.contains(&"tgsi-a1"));
-        assert!(article_ids.contains(&"tgsi-a3"));
+        // search_entities_by_name: "Go" should find nothing (no entity)
+        let go_matches = s.search_entities_by_name("s1", &["Go"]).await.unwrap();
+        assert!(go_matches.is_empty());
 
-        // Search for "Go" — should find nothing (no entity for Go)
-        let output = searcher.search("Go", "s1", 10).await.unwrap();
-        assert!(output.results.is_empty());
-        assert_eq!(output.entity_coverage, 0.0);
+        // list_articles_for_entities: Rust entity should yield a1
+        let rust_articles = s.list_articles_for_entities(&["tgsi-tool-rust"]).await.unwrap();
+        assert_eq!(rust_articles.len(), 1);
+        assert_eq!(rust_articles[0].0.id, "tgsi-a1");
+
+        // list_articles_for_entities: Tokio entity should yield a1 and a3
+        let tokio_articles = s.list_articles_for_entities(&["tgsi-tool-tokio"]).await.unwrap();
+        assert_eq!(tokio_articles.len(), 2);
+        let ids: Vec<&str> = tokio_articles.iter().map(|(a, _)| a.id.as_str()).collect();
+        assert!(ids.contains(&"tgsi-a1"));
+        assert!(ids.contains(&"tgsi-a3"));
+
+        // list_co_mentioned_entities for tgsi-tool-tokio should include tgsi-tool-rust
+        // (both are mentioned in a1, so they co-occur)
+        let co = s.list_co_mentioned_entities("tgsi-tool-tokio").await.unwrap();
+        assert!(!co.is_empty());
     }
 }
