@@ -282,6 +282,84 @@ impl SurrealStore {
     }
 }
 
+/// Open the SurrealDB store from config, creating the owner user and default
+/// knowledge store on first run. Refuses to start if a legacy SQLite DB exists
+/// but no migration has been run.
+///
+/// This is the lib-visible equivalent of `open_store_or_bail` from `main.rs`.
+/// Non-bin modules (e.g. `search::search_files`) call this instead of
+/// duplicating the store-opening logic.
+pub async fn open_from_config(cfg: &crate::config::Config) -> Result<std::sync::Arc<dyn Store>> {
+    let surreal_dir = crate::config::data_dir().join("surreal");
+    let sqlite_path = crate::config::sqlite_path();
+    let surreal_exists = surreal_dir.exists()
+        && surreal_dir
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+    let migration_complete = crate::migrate::is_migrated(&surreal_dir);
+    let legacy_sqlite_exists = sqlite_path.exists();
+
+    match (surreal_exists, migration_complete, legacy_sqlite_exists) {
+        (true, true, _) => {
+            tracing::info!("Opening SurrealDB at {:?}", surreal_dir);
+        }
+        (true, false, _) => {
+            anyhow::bail!(
+                "SurrealDB directory {:?} exists but has no `migration_completed` marker. \
+                 A previous migration was interrupted. Run: \
+                 `knowledge-nexus-agent migrate --force` to retry.",
+                surreal_dir
+            );
+        }
+        (false, _, true) => {
+            anyhow::bail!(
+                "Legacy SQLite DB at {:?} detected, but no SurrealDB yet. Run: \
+                 `knowledge-nexus-agent migrate --from sqlite --to surrealdb` to upgrade.",
+                sqlite_path
+            );
+        }
+        (false, _, false) => {
+            tracing::info!("No existing database — creating fresh SurrealDB at {:?}", surreal_dir);
+        }
+    }
+
+    let surreal_store = SurrealStore::open(&surreal_dir).await?;
+
+    if surreal_store.get_owner_user().await?.is_none() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let store_id = uuid::Uuid::new_v4().to_string();
+
+        let user = User {
+            id: user_id.clone(),
+            username: cfg.device.name.clone(),
+            display_name: cfg.device.name.clone(),
+            is_owner: true,
+            settings: serde_json::json!({}),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        surreal_store.create_user(&user).await?;
+        tracing::info!("Created default owner user: {}", user.username);
+
+        let ks = KnowledgeStore {
+            id: store_id.clone(),
+            owner_id: user_id,
+            store_type: "personal".into(),
+            name: format!("{}'s Knowledge", cfg.device.name),
+            lancedb_collection: format!("store_{}", store_id),
+            quantizer_version: "ivf_pq_v1".into(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        surreal_store.create_store(&ks).await?;
+        tracing::info!("Created default personal store: {}", ks.name);
+    }
+
+    Ok(std::sync::Arc::new(surreal_store))
+}
+
 
 #[async_trait]
 impl Store for SurrealStore {
