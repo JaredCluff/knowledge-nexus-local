@@ -180,6 +180,11 @@ pub trait Store: Send + Sync {
     async fn list_semantically_related_for(&self, store_id: &str, article_id: &str) -> Result<Vec<SemanticallyRelatedEdge>>;
     async fn list_caused_by_for(&self, store_id: &str, article_id: &str) -> Result<Vec<CausedByEdge>>;
     async fn list_references_for(&self, store_id: &str, article_id: &str) -> Result<Vec<ReferencesEdgeRow>>;
+
+    /// Returns all (from_id, to_id) pairs from the entity_overlap table for
+    /// a given store. Used by P5 backfills that operate over the existing
+    /// entity-overlap graph.
+    async fn list_entity_overlap_pairs(&self, store_id: &str) -> Result<Vec<(String, String)>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -1511,6 +1516,21 @@ impl Store for SurrealStore {
             .await?;
         let edges: Vec<ReferencesEdgeRow> = resp.take(0).unwrap_or_default();
         Ok(edges)
+    }
+
+    async fn list_entity_overlap_pairs(&self, store_id: &str) -> Result<Vec<(String, String)>> {
+        let mut resp = self.db()
+            .query(
+                "SELECT meta::id(in) AS from_id, meta::id(out) AS to_id
+                 FROM entity_overlap
+                 WHERE store_id = $sid"
+            )
+            .bind(("sid", store_id.to_string()))
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct Row { from_id: String, to_id: String }
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(|r| (r.from_id, r.to_id)).collect())
     }
 }
 
