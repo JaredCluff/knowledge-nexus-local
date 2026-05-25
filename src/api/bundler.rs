@@ -184,4 +184,19 @@ mod tests {
         assert_eq!(resp.items[0].article_id, "a");
         assert!(!resp.items[0].truncated);
     }
+
+    #[test]
+    fn p9_token_budget_enforces_truncation_two_huge_items() {
+        // Budget = 10 tokens = 40 chars. Two 1000-char summaries.
+        // First item: truncated to fit; second item: dropped.
+        let huge_summary = "x".repeat(1000);
+        let results = vec![
+            mk("big-1", "Big", &huge_summary, 0.9),
+            mk("big-2", "Big2", &huge_summary, 0.8),
+        ];
+        let resp = pack_to_budget(results, 10);
+        assert_eq!(resp.items.len(), 1, "budget=10 must constrain to 1 item");
+        assert!(resp.items[0].truncated);
+        assert_eq!(resp.items_dropped, 1);
+    }
 }
