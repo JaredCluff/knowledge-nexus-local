@@ -5221,4 +5221,88 @@ mod p3_integration_tests {
             "pinned article must not appear in transition audit log"
         );
     }
+
+    /// P9 lifecycle test: observe (create article), recall (find via search),
+    /// forget (set Archive), verify-forgotten (excluded from non-archive recall).
+    ///
+    /// Doesn't go through HTTP — tests the underlying operations the P9
+    /// handlers perform. Full HTTP-level test requires K2K auth scaffolding
+    /// that's out of scope for this verification.
+    #[tokio::test]
+    async fn p9_observe_recall_forget_lifecycle() {
+        let s = fixture().await;
+        let ts = now();
+
+        // === observe: create an article (what /v1/memory/observe does) ===
+        let article = Article {
+            id: "p9-obs1".into(),
+            store_id: "s1".into(),
+            title: "An observation about Rust async".into(),
+            content: "Rust provides powerful async via Tokio".into(),
+            source_type: "user".into(),
+            source_id: String::new(),
+            content_hash: "p9-h1".into(),
+            tags: serde_json::json!([]),
+            embedded_at: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            reflects: vec![],
+            access_count: 0,
+            last_accessed_at: "".into(),
+            importance_score: 0.5,
+            tier: Tier::Hot,
+            pinned: false,
+            compacted_into: None,
+        };
+        s.create_article(&article).await.unwrap();
+
+        // Set up entity so the recall path finds the article via GraphSearcher
+        s.create_entity(&Entity {
+            id: "p9-tool-rust".into(),
+            name: "Rust".into(),
+            entity_type: "tool".into(),
+            description: None,
+            store_id: "s1".into(),
+            mention_count: 1,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        }).await.unwrap();
+        s.create_mentions_edge("p9-obs1", "p9-tool-rust", "Rust provides", 0.95).await.unwrap();
+
+        // === recall: query via Store (what /v1/memory/recall does internally) ===
+        let articles_found = s.list_articles_for_entity("p9-tool-rust").await.unwrap();
+        assert!(!articles_found.is_empty(),
+            "recall query should find the observed article");
+        assert!(articles_found.iter().any(|a| a.id == "p9-obs1"));
+
+        // === forget: archive (what /v1/memory/forget does) ===
+        s.set_article_tier("p9-obs1", Tier::Archive, "forget_api: user requested").await.unwrap();
+
+        let archived = s.get_article("p9-obs1").await.unwrap().unwrap();
+        assert_eq!(archived.tier, Tier::Archive);
+
+        // === verify forgotten: tier_factor returns 0 for Archive when include_archive=false ===
+        use crate::maintenance::decay::tier_factor;
+        let factor_default = tier_factor(Tier::Archive, false);
+        assert_eq!(factor_default, 0.0,
+            "Archive items must be excluded by default (recall include_archive=false)");
+
+        let factor_explicit = tier_factor(Tier::Archive, true);
+        assert!(factor_explicit > 0.0,
+            "Archive items must be surfaceable with include_archive=true");
+
+        // === audit trail: forget operation must be audit-logged ===
+        let entries = s.list_audit_log("s1", None, 100).await.unwrap();
+        let has_forget_entry = entries.iter().any(|e|
+            e.subject_id == "p9-obs1"
+            && e.action == "tier_change"
+            && e.details.get("reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("forget_api"))
+                .unwrap_or(false)
+        );
+        assert!(has_forget_entry,
+            "forget operation must write an audit entry; got entries: {:?}", entries);
+    }
+
 }

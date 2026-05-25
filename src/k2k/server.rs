@@ -233,6 +233,12 @@ impl K2KServer {
             .route("/k2k/v1/tasks/events", get(handle_task_events))
             .route("/k2k/v1/tasks/:id", get(handle_get_task))
             .route("/k2k/v1/tasks/:id", axum_delete(handle_cancel_task))
+            // P9 agent memory API
+            .route("/v1/memory/observe", post(super::memory_handlers::observe))
+            .route("/v1/memory/recall", post(super::memory_handlers::recall))
+            .route("/v1/memory/reflect", post(super::memory_handlers::reflect))
+            .route("/v1/memory/timeline", get(super::memory_handlers::timeline))
+            .route("/v1/memory/forget", post(super::memory_handlers::forget))
             .layer(axum::middleware::from_fn_with_state(
                 self.state.clone(),
                 require_k2k_auth,

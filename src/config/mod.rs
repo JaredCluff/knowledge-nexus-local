@@ -69,6 +69,10 @@ pub struct Config {
     /// Compaction settings (P8)
     #[serde(default)]
     pub compaction: CompactionConfig,
+
+    /// Agent-native HTTP API settings (P9)
+    #[serde(default)]
+    pub agent_api: AgentApiConfig,
 }
 
 // ============================================================================
@@ -514,6 +518,50 @@ impl Default for DecayConfig {
             ga_w_importance: default_ga_w_importance(),
             ga_decay: default_ga_decay(),
             ebbinghaus_strength: default_ebbinghaus_strength(),
+        }
+    }
+}
+
+/// Agent-native HTTP API configuration (P9).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentApiConfig {
+    /// Master switch. Default true — the /v1/memory/* endpoints are
+    /// mounted on the existing K2K server.
+    #[serde(default = "default_agent_api_enabled")]
+    pub enabled: bool,
+
+    /// Default token budget for recall when caller doesn't specify.
+    #[serde(default = "default_token_budget")]
+    pub default_token_budget: u32,
+
+    /// Maximum token budget callers can request.
+    #[serde(default = "default_max_token_budget")]
+    pub max_token_budget: u32,
+
+    /// p95 latency target for recall (informational; enforced via per-query
+    /// deadline). Used by smoke tests + ops dashboards.
+    #[serde(default = "default_recall_p95_ms")]
+    pub recall_p95_target_ms: u64,
+
+    /// Allow federation fan-out on /v1/memory/recall when caller sets
+    /// federate=true. Default false (explicit opt-in even though P9 supports it).
+    #[serde(default)]
+    pub federation_enabled: bool,
+}
+
+fn default_agent_api_enabled() -> bool { true }
+fn default_token_budget() -> u32 { 2000 }
+fn default_max_token_budget() -> u32 { 16_000 }
+fn default_recall_p95_ms() -> u64 { 1500 }
+
+impl Default for AgentApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_agent_api_enabled(),
+            default_token_budget: default_token_budget(),
+            max_token_budget: default_max_token_budget(),
+            recall_p95_target_ms: default_recall_p95_ms(),
+            federation_enabled: false,
         }
     }
 }
@@ -1058,6 +1106,7 @@ impl Default for Config {
             reflection: ReflectionConfig::default(),
             decay: DecayConfig::default(),
             compaction: CompactionConfig::default(),
+            agent_api: AgentApiConfig::default(),
         }
     }
 }

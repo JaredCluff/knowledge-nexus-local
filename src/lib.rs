@@ -3,6 +3,7 @@
 //! Keeps internal modules private to the binary while exposing the subset
 //! that integration tests in `tests/` need.
 
+pub mod api;
 pub mod config;
 pub mod embeddings;
 pub mod maintenance;
