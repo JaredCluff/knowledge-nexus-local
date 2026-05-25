@@ -5247,7 +5247,7 @@ mod p3_integration_tests {
 
         let db: Arc<dyn Store> = Arc::new(s);
         let cfg = DecayConfig::default();
-        let report = nightly_tier_transition(db.clone(), "p8e-s1", &cfg, now).await.unwrap();
+        let report = nightly_tier_transition(db.clone(), "p8e-s1", &cfg, now, 0.0).await.unwrap();
 
         // Sanity: scanned all 10
         assert_eq!(report.articles_scanned, 10, "should scan all 10 articles");
