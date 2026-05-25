@@ -6,6 +6,7 @@
 pub mod capabilities;
 pub mod handlers;
 pub mod keys;
+pub mod memory_handlers;
 pub mod middleware;
 pub mod models;
 pub mod remote_handler;

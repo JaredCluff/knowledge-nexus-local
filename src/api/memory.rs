@@ -1,4 +1,4 @@
-//! /v1/memory/* HTTP handlers (P9).
+//! /v1/memory/* request/response DTOs (P9).
 //!
 //! Five endpoints mapped to Lin et al.'s 6-phase memory lifecycle:
 //! - observe → Write
@@ -6,6 +6,9 @@
 //! - reflect → Store (consolidation)
 //! - timeline → Retrieve
 //! - forget → Forget/Rollback
+//!
+//! DTOs live here (lib-accessible for integration tests).
+//! Axum handlers live in src/k2k/memory_handlers.rs (binary crate context).
 
 use serde::{Deserialize, Serialize};
 
@@ -118,3 +121,4 @@ pub struct ForgetResponse {
     pub archived: bool,
     pub audit_id: String,
 }
+
