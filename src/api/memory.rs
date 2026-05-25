@@ -122,3 +122,78 @@ pub struct ForgetResponse {
     pub audit_id: String,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observe_request_default_async_true() {
+        let json = r#"{"text": "Hello"}"#;
+        let req: ObserveRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.text, "Hello");
+        assert!(req.r#async, "async should default to true");
+    }
+
+    #[test]
+    fn recall_request_minimal() {
+        let json = r#"{"query": "test"}"#;
+        let req: RecallRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "test");
+        assert!(req.token_budget.is_none());
+        assert!(!req.include_archive);
+        assert!(!req.federate);
+    }
+
+    #[test]
+    fn recall_request_full_with_all_fields() {
+        let json = r#"{
+            "query": "what happened in March",
+            "token_budget": 2000,
+            "scope": "store_a",
+            "since": "2026-03-01T00:00:00Z",
+            "until": "2026-03-31T23:59:59Z",
+            "include_archive": true,
+            "federate": true
+        }"#;
+        let req: RecallRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.token_budget, Some(2000));
+        assert_eq!(req.scope.as_deref(), Some("store_a"));
+        assert!(req.include_archive);
+        assert!(req.federate);
+    }
+
+    #[test]
+    fn forget_request_requires_reason() {
+        // reason is non-Option<>, so missing → deserialize fails
+        let json = r#"{"memory_id": "a1"}"#;
+        let res: Result<ForgetRequest, _> = serde_json::from_str(json);
+        assert!(res.is_err(), "forget without reason must fail to deserialize");
+    }
+
+    #[test]
+    fn recall_response_round_trips() {
+        use crate::api::bundler::BundledItem;
+        let resp = RecallResponse {
+            items: vec![
+                BundledItem {
+                    article_id: "a1".into(),
+                    title: "T".into(),
+                    summary: "S".into(),
+                    confidence: 0.85,
+                    truncated: false,
+                },
+            ],
+            total_budget_used: 100,
+            items_dropped: 2,
+            items_truncated: 0,
+            follow_ups: vec!["more like 'T'".into()],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: RecallResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.total_budget_used, 100);
+        assert_eq!(parsed.items_dropped, 2);
+        assert_eq!(parsed.follow_ups.len(), 1);
+    }
+}
+
