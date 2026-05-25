@@ -235,6 +235,37 @@ pub struct AuditLogEntry {
     pub recorded_at: String,
 }
 
+/// Type of policy decision being traced (P10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionType {
+    Decay,
+    ReflectionTrigger,
+    ActivationWeight,
+}
+
+/// Append-only policy decision trace (P10).
+/// Each entry captures input features, the chosen action, and (optionally)
+/// the measured outcome. Together with P9's audit log, this is the training
+/// substrate for offline-learned policies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyTrace {
+    pub id: String,
+    pub store_id: String,
+    /// Name of the policy implementation that made the decision
+    /// (e.g., "default_synapse_aligned", "default_rate_threshold").
+    pub policy_name: String,
+    pub decision_type: DecisionType,
+    /// Free-form input features the policy observed.
+    pub input_features: serde_json::Value,
+    /// The action chosen by the policy.
+    pub action: serde_json::Value,
+    /// Optional measured outcome (e.g., final tier after decay was applied,
+    /// reflection-generated count). Filled in after the fact when feasible.
+    pub outcome: Option<serde_json::Value>,
+    pub recorded_at: String,
+}
+
 /// How an edge was derived. Stored as a lowercase string in SurrealDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -3,7 +3,7 @@
 //!
 //! The schema is SCHEMAFULL — unknown fields are rejected.
 
-pub const SCHEMA_VERSION: &str = "1.0.0-p8";
+pub const SCHEMA_VERSION: &str = "1.0.0-p10";
 
 /// Returns the full SurrealQL DDL script. Idempotent: every statement uses
 /// `IF NOT EXISTS` or `OVERWRITE` so re-running on an initialized DB is a
@@ -322,5 +322,19 @@ DEFINE FIELD IF NOT EXISTS recorded_at ON _audit_log TYPE string;
 DEFINE INDEX IF NOT EXISTS _audit_log_subject_idx ON _audit_log FIELDS subject_id;
 DEFINE INDEX IF NOT EXISTS _audit_log_time_idx ON _audit_log FIELDS recorded_at;
 DEFINE INDEX IF NOT EXISTS _audit_log_store_idx ON _audit_log FIELDS store_id;
+
+-- P10 policy traces (append-only, training-data substrate)
+DEFINE TABLE IF NOT EXISTS _policy_traces SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS store_id ON _policy_traces TYPE string;
+DEFINE FIELD IF NOT EXISTS policy_name ON _policy_traces TYPE string;
+DEFINE FIELD IF NOT EXISTS decision_type ON _policy_traces TYPE string
+    ASSERT $value IN ["decay", "reflection_trigger", "activation_weight"];
+DEFINE FIELD IF NOT EXISTS input_features ON _policy_traces FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS action ON _policy_traces FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS outcome ON _policy_traces FLEXIBLE TYPE option<object>;
+DEFINE FIELD IF NOT EXISTS recorded_at ON _policy_traces TYPE string;
+DEFINE INDEX IF NOT EXISTS _policy_traces_policy_idx ON _policy_traces FIELDS policy_name;
+DEFINE INDEX IF NOT EXISTS _policy_traces_time_idx ON _policy_traces FIELDS recorded_at;
+DEFINE INDEX IF NOT EXISTS _policy_traces_store_idx ON _policy_traces FIELDS store_id;
 "#
 }

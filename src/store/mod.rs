@@ -295,6 +295,19 @@ pub trait Store: Send + Sync {
     async fn list_audit_log(&self, store_id: &str, since_rfc3339: Option<&str>, limit: usize) -> Result<Vec<AuditLogEntry>>;
     async fn count_recent_access_audit(&self, article_id: &str, since_rfc3339: &str) -> Result<usize>;
     async fn set_article_compacted_into(&self, article_id: &str, reflection_id: &str) -> Result<()>;
+
+    /// Append a policy trace (P10). Used for offline training-data collection.
+    async fn write_policy_trace(&self, trace: &PolicyTrace) -> Result<()>;
+
+    /// List policy traces with optional filters. Used by the CLI
+    /// `policy-traces` command.
+    async fn list_policy_traces(
+        &self,
+        store_id: Option<&str>,
+        policy_name: Option<&str>,
+        since_rfc3339: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PolicyTrace>>;
 }
 
 const SURREAL_NS: &str = "knowledge_nexus";
@@ -2620,6 +2633,72 @@ impl Store for SurrealStore {
             recorded_at: now,
         };
         self.write_audit_log(&entry).await
+    }
+
+    async fn write_policy_trace(&self, trace: &PolicyTrace) -> Result<()> {
+        let decision_type_str = serde_json::to_value(trace.decision_type)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "decay".into());
+
+        let res = self.db()
+            .query(
+                "CREATE type::thing('_policy_traces', $id) CONTENT {
+                    store_id: $store_id,
+                    policy_name: $policy_name,
+                    decision_type: $decision_type,
+                    input_features: $input_features,
+                    action: $action,
+                    outcome: $outcome,
+                    recorded_at: $recorded_at
+                 }"
+            )
+            .bind(("id", trace.id.clone()))
+            .bind(("store_id", trace.store_id.clone()))
+            .bind(("policy_name", trace.policy_name.clone()))
+            .bind(("decision_type", decision_type_str))
+            .bind(("input_features", trace.input_features.clone()))
+            .bind(("action", trace.action.clone()))
+            .bind(("outcome", trace.outcome.clone()))
+            .bind(("recorded_at", trace.recorded_at.clone()))
+            .await;
+        match res { Ok(r) => { let _ = r.check(); Ok(()) } Err(_) => Ok(()) }
+    }
+
+    async fn list_policy_traces(
+        &self,
+        store_id: Option<&str>,
+        policy_name: Option<&str>,
+        since_rfc3339: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PolicyTrace>> {
+        let mut conditions: Vec<&str> = Vec::new();
+        if store_id.is_some() { conditions.push("store_id = $sid"); }
+        if policy_name.is_some() { conditions.push("policy_name = $pname"); }
+        if since_rfc3339.is_some() { conditions.push("recorded_at >= $since"); }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let q = format!(
+            "SELECT meta::id(id) AS id, store_id, policy_name, decision_type,
+                    input_features, action, outcome, recorded_at
+             FROM _policy_traces {}
+             ORDER BY recorded_at DESC LIMIT $limit",
+            where_clause
+        );
+
+        let mut query = self.db().query(&q).bind(("limit", limit as i64));
+        if let Some(s) = store_id { query = query.bind(("sid", s.to_string())); }
+        if let Some(p) = policy_name { query = query.bind(("pname", p.to_string())); }
+        if let Some(s) = since_rfc3339 { query = query.bind(("since", s.to_string())); }
+
+        let mut resp = query.await.context("list_policy_traces")?;
+        let traces: Vec<PolicyTrace> = resp.take(0).unwrap_or_default();
+        Ok(traces)
     }
 }
 
@@ -5303,6 +5382,64 @@ mod p3_integration_tests {
         );
         assert!(has_forget_entry,
             "forget operation must write an audit entry; got entries: {:?}", entries);
+    }
+
+    #[tokio::test]
+    async fn write_policy_trace_persists() {
+        let s = fixture().await;
+        let trace = PolicyTrace {
+            id: "p10t5-1".into(),
+            store_id: "p10-s1".into(),
+            policy_name: "default_synapse_aligned".into(),
+            decision_type: DecisionType::Decay,
+            input_features: serde_json::json!({"days_since_access": 30, "importance": 0.8}),
+            action: serde_json::json!({"salience": 0.55, "tier": "hot"}),
+            outcome: None,
+            recorded_at: "2026-05-24T00:00:00Z".into(),
+        };
+        s.write_policy_trace(&trace).await.unwrap();
+
+        let traces = s.list_policy_traces(Some("p10-s1"), None, None, 100).await.unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].id, "p10t5-1");
+        // FLEXIBLE schema means nested keys survive
+        assert_eq!(traces[0].input_features["days_since_access"], 30);
+        assert_eq!(traces[0].action["tier"], "hot");
+    }
+
+    #[tokio::test]
+    async fn list_policy_traces_filters_by_policy_name() {
+        let s = fixture().await;
+        let mk = |id: &str, name: &str| PolicyTrace {
+            id: id.into(),
+            store_id: "p10t5b-s1".into(),
+            policy_name: name.into(),
+            decision_type: DecisionType::Decay,
+            input_features: serde_json::json!({}),
+            action: serde_json::json!({}),
+            outcome: None,
+            recorded_at: "2026-05-24T00:00:00Z".into(),
+        };
+
+        s.write_policy_trace(&mk("p10t5b-1", "policy_a")).await.unwrap();
+        s.write_policy_trace(&mk("p10t5b-2", "policy_b")).await.unwrap();
+        s.write_policy_trace(&mk("p10t5b-3", "policy_a")).await.unwrap();
+
+        let policy_a = s.list_policy_traces(None, Some("policy_a"), None, 100).await.unwrap();
+        assert_eq!(policy_a.len(), 2);
+        assert!(policy_a.iter().all(|t| t.policy_name == "policy_a"));
+
+        let policy_b = s.list_policy_traces(None, Some("policy_b"), None, 100).await.unwrap();
+        assert_eq!(policy_b.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn decision_type_enum_roundtrips_via_serde() {
+        let d = DecisionType::ReflectionTrigger;
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(json, "\"reflection_trigger\"");
+        let back: DecisionType = serde_json::from_str("\"activation_weight\"").unwrap();
+        assert_eq!(back, DecisionType::ActivationWeight);
     }
 
 }
