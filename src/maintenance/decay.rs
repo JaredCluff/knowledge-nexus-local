@@ -153,12 +153,17 @@ pub struct TransitionReport {
 /// Walk all articles + events for a store; compute salience; transition tier
 /// when it changes AND the item is not pinned. Audit-logged via the Store
 /// trait methods. Returns a per-pass report.
+///
+/// `trace_sampling_rate` controls P10 policy-trace logging: 1.0 = log every
+/// transition, 0.0 = log nothing. Probabilistic sub-sampling fires when
+/// a random f64 < sampling_rate (using the `rand` crate).
 #[allow(dead_code)] // consumed by P9+ background runner
 pub async fn nightly_tier_transition(
     db: Arc<dyn crate::store::Store>,
     store_id: &str,
     config: &DecayConfig,
     now: DateTime<Utc>,
+    trace_sampling_rate: f64,  // P10: 0.0..=1.0
 ) -> Result<TransitionReport> {
     let mut report = TransitionReport::default();
 
@@ -197,6 +202,34 @@ pub async fn nightly_tier_transition(
                 .entry(format!("{}->{}", from, to))
                 .or_insert(0) += 1;
             report.articles_transitioned += 1;
+
+            // P10: record a policy trace for offline training-data accumulation.
+            if trace_sampling_rate >= 1.0 || rand::random::<f64>() < trace_sampling_rate {
+                let trace = crate::store::PolicyTrace {
+                    id: format!("ptrace-{}-{}",
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                        article.id),
+                    store_id: store_id.to_string(),
+                    policy_name: "default_synapse_aligned".into(),
+                    decision_type: crate::store::DecisionType::Decay,
+                    input_features: serde_json::json!({
+                        "article_id": article.id,
+                        "from_tier": from,
+                        "importance_score": article.importance_score,
+                        "access_count": article.access_count,
+                        "last_accessed_at": article.last_accessed_at,
+                    }),
+                    action: serde_json::json!({
+                        "to_tier": to,
+                        "salience": s,
+                    }),
+                    outcome: None,
+                    recorded_at: chrono::Utc::now().to_rfc3339(),
+                };
+                if let Err(e) = db.write_policy_trace(&trace).await {
+                    tracing::warn!("Failed to write policy trace: {}", e);
+                }
+            }
         }
     }
 
@@ -235,6 +268,34 @@ pub async fn nightly_tier_transition(
                 .entry(format!("{}->{}", from, to))
                 .or_insert(0) += 1;
             report.events_transitioned += 1;
+
+            // P10: record a policy trace for offline training-data accumulation.
+            if trace_sampling_rate >= 1.0 || rand::random::<f64>() < trace_sampling_rate {
+                let trace = crate::store::PolicyTrace {
+                    id: format!("ptrace-{}-{}",
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                        event.id),
+                    store_id: store_id.to_string(),
+                    policy_name: "default_synapse_aligned".into(),
+                    decision_type: crate::store::DecisionType::Decay,
+                    input_features: serde_json::json!({
+                        "event_id": event.id,
+                        "from_tier": from,
+                        "importance_score": event.importance_score,
+                        "access_count": event.access_count,
+                        "last_accessed_at": event.last_accessed_at,
+                    }),
+                    action: serde_json::json!({
+                        "to_tier": to,
+                        "salience": s,
+                    }),
+                    outcome: None,
+                    recorded_at: chrono::Utc::now().to_rfc3339(),
+                };
+                if let Err(e) = db.write_policy_trace(&trace).await {
+                    tracing::warn!("Failed to write policy trace: {}", e);
+                }
+            }
         }
     }
 
@@ -432,7 +493,7 @@ mod tests {
         let cfg = DecayConfig::default();
         let now = chrono::Utc::now();
 
-        let report = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now).await.unwrap();
+        let report = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now, 0.0).await.unwrap();
 
         assert_eq!(report.articles_scanned, 4);
         assert!(report.articles_transitioned >= 2,
@@ -456,7 +517,7 @@ mod tests {
         let cfg = DecayConfig::default();
         let now = chrono::Utc::now();
 
-        let report = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now).await.unwrap();
+        let report = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now, 0.0).await.unwrap();
 
         assert_eq!(report.pinned_skipped, 1);
         let pinned = db.get_article("p8t5p-old").await.unwrap().unwrap();
@@ -471,7 +532,7 @@ mod tests {
         let cfg = DecayConfig::default();
         let now = chrono::Utc::now();
 
-        let report = nightly_tier_transition(db, "empty-store", &cfg, now).await.unwrap();
+        let report = nightly_tier_transition(db, "empty-store", &cfg, now, 0.0).await.unwrap();
         assert_eq!(report.articles_scanned, 0);
         assert_eq!(report.events_scanned, 0);
         assert_eq!(report.articles_transitioned, 0);
@@ -486,7 +547,7 @@ mod tests {
         let cfg = DecayConfig::default();
         let now = chrono::Utc::now();
 
-        let _ = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now).await.unwrap();
+        let _ = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now, 0.0).await.unwrap();
 
         // Verify audit log has a tier_change entry
         let entries = db.list_audit_log("p8t5-s1", None, 100).await.unwrap();
@@ -501,5 +562,51 @@ mod tests {
         assert!(has_transition,
             "nightly_tier_transition should write audit entries; got entries: {:?}",
             entries);
+    }
+
+    #[tokio::test]
+    async fn nightly_transition_writes_policy_trace_when_sampling_enabled() {
+        let store = crate::store::SurrealStore::open_in_memory().await.unwrap();
+        store.create_article(&build_aged_article("p10t6-old", 365, 0.8, false)).await.unwrap();
+
+        let db: Arc<dyn crate::store::Store> = Arc::new(store);
+        let cfg = DecayConfig::default();
+        let now = chrono::Utc::now();
+
+        let _ = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now, 1.0).await.unwrap();
+
+        // Verify a policy trace was written for the demotion
+        let traces = db.list_policy_traces(
+            Some("p8t5-s1"),
+            Some("default_synapse_aligned"),
+            None,
+            100,
+        ).await.unwrap();
+        assert!(!traces.is_empty(), "expected at least one trace for the demotion");
+        assert!(traces.iter().any(|t|
+            t.input_features.get("article_id")
+                .and_then(|v| v.as_str()) == Some("p10t6-old")
+        ));
+    }
+
+    #[tokio::test]
+    async fn nightly_transition_skips_traces_when_sampling_zero() {
+        let store = crate::store::SurrealStore::open_in_memory().await.unwrap();
+        store.create_article(&build_aged_article("p10t6b-old", 365, 0.8, false)).await.unwrap();
+
+        let db: Arc<dyn crate::store::Store> = Arc::new(store);
+        let cfg = DecayConfig::default();
+        let now = chrono::Utc::now();
+
+        let _ = nightly_tier_transition(db.clone(), "p8t5-s1", &cfg, now, 0.0).await.unwrap();
+
+        let traces = db.list_policy_traces(
+            Some("p8t5-s1"),
+            Some("default_synapse_aligned"),
+            None,
+            100,
+        ).await.unwrap();
+        assert!(traces.is_empty(),
+            "expected no traces with sampling=0.0; got {}", traces.len());
     }
 }

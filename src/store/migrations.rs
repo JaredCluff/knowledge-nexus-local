@@ -69,6 +69,19 @@ pub async fn run_migrations(db: &Surreal<Any>) -> Result<()> {
         migrate_backfill_last_accessed_at(db).await?;
     }
 
+    // P10 migration: schema upgrade only (no data migration). _policy_traces
+    // table is created by DDL with IF NOT EXISTS.
+    if current_version.starts_with("1.0.0-p1")
+        || current_version.starts_with("1.0.0-p2")
+        || current_version.starts_with("1.0.0-p3")
+        || current_version.starts_with("1.0.0-p5")
+        || current_version.starts_with("1.0.0-p7")
+        || current_version.starts_with("1.0.0-p8")
+    {
+        tracing::info!("P10 migration: schema upgrade only (no data backfill)");
+        // DDL handles it.
+    }
+
     // Record current schema version
     let applied_at = chrono::Utc::now().to_rfc3339();
     db.query(
@@ -353,13 +366,13 @@ mod tests {
         let n = cnts.first().map(|c| c.n).unwrap_or(0);
         assert_eq!(n, 0, "related_to should be empty after migration");
 
-        // Schema version is now 1.0.0-p8 (the current latest)
+        // Schema version is now 1.0.0-p10 (the current latest)
         let mut resp3 = db.query(
             "SELECT version FROM _schema_version WHERE id = type::thing('_schema_version', 'current')"
         ).await.expect("version").check().expect("check3");
         #[derive(serde::Deserialize)] struct V { version: String }
         let vs: Vec<V> = resp3.take(0).unwrap_or_default();
-        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p8"));
+        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p10"));
     }
 
     #[tokio::test]
@@ -424,14 +437,14 @@ mod tests {
         assert_eq!(cnts.first().map(|c| c.n).unwrap_or(0), 1,
             "existing article should be preserved");
 
-        // Verify: schema version is now P8 (the current latest)
+        // Verify: schema version is now P10 (the current latest)
         let mut resp = db.query(
             "SELECT version FROM _schema_version WHERE id = type::thing('_schema_version', 'current')"
         ).await.expect("version").check().expect("check");
         #[derive(serde::Deserialize)] struct V { version: String }
         let vs: Vec<V> = resp.take(0).unwrap_or_default();
-        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p8"),
-            "schema version should be 1.0.0-p8");
+        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p10"),
+            "schema version should be 1.0.0-p10");
     }
 
     #[tokio::test]
@@ -494,13 +507,13 @@ mod tests {
         assert_eq!(rows[0].last_accessed_at, rows[0].created_at);
         assert_eq!(rows[0].last_accessed_at, "2026-05-20T00:00:00Z");
 
-        // Schema version is p8
+        // Schema version is p10
         let mut resp = db.query(
             "SELECT version FROM _schema_version WHERE id = type::thing('_schema_version', 'current')"
         ).await.expect("version").check().expect("check");
         #[derive(serde::Deserialize)] struct V { version: String }
         let vs: Vec<V> = resp.take(0).unwrap_or_default();
-        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p8"));
+        assert_eq!(vs.first().map(|v| v.version.as_str()), Some("1.0.0-p10"));
     }
 
     #[tokio::test]

@@ -287,6 +287,23 @@ enum Commands {
         limit: usize,
     },
 
+    /// Dump policy decision traces for offline training-data analysis (P10).
+    PolicyTraces {
+        #[arg(long)]
+        store: Option<String>,
+
+        /// Filter by policy name (e.g., "default_synapse_aligned").
+        #[arg(long)]
+        policy: Option<String>,
+
+        /// Filter: only entries at or after this RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+
     /// Admin tier override. Audit-logged.
     Tier {
         article_id: String,
@@ -604,6 +621,9 @@ fn main() -> Result<()> {
             Commands::DecayStatus { store } => cmd_decay_status(store.as_deref()).await?,
             Commands::Compact { store, dry_run } => cmd_compact(store.as_deref(), dry_run).await?,
             Commands::AuditLog { store, since, limit } => cmd_audit_log(store.as_deref(), since.as_deref(), limit).await?,
+            Commands::PolicyTraces { store, policy, since, limit } => {
+                cmd_policy_traces(store.as_deref(), policy.as_deref(), since.as_deref(), limit).await?;
+            }
             Commands::Tier { article_id, new_tier } => cmd_tier(&article_id, &new_tier).await?,
         }
         Ok(())
@@ -2098,6 +2118,41 @@ async fn cmd_audit_log(store_filter: Option<&str>, since: Option<&str>, limit: u
         println!("  [{}] {} {} {}", e.recorded_at, e.action, e.subject_type, e.subject_id);
         if !e.details.is_null() && !matches!(&e.details, serde_json::Value::Object(m) if m.is_empty()) {
             println!("       {}", e.details);
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_policy_traces(
+    store_filter: Option<&str>,
+    policy_filter: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let cfg = config::load_config().await?;
+    let db = open_store_or_bail(&cfg).await?;
+
+    let traces = db.list_policy_traces(store_filter, policy_filter, since, limit).await?;
+
+    if traces.is_empty() {
+        println!("No policy traces found.");
+        return Ok(());
+    }
+
+    println!("Policy traces ({} shown, most recent first):", traces.len());
+    println!();
+    for t in &traces {
+        println!("  [{}] {} {:?} store={}",
+            t.recorded_at, t.policy_name, t.decision_type, t.store_id);
+        if !t.input_features.is_null() {
+            println!("    input:  {}", t.input_features);
+        }
+        if !t.action.is_null() {
+            println!("    action: {}", t.action);
+        }
+        if let Some(ref o) = t.outcome {
+            println!("    outcome: {}", o);
         }
     }
 

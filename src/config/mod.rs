@@ -73,6 +73,10 @@ pub struct Config {
     /// Agent-native HTTP API settings (P9)
     #[serde(default)]
     pub agent_api: AgentApiConfig,
+
+    /// Policy-learned memory control settings (P10)
+    #[serde(default)]
+    pub policy: PolicyConfig,
 }
 
 // ============================================================================
@@ -562,6 +566,46 @@ impl Default for AgentApiConfig {
             max_token_budget: default_max_token_budget(),
             recall_p95_target_ms: default_recall_p95_ms(),
             federation_enabled: false,
+        }
+    }
+}
+
+/// Policy-learned memory control configuration (P10 scaffolding).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyConfig {
+    /// Name of the active DecayPolicy impl. P10 scaffolding: only
+    /// "default_synapse_aligned" is implemented. Future learned impls
+    /// register themselves here.
+    #[serde(default = "default_decay_policy_name")]
+    pub decay_policy_name: String,
+
+    /// Name of the active ReflectionTriggerPolicy impl.
+    #[serde(default = "default_reflection_policy_name")]
+    pub reflection_policy_name: String,
+
+    /// Name of the active ActivationWeightPolicy impl.
+    #[serde(default = "default_activation_policy_name")]
+    pub activation_policy_name: String,
+
+    /// Fraction of policy decisions to log as traces (0.0 = none,
+    /// 1.0 = all). Lower in production to manage table volume; keep
+    /// at 1.0 during dev to ensure training-data accumulates.
+    #[serde(default = "default_trace_sampling_rate")]
+    pub trace_sampling_rate: f64,
+}
+
+fn default_decay_policy_name() -> String { "default_synapse_aligned".into() }
+fn default_reflection_policy_name() -> String { "default_rate_threshold".into() }
+fn default_activation_policy_name() -> String { "default_magma_table".into() }
+fn default_trace_sampling_rate() -> f64 { 1.0 }
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            decay_policy_name: default_decay_policy_name(),
+            reflection_policy_name: default_reflection_policy_name(),
+            activation_policy_name: default_activation_policy_name(),
+            trace_sampling_rate: default_trace_sampling_rate(),
         }
     }
 }
@@ -1107,6 +1151,7 @@ impl Default for Config {
             decay: DecayConfig::default(),
             compaction: CompactionConfig::default(),
             agent_api: AgentApiConfig::default(),
+            policy: PolicyConfig::default(),
         }
     }
 }
